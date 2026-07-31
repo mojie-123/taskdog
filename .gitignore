@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+
+# Training logs
+logs/
+
+# Exported models
+exported/
+*.onnx
+*.pt
+
+# Conda
+.conda/
+
+# IDE
+.vscode/
+.idea/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Docker
+docker-compose.override.yaml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Isaac Sim/Lab
+*.usda
+*.usdc
+*.usd
+
+# Misc
+*.log
+*.swp
+*.swo

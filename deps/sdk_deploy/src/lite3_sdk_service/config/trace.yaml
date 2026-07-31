@@ -1,0 +1,8 @@
+# lite3_sdk_service trace config
+enable: false
+console: false
+file: false
+
+sdk_service_trace: false
+
+log_dir: ""
