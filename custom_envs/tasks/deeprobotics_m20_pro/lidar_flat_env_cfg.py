@@ -23,8 +23,8 @@ TABLE_USD = os.path.join(os.path.dirname(__file__), "..", "..", "objects", "Shop
 def _banana_cfg(pos=(5.0, 5.0, 0.9), rot=(1.0, 0.0, 0.0, 0.0)):
     """RigidObject config for the banana target.
 
-    Spawns slightly above the table (z=0.9) and drops under gravity
-    to rest on the table surface (~z=0.85 after settling).
+    Spawns slightly above the table (z=0.70) and drops under gravity
+    to rest on the table surface (~z=0.65 + 0.05 clearance).
     """
     return RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/banana",
