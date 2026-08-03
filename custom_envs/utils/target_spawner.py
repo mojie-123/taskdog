@@ -1,43 +1,62 @@
-"""Target-object helpers — spawn a visible sphere and query its position."""
+"""Target-object helpers — spawn a banana as a physics RigidObject."""
 
-from isaaclab.sim.spawners import SphereCfg
-from isaaclab.assets import AssetBaseCfg
+import os
+import isaaclab.sim as sim_utils
+from isaaclab.assets import RigidObjectCfg
+
+BANANA_USD_PATH = os.path.join(
+    os.path.dirname(__file__), "..", "objects", "011_banana.usd"
+)
 
 
-def spawn_target_sphere(scene, pos=(5.0, 2.0, 0.3), radius=0.15):
-    """Add a static red sphere to the scene config (call inside __post_init__).
+def spawn_banana(scene, pos=(10.0, 10.0, 0.03), rot=(1.0, 0.0, 0.0, 0.0)):
+    """Add a physics-enabled banana RigidObject to the scene config.
 
-    The sphere is visual-only — no MDL material (avoids unavailable asset paths).
-    Use a simple diffuse color instead.  RayCaster in IsaacLab 2.3.2 only supports
-    a single mesh prim, so the sphere is NOT added to LiDAR mesh_prim_paths.
-    Navigation goals are specified manually via --goal.
+    The banana spawns at *pos* and drops to the ground under gravity.
+    Call inside __post_init__.
 
     Args:
-        scene:  self.scene (InteractiveSceneCfg instance).
-        pos:    (x, y, z) world position.
-        radius: sphere radius (m).
+        scene: self.scene (InteractiveSceneCfg instance).
+        pos:   (x, y, z) world spawn position.
+        rot:   (w, x, y, z) quaternion orientation.
 
     Returns:
-        prim_path string.
+        prim_path string for LiDAR mesh_prim_paths.
+        With num_envs=1, {ENV_REGEX_NS} resolves to /World/envs/env_0.
     """
-    prim_path = "/World/target_ball"
-    scene.target_sphere = AssetBaseCfg(
+    prim_path = "/World/envs/env_0/banana"
+    scene.banana = RigidObjectCfg(
         prim_path=prim_path,
-        spawn=SphereCfg(radius=radius),
-        init_state=AssetBaseCfg.InitialStateCfg(pos=pos),
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=BANANA_USD_PATH,
+            scale=(1, 1, 1),
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                rigid_body_enabled=True,
+                kinematic_enabled=False,
+                linear_damping=2.0,
+                angular_damping=4.0,
+                max_depenetration_velocity=0.5,
+            ),
+            mass_props=sim_utils.MassPropertiesCfg(mass=0.5),
+            collision_props=sim_utils.CollisionPropertiesCfg(
+                contact_offset=0.01,
+                rest_offset=0.0,
+            ),
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=pos, rot=rot),
     )
     return prim_path
 
 
 def get_target_position():
-    """Read the sphere's world position from the USD stage.
+    """Read the banana's world position from the USD stage.
 
     Only callable while Isaac Sim is running.
     Returns (x, y, z) in meters, or None on failure.
     """
     try:
         from omni.isaac.core.utils.prims import get_prim_at_path
-        prim = get_prim_at_path("/World/target_ball")
+        prim = get_prim_at_path("/World/envs/env_0/banana")
         attr = prim.GetAttribute("xformOp:translate")
         if attr.IsValid():
             v = attr.Get()

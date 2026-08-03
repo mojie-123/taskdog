@@ -2,17 +2,20 @@
 """Load a saved occupancy-grid map and navigate the robot to a goal.
 
 Usage:
-    python scripts/navigation/navigate_to_goal.py \\
-        --task=Flat-Deeprobotics-M20Pro-Lidar-v0 \\
-        --map=maps/my_map.npz \\
-        --goal 5.0 2.0
+    python scripts/navigation/navigate_to_goal.py \
+        --task=Flat-Deeprobotics-M20Pro-Lidar-v0 \
+        --policy_task=Flat-Deeprobotics-M20-v0 \
+        --load_run=2026-07-18_10-57-32 \
+        --checkpoint=model_4999.pt \
+        --map=maps/my_map.npz \
+        --goal 7 7 \
+        --target_speed 0.5
 """
 
 import argparse
 import os
 import sys
 
-import cv2
 import numpy as np
 import torch
 
@@ -25,10 +28,9 @@ def main():
                         help="goal world coordinates, e.g. --goal 5.0 2.0")
     parser.add_argument("--num_envs", type=int, default=1)
     parser.add_argument("--target_speed", type=float, default=0.8)
-    parser.add_argument("--load_run", default=None, help="run dir (default: latest)")
-    parser.add_argument("--checkpoint", default=None, help="checkpoint filename (default: latest)")
-    parser.add_argument("--policy_task", default=None,
-                        help="task whose trained model to use (default: same as --task)")
+    parser.add_argument("--load_run", default=None)
+    parser.add_argument("--checkpoint", default=None)
+    parser.add_argument("--policy_task", default=None)
     args, unknown = parser.parse_known_args()
 
     # ---- Isaac Sim launch ----
@@ -50,7 +52,7 @@ def main():
     grid = OccupancyGrid.load(args.map)
     goal_world = (args.goal[0], args.goal[1])
 
-    # ---- env ----
+    # ---- build env config ----
     from isaaclab_tasks.utils.parse_cfg import load_cfg_from_registry
     env_cfg = load_cfg_from_registry(args.task, "env_cfg_entry_point")
     env_cfg.scene.num_envs = 1
@@ -58,7 +60,7 @@ def main():
     env_cfg.events.randomize_apply_external_force_torque = None
     env_cfg.terminations.time_out = None
 
-    # ---- load locomotion policy ----
+    # ---- load policy (RSL-RL standard pattern) ----
     from rsl_rl.runners import OnPolicyRunner
     from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
     from isaaclab_tasks.utils import get_checkpoint_path
@@ -67,7 +69,6 @@ def main():
     from isaaclab_tasks.utils.parse_cfg import load_cfg_from_registry as load_cfg
     agent_cfg = load_cfg(policy_task, "rsl_rl_cfg_entry_point")
 
-    # If policy was trained WITHOUT LiDAR, strip LiDAR obs from sim env
     if "Lidar" not in policy_task and "Lidar" in args.task:
         print("[INFO] Policy has no LiDAR — stripping LiDAR observations from env")
         env_cfg.observations.policy.lidar = None
@@ -75,8 +76,11 @@ def main():
         if hasattr(env_cfg.scene, "mid360_lidar"):
             env_cfg.scene.mid360_lidar.debug_vis = False
 
+    # create env
     env = gym.make(args.task, cfg=env_cfg)
-    obs = env.reset()[0]
+    obs = env.reset()[0]  # raw env returns tensor (policy obs group)
+
+    # load checkpoint
     _rl_training_root = os.path.abspath(
         os.path.join(os.path.dirname(__file__), "..", "..", "..", "deps", "rl_training")
     )
@@ -108,6 +112,7 @@ def main():
     runner.load(resume_path)
     policy = runner.get_inference_policy(device="cuda:0")
     print("[INFO] Policy loaded")
+    print(f"[DEBUG] obs type: {type(obs)}, keys: {list(obs.keys()) if isinstance(obs, dict) else 'N/A'}")
 
     # ---- controller ----
     pp = PurePursuitController(target_speed=args.target_speed)
@@ -118,8 +123,13 @@ def main():
     print(f"\n[INFO] Navigate to goal {goal_world}")
     print(f"[INFO] Map: {args.map}\n")
 
+    import time, traceback
+    loop_count = 0
+    MAX_STEPS = 10000  # ~200 seconds at 0.02s/step, plenty to reach goal
     try:
-        while simulation_app.is_running():
+        while loop_count < MAX_STEPS:
+            loop_count += 1
+            # get robot pose from unwrapped env
             robot = env.unwrapped.scene["robot"]
             pos_w = robot.data.root_pos_w[0].cpu().numpy()
             quat_w = robot.data.root_quat_w[0].cpu().numpy()
@@ -129,7 +139,6 @@ def main():
             # ---- check arrival ----
             if is_goal_reached(robot_pose, goal_world, threshold=0.5):
                 print("[INFO] Goal reached!")
-                cv2.waitKey(2000)
                 break
 
             # ---- replan ----
@@ -159,37 +168,41 @@ def main():
             else:
                 vx, omega = 0.0, 0.0
 
-            # ---- send to locomotion (via observation override) ----
+            # Inject velocity command into the policy observation.
+            # obs is a dict; "policy" key is tensor shape (1, 57).
+            # Indices: base_ang_vel(0:3), projected_gravity(3:6),
+            # velocity_commands(6:9), joint_pos(9:25), joint_vel(25:41), actions(41:57)
+            # Must clone — the tensor is an "inference tensor" (created inside
+            # torch.inference_mode) and cannot be modified inplace.
+            p_obs = obs["policy"].clone()
+            p_obs[0, 6] = vx
+            p_obs[0, 7] = 0.0
+            p_obs[0, 8] = omega
+            obs["policy"] = p_obs
+
+            # ---- send to locomotion ----
             with torch.inference_mode():
                 actions = policy(obs)
-                obs = env.step(actions)[0]
+                step_result = env.step(actions)
+                obs = step_result[0]
+                print(f"[TRACE] step done, loop={loop_count}", flush=True)
 
-            # ---- visualisation ----
-            viz = grid.get_visualization()
-            # draw path
-            if path_world is not None:
-                for wx, wy in path_world:
-                    r, c = grid.world_to_grid(wx, wy)
-                    if 0 <= r < grid.height and 0 <= c < grid.width:
-                        cv2.circle(viz, (c, r), 1, (0, 255, 0), -1)
-            # draw robot
-            rr, rc = grid.world_to_grid(robot_pose[0], robot_pose[1])
-            cv2.circle(viz, (rc, rr), 4, (255, 0, 0), -1)
-            # draw goal
-            gr, gc = grid.world_to_grid(goal_world[0], goal_world[1])
-            cv2.circle(viz, (gc, gr), 5, (0, 0, 255), -1)
+            if loop_count <= 5:
+                pos = env.unwrapped.scene["robot"].data.root_pos_w[0].cpu().numpy()
+                print(f"[DEBUG] step {loop_count}: robot=({pos[0]:.1f},{pos[1]:.1f}) "
+                      f"vx={vx:.2f} w={omega:.2f} running={simulation_app.is_running()}")
 
-            status = f"vx={vx:.2f} ω={omega:.2f}  path={'OK' if path_world else 'NONE'}"
-            cv2.putText(viz, status, (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
-            cv2.imshow("Navigation", viz)
-            if cv2.waitKey(1) & 0xFF == 27:
-                break
+            # ---- terminal debug ----
+            if loop_count % 500 == 0 or loop_count <= 3:
+                dist = np.sqrt((robot_pose[0]-goal_world[0])**2 + (robot_pose[1]-goal_world[1])**2)
+                print(f"[NAV] step {loop_count}: robot=({robot_pose[0]:.1f},{robot_pose[1]:.1f}) "
+                      f"yaw={np.degrees(robot_pose[2]):.0f}deg "
+                      f"vx={vx:.2f} w={omega:.3f} dist={dist:.1f}m")
 
+    except Exception as e:
+        print(f"[ERROR] {e}")
+        traceback.print_exc()
     finally:
-        try:
-            cv2.destroyAllWindows()
-        except Exception:
-            pass
         env.close()
         simulation_app.close()
 

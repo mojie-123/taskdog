@@ -207,14 +207,23 @@ def main():
                         if len(finite) > 0:
                             # 2D grid: use all hits (ground provides free-space reference)
                             grid.update((pos[0], pos[1], yaw), finite)
-                            # 3D cloud: only above-ground hits (ball / obstacles), subsampled
-                            elevated = finite[np.abs(finite[:, 2]) > 0.15]
-                            if len(elevated) > 0:
-                                all_points_3d.append(elevated[::2])
+                            # 3D cloud: keep all finite hits (no z filter).
+                            # Banana sits on the ground (z≈0.03), so an absolute
+                            # z threshold like >0.15 would reject it.  Instead,
+                            # save everything; use viz_map.py --no_ground later.
+                            if len(finite) > 0:
+                                all_points_3d.append(finite[::2])
                             if frame % 100 == 0 and frame > 0:
+                                # Count hits near banana position (5, 5) — verify PhysX
+                                banana_pos = np.array([5.0, 5.0])
+                                near_banana = finite[
+                                    (np.abs(finite[:, 0] - banana_pos[0]) < 1.0)
+                                    & (np.abs(finite[:, 1] - banana_pos[1]) < 1.0)
+                                ]
                                 print(f"[DEBUG] frame {frame}: {len(finite)} hits, "
                                       f"z=[{finite[:,2].min():.3f},{finite[:,2].max():.3f}], "
-                                      f"elevated={len(elevated)}, total_elev={sum(len(p) for p in all_points_3d)}")
+                                      f"near_banana={len(near_banana)}, "
+                                      f"total_cloud={sum(len(p) for p in all_points_3d)}")
                 except Exception as e:
                     print(f"[WARN] LiDAR read failed (frame {frame}): {e}")
 

@@ -50,7 +50,10 @@ class PurePursuitController:
 
         # --- 4. curvature → omega ---
         curvature = 2.0 * dy_body / max(lookahead * lookahead, 1e-6)
-        omega = current_vx * curvature
+        # Use target speed (not current_vx which may be 0) so that
+        # the robot can turn from a stand-still.
+        speed_for_omega = max(current_vx, self.target_speed * 0.3)
+        omega = speed_for_omega * curvature
         omega = float(np.clip(omega, -self.max_omega, self.max_omega))
 
         # --- 5. linear speed: slow down on tight turns ---

@@ -2,7 +2,7 @@
 
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import SceneEntityCfg
-from isaaclab.sensors.ray_caster import RayCasterCfg
+from isaaclab.sensors.ray_caster import MultiMeshRayCasterCfg
 from isaaclab.utils import configclass
 
 from custom_envs.tasks.deeprobotics_m20_pro.rough_env_cfg import (
@@ -33,15 +33,15 @@ class DeeproboticsM20ProLidarRoughEnvCfg(DeeproboticsM20ProRoughEnvCfg):
     def __post_init__(self):
         super().__post_init__()
 
-        # ---- LiDAR sensor ----
-        self.scene.mid360_lidar = RayCasterCfg(
+        # ---- LiDAR sensor (MultiMeshRayCaster for object-space raycasting) ----
+        self.scene.mid360_lidar = MultiMeshRayCasterCfg(
             prim_path="{ENV_REGEX_NS}/Robot/" + self.base_link_name,
-            offset=RayCasterCfg.OffsetCfg(pos=(0.30, 0.0, 0.55)),
+            offset=MultiMeshRayCasterCfg.OffsetCfg(pos=(0.30, 0.0, 0.55)),
             ray_alignment="base",
             pattern_cfg=get_mid360_lidar_pattern_light(),
             max_distance=70.0,
             update_period=0.1,
-            debug_vis=False,  # disable for training — saves GPU memory
+            debug_vis=False,
             mesh_prim_paths=["/World/ground"],
         )
 
