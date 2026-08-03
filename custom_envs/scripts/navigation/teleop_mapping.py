@@ -205,12 +205,15 @@ def main():
                         quat = robot.data.root_quat_w[0].cpu().numpy()
                         yaw = euler_from_quat(quat)
                         if len(finite) > 0:
-                            # 2D grid: use all hits (ground provides free-space reference)
+                            # 2D grid:
+                            #   All hits → mark free space along rays (Bresenham).
+                            #   Elevated hits → mark occupied cells (obstacles).
                             grid.update((pos[0], pos[1], yaw), finite)
+                            elevated = finite[np.abs(finite[:, 2]) > 0.15]
+                            if len(elevated) > 0:
+                                grid.mark_elevated(elevated[:, :2], min_hits=1)
                             # 3D cloud: keep all finite hits (no z filter).
-                            # Banana sits on the ground (z≈0.03), so an absolute
-                            # z threshold like >0.15 would reject it.  Instead,
-                            # save everything; use viz_map.py --no_ground later.
+                            # Save everything; use viz_map.py --no_ground later.
                             if len(finite) > 0:
                                 all_points_3d.append(finite[::2])
                             if frame % 100 == 0 and frame > 0:

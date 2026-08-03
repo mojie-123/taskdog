@@ -25,6 +25,9 @@ class OccupancyGrid:
         self.grid = np.zeros((height, width), dtype=np.float32)
         self.origin = (0.0, 0.0)  # world coordinate of grid[0, 0]
 
+        # persistent hit counter for mark_elevated (accumulates across calls)
+        self._elevated_count = np.zeros((height, width), dtype=np.int32)
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -66,6 +69,23 @@ class OccupancyGrid:
         """
         return (self.grid > 0.0).astype(np.uint8)
 
+    def get_inflated_binary_map(self, robot_radius: float = 0.3):
+        """Binary obstacle map with obstacles inflated by *robot_radius*.
+
+        This ensures A* keeps the robot centre at least *robot_radius*
+        away from any detected obstacle, preventing collisions from the
+        robot's physical width.
+
+        Args:
+            robot_radius: inflation radius in meters (default 0.3 m).
+        """
+        from scipy.ndimage import binary_dilation
+
+        binary = self.get_binary_map()
+        cells = max(1, int(robot_radius / self.resolution))
+        struct = np.ones((2 * cells + 1, 2 * cells + 1), dtype=bool)
+        return binary_dilation(binary, structure=struct).astype(np.uint8)
+
     def get_visualization(self):
         """Return an 8-bit BGR image suitable for cv2.imshow.
 
@@ -105,21 +125,52 @@ class OccupancyGrid:
     # ------------------------------------------------------------------
 
     def _ray_cast(self, sx: float, sy: float, ex: float, ey: float):
-        """Bresenham ray: free cells along the ray, occupied at the end."""
+        """Bresenham ray: mark cells along the ray as free only.
+
+        The endpoint is NOT marked as occupied here — that is handled
+        separately by :meth:`mark_elevated` for above-ground hits.
+        """
         sc, sr = self.world_to_grid(sx, sy)
         ec, er = self.world_to_grid(ex, ey)
-        # clamp to grid bounds (ball hits near edge can go out)
         sr, sc = max(0, min(sr, self.height-1)), max(0, min(sc, self.width-1))
         er, ec = max(0, min(er, self.height-1)), max(0, min(ec, self.width-1))
 
         for r, c in self._bresenham(sr, sc, er, ec):
             if 0 <= r < self.height and 0 <= c < self.width:
-                if r == er and c == ec:
-                    self.grid[r, c] += 0.8   # occupied  (log-odds increment)
-                else:
-                    self.grid[r, c] -= 0.4   # free
-            # clamp to avoid divergence
+                self.grid[r, c] -= 0.4   # free
             self.grid[r, c] = float(np.clip(self.grid[r, c], -10.0, 10.0))
+
+    # ------------------------------------------------------------------
+    # Elevated-hit projection
+    # ------------------------------------------------------------------
+
+    def mark_elevated(self, hits_xy: np.ndarray, min_hits: int = 3):
+        """Project elevated LiDAR hits onto the 2D grid as occupied cells.
+
+        Accumulates hits across calls in a persistent counter, so cells only
+        become occupied after *min_hits* total hits across the entire session.
+
+        Args:
+            hits_xy: (N, 2) numpy array of world (x, y) positions from
+                     above-ground LiDAR hits.
+            min_hits: minimum number of hits in a cell to confirm occupancy.
+        """
+        for x, y in hits_xy:
+            r, c = self.world_to_grid(x, y)
+            if 0 <= r < self.height and 0 <= c < self.width:
+                self._elevated_count[r, c] += 1
+
+        occupied_mask = self._elevated_count >= min_hits
+        if occupied_mask.any():
+            self.grid[occupied_mask] = 10.0
+
+        # Debug: print progress every ~200 total elevated hits
+        total = self._elevated_count.sum()
+        if total % 200 < len(hits_xy) or total < 10:
+            n_occ = (self._elevated_count >= min_hits).sum()
+            max_c = self._elevated_count.max()
+            print(f"[GRID] elevated total={total}, occupied_cells={n_occ}, "
+                  f"max_hits_per_cell={max_c}")
 
     @staticmethod
     def _bresenham(r0, c0, r1, c1):

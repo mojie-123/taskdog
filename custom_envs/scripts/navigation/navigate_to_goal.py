@@ -58,6 +58,8 @@ def main():
     env_cfg.scene.num_envs = 1
     env_cfg.observations.policy.enable_corruption = False
     env_cfg.events.randomize_apply_external_force_torque = None
+    env_cfg.events.randomize_reset_base = None   # spawn at origin, facing +x
+    env_cfg.events.randomize_reset_joints = None
     env_cfg.terminations.time_out = None
 
     # ---- load policy (RSL-RL standard pattern) ----
@@ -144,16 +146,31 @@ def main():
             # ---- replan ----
             replan_counter += 1
             if replan_counter % REPLAN_EVERY == 0 or path_world is None:
-                bin_map = grid.get_binary_map()
+                bin_map = grid.get_inflated_binary_map(robot_radius=0.4)
                 start_rc = world_to_grid(
                     robot_pose[0], robot_pose[1], grid.origin, grid.resolution
                 )
                 goal_rc = world_to_grid(
                     goal_world[0], goal_world[1], grid.origin, grid.resolution
                 )
+                # Clear a patch around start/goal so A* has room to plan.
+                # Clearing just the single cell isn't enough when the
+                # robot is deep in the inflation zone (all neighbours blocked).
+                clear_radius = max(1, int(0.3 / grid.resolution))  # ~6 cells
+                for rr in range(start_rc[0]-clear_radius, start_rc[0]+clear_radius+1):
+                    for cc in range(start_rc[1]-clear_radius, start_rc[1]+clear_radius+1):
+                        if 0 <= rr < bin_map.shape[0] and 0 <= cc < bin_map.shape[1]:
+                            bin_map[rr, cc] = 0
+                for rr in range(goal_rc[0]-clear_radius, goal_rc[0]+clear_radius+1):
+                    for cc in range(goal_rc[1]-clear_radius, goal_rc[1]+clear_radius+1):
+                        if 0 <= rr < bin_map.shape[0] and 0 <= cc < bin_map.shape[1]:
+                            bin_map[rr, cc] = 0
                 raw_path = astar_plan(bin_map, start_rc, goal_rc)
                 if raw_path is None:
-                    print("[WARN] A* returned no path — retrying next cycle")
+                    roi = bin_map[max(0,start_rc[0]-3):start_rc[0]+4,
+                                  max(0,start_rc[1]-3):start_rc[1]+4]
+                    print(f"[WARN] A* failed: start={start_rc} "
+                          f"nearby_blocked={roi.sum()} pos=({robot_pose[0]:.1f},{robot_pose[1]:.1f})")
                     path_world = None
                 else:
                     path_world = [
@@ -192,6 +209,10 @@ def main():
                 print(f"[DEBUG] step {loop_count}: robot=({pos[0]:.1f},{pos[1]:.1f}) "
                       f"vx={vx:.2f} w={omega:.2f} running={simulation_app.is_running()}")
 
+            # ---- save map PNG periodically ----
+            if loop_count % 200 == 0 or loop_count == 1:
+                _save_nav_png(grid, path_world, robot_pose, goal_world, loop_count)
+
             # ---- terminal debug ----
             if loop_count % 500 == 0 or loop_count <= 3:
                 dist = np.sqrt((robot_pose[0]-goal_world[0])**2 + (robot_pose[1]-goal_world[1])**2)
@@ -205,6 +226,41 @@ def main():
     finally:
         env.close()
         simulation_app.close()
+
+
+def _save_nav_png(grid, path_world, robot_pose, goal_world, step):
+    """Save a PNG snapshot of the navigation map."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    viz = grid.get_visualization()
+    # Convert BGR to RGB for matplotlib
+    viz_rgb = viz[:, :, ::-1]
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    ax.imshow(viz_rgb, origin="upper")
+
+    if path_world is not None:
+        px, py = [], []
+        for wx, wy in path_world:
+            r, c = grid.world_to_grid(wx, wy)
+            px.append(c); py.append(r)
+        ax.plot(px, py, "g-", linewidth=1.0, alpha=0.8)
+
+    rr, rc = grid.world_to_grid(robot_pose[0], robot_pose[1])
+    ax.plot(rc, rr, "bo", markersize=8, label="Robot")
+
+    gr, gc = grid.world_to_grid(goal_world[0], goal_world[1])
+    ax.plot(gc, gr, "r*", markersize=12, label="Goal")
+
+    ax.set_title(f"Navigation — step {step}")
+    ax.legend()
+
+    path = f"/home/mojie/taskdog/custom_envs/maps/nav_step_{step:04d}.png"
+    fig.savefig(path, dpi=100, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[NAV] snapshot saved → {path}")
 
 
 if __name__ == "__main__":
