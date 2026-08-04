@@ -59,6 +59,10 @@ def main():
     import gymnasium as gym
     import custom_envs.tasks  # noqa: F401
 
+    _piper_mode = "Piper" in args.task
+    if _piper_mode:
+        from custom_envs.tasks.deeprobotics_m20_pro.piper_env_cfg import piper_mount_and_follow
+
     from custom_envs.utils.occupancy_grid import OccupancyGrid
     from custom_envs.utils.nav_utils import euler_from_quat
 
@@ -186,6 +190,8 @@ def main():
                 with torch.inference_mode():
                     actions = policy(obs)
                     obs = env.step(actions)[0]
+                    if _piper_mode:
+                        piper_mount_and_follow(env)
             except Exception as e:
                 print(f"[ERROR] env.step failed: {e}")
                 import traceback; traceback.print_exc()

@@ -41,6 +41,10 @@ def main():
     import gymnasium as gym
     import custom_envs.tasks  # noqa: F401
 
+    _piper_mode = "Piper" in args.task
+    if _piper_mode:
+        from custom_envs.tasks.deeprobotics_m20_pro.piper_env_cfg import piper_mount_and_follow
+
     from custom_envs.utils.occupancy_grid import OccupancyGrid
     from custom_envs.utils.astar_planner import astar_plan
     from custom_envs.utils.pure_pursuit import PurePursuitController
@@ -202,6 +206,8 @@ def main():
                 actions = policy(obs)
                 step_result = env.step(actions)
                 obs = step_result[0]
+                if _piper_mode:
+                    piper_mount_and_follow(env)
                 print(f"[TRACE] step done, loop={loop_count}", flush=True)
 
             if loop_count <= 5:
