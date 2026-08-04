@@ -257,7 +257,7 @@ def _save_nav_png(grid, path_world, robot_pose, goal_world, step):
     ax.set_title(f"Navigation — step {step}")
     ax.legend()
 
-    path = f"/home/mojie/taskdog/custom_envs/maps/nav_step_{step:04d}.png"
+    path = f"/home/mojie/taskdog/custom_envs/maps/nav_process/nav_step_{step:04d}.png"
     fig.savefig(path, dpi=100, bbox_inches="tight")
     plt.close(fig)
     print(f"[NAV] snapshot saved → {path}")
