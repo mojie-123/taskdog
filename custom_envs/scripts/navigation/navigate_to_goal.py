@@ -43,7 +43,7 @@ def main():
 
     _piper_mode = "Piper" in args.task
     if _piper_mode:
-        from custom_envs.tasks.deeprobotics_m20_pro.piper_env_cfg import piper_mount_and_follow
+        from custom_envs.tasks.deeprobotics_m20_pro.piper_env_cfg import setup_piper_sync
 
     from custom_envs.utils.occupancy_grid import OccupancyGrid
     from custom_envs.utils.astar_planner import astar_plan
@@ -85,6 +85,10 @@ def main():
     # create env
     env = gym.make(args.task, cfg=env_cfg)
     obs = env.reset()[0]  # raw env returns tensor (policy obs group)
+
+    # ---- register Piper sub-step sync ----
+    if _piper_mode:
+        setup_piper_sync(env)
 
     # load checkpoint
     _rl_training_root = os.path.abspath(
@@ -206,9 +210,6 @@ def main():
                 actions = policy(obs)
                 step_result = env.step(actions)
                 obs = step_result[0]
-                if _piper_mode:
-                    piper_mount_and_follow(env)
-                print(f"[TRACE] step done, loop={loop_count}", flush=True)
 
             if loop_count <= 5:
                 pos = env.unwrapped.scene["robot"].data.root_pos_w[0].cpu().numpy()

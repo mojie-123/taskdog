@@ -3,51 +3,46 @@
 Joints (26 total, 16 active + 8 arm/gripper frozen):
   12 leg joints (fl/fr/hl/hr × hipx/hipy/knee)
    4 wheel joints (fl/fr/hl/hr_wheel)
-   6 arm joints (joint1–joint6, Piper 6-DOF)
-   1 gripper (joint7, prismatic)
-   1 finger (joint8, prismatic)
-   2 fixed (base_to_arm, joint6_to_gripper_base)
+   6 arm joints (arm_joint1–arm_joint6, Piper 6-DOF)
+   1 gripper (arm_joint7, prismatic)
+   1 finger (arm_joint8, prismatic)
+   2 fixed (FixedJoint in arm_base, joint6_to_gripper_base)
 
 The arm + gripper are **frozen** at a folded pose so they do not
 interfere with locomotion.  Only the 16 leg + wheel joints appear in
 the action space.
+
+USD source: custom_envs/assets/m20_piper.usda (hand-authored single
+articulation following the ATEC2026 b2_piper.usda pattern).
 """
 
 import os
 import isaaclab.sim as sim_utils
-from isaaclab.actuators import DCMotorCfg, DelayedPDActuatorCfg, IdealPDActuatorCfg
+from isaaclab.actuators import DelayedPDActuatorCfg, IdealPDActuatorCfg
 from isaaclab.assets.articulation import ArticulationCfg
 
-# USD path (same location as other Deep Robotics models)
-_MODEL_DIR = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "..", "deps", "deep_robotics_model")
-)
-M20_PIPER_USD = os.path.join(_MODEL_DIR, "M20_Piper", "usd", "M20_Piper.usd")
+_ASSETS_DIR = os.path.dirname(__file__)
+M20_PIPER_USD = os.path.join(_ASSETS_DIR, "m20_piper.usda")
 
 # ---------------------------------------------------------------------------
-# Helper — arm joint names for frozen init
+# Arm / gripper joint names (frozen at parked pose)
 # ---------------------------------------------------------------------------
-ARM_JOINT_NAMES = ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]
-GRIPPER_JOINT_NAMES = ["joint7", "joint8"]
+ARM_JOINT_NAMES = [
+    "arm_joint1", "arm_joint2", "arm_joint3",
+    "arm_joint4", "arm_joint5", "arm_joint6",
+]
+GRIPPER_JOINT_NAMES = ["arm_joint7", "arm_joint8"]
 
-# Folded pose on the dog's back (within joint limits from URDF).
-#   joint1:   base rotation             [-2.618,  2.618]
-#   joint2:   shoulder                  [ 0,      3.14 ]
-#   joint3:   elbow                     [-2.967,  0     ]
-#   joint4:   wrist roll                [-1.745,  1.745]
-#   joint5:   wrist pitch               [-1.22,   1.22 ]
-#   joint6:   wrist yaw                 [-2.094,  2.094]
-#   joint7:   gripper (prismatic)       [ 0,      0.035]
-#   joint8:   finger (prismatic)        [-0.035,  0     ]
+# Folded pose on the dog's back (within joint limits from URDF / ATEC2026).
 ARM_FOLDED_POSE = {
-    "joint1": 0.0,
-    "joint2": 0.3,
-    "joint3": -1.5,
-    "joint4": 0.0,
-    "joint5": 0.8,
-    "joint6": 0.0,
-    "joint7": 0.0175,   # gripper half-open
-    "joint8": -0.0175,  # fingers half-closed
+    "arm_joint1": 0.0,
+    "arm_joint2": 0.3,
+    "arm_joint3": -1.5,
+    "arm_joint4": 0.0,
+    "arm_joint5": 0.8,
+    "arm_joint6": 0.0,
+    "arm_joint7": 0.0175,   # gripper half-open
+    "arm_joint8": -0.0175,  # finger half-closed
 }
 
 # ---------------------------------------------------------------------------
@@ -57,7 +52,7 @@ ARM_FOLDED_POSE = {
 DEEPROBOTICS_M20_PIPER_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
         usd_path=M20_PIPER_USD,
-        activate_contact_sensors=False,
+        activate_contact_sensors=True,
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             disable_gravity=False,
             retain_accelerations=False,
@@ -117,10 +112,10 @@ DEEPROBOTICS_M20_PIPER_CFG = ArticulationCfg(
         # --- Arm (frozen — not in action space) ---
         "arm": IdealPDActuatorCfg(
             joint_names_expr=ARM_JOINT_NAMES,
-            effort_limit=30.0,
+            effort_limit=100.0,
             velocity_limit=10.0,
-            stiffness=80.0,
-            damping=4.0,
+            stiffness=800.0,
+            damping=80.0,
             friction=0.0,
         ),
         # --- Gripper (frozen — not in action space) ---
@@ -128,8 +123,8 @@ DEEPROBOTICS_M20_PIPER_CFG = ArticulationCfg(
             joint_names_expr=GRIPPER_JOINT_NAMES,
             effort_limit=10.0,
             velocity_limit=2.0,
-            stiffness=40.0,
-            damping=2.0,
+            stiffness=400.0,
+            damping=20.0,
             friction=0.0,
         ),
     },
