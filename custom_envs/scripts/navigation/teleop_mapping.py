@@ -59,8 +59,11 @@ def main():
     import gymnasium as gym
     import custom_envs.tasks  # noqa: F401
 
-    _piper_mode = "Piper" in args.task
-    if _piper_mode:
+    # Only the legacy Piper task uses a separate articulation that must be
+    # synchronized to the mobile base. The Single task contains Piper in the
+    # robot articulation itself and must not install this callback.
+    _dual_piper_mode = "Piper" in args.task and "Piper-Single" not in args.task
+    if _dual_piper_mode:
         from custom_envs.tasks.deeprobotics_m20_pro.piper_env_cfg import setup_piper_sync
 
     from custom_envs.utils.occupancy_grid import OccupancyGrid
@@ -117,8 +120,15 @@ def main():
     env = gym.make(args.task, cfg=env_cfg)
     obs = env.reset()[0]
 
+    # Mapping is optional: the minimal Single articulation task intentionally
+    # has no LiDAR. Avoid emitting a KeyError warning every five frames while
+    # still allowing locomotion teleoperation and policy smoke tests.
+    _has_lidar = "mid360_lidar" in env.unwrapped.scene.keys()
+    if not _has_lidar:
+        print("[WARN] Task has no 'mid360_lidar'; occupancy mapping is disabled")
+
     # ---- register Piper sub-step sync ----
-    if _piper_mode:
+    if _dual_piper_mode:
         setup_piper_sync(env)
 
     # Resolve checkpoint: explicit args take priority, else auto-latest
@@ -201,7 +211,7 @@ def main():
 
             # --- LiDAR → map every 5 frames ---
             frame += 1
-            if frame % 5 == 0:
+            if _has_lidar and frame % 5 == 0:
                 try:
                     lidar = env.unwrapped.scene["mid360_lidar"]
                     robot = env.unwrapped.scene["robot"]

@@ -73,3 +73,15 @@ gym.register(
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:DeeproboticsM20ProFlatPPORunnerCfg",
     },
 )
+
+# Isolated single-articulation integration. The existing dual-articulation
+# task above remains available as a rollback/reference path.
+gym.register(
+    id="Flat-Deeprobotics-M20Pro-Piper-Single-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.single_piper_env_cfg:DeeproboticsM20ProSinglePiperEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:DeeproboticsM20ProFlatPPORunnerCfg",
+    },
+)

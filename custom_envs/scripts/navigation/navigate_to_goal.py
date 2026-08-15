@@ -31,17 +31,29 @@ def main():
     parser.add_argument("--load_run", default=None)
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--policy_task", default=None)
+    parser.add_argument("--grasp_checkpoint", default=None,
+                        help="Path to graspnet checkpoint-rs.tar (enables Phase 2 grasp)")
+    parser.add_argument("--grasp_topk", type=int, default=1,
+                        help="Number of top grasps to attempt (default 1)")
     args, unknown = parser.parse_known_args()
 
     # ---- Isaac Sim launch ----
     from isaaclab.app import AppLauncher
+    # Enable camera rendering when a grasp checkpoint is provided (wrist camera
+    # is required for Phase 2 point cloud acquisition).
+    if args.grasp_checkpoint is not None:
+        args.enable_cameras = True
     app_launcher = AppLauncher(args)
     simulation_app = app_launcher.app
 
     import gymnasium as gym
     import custom_envs.tasks  # noqa: F401
 
-    _piper_mode = "Piper" in args.task
+    # Only the legacy dual-articulation Piper-v0 task needs the sub-step sync
+    # callback. Single-v0 embeds Piper inside the robot articulation itself and
+    # has no separate 'piper' scene entity — calling setup_piper_sync on it
+    # raises a KeyError.
+    _piper_mode = "Piper" in args.task and "Piper-Single" not in args.task
     if _piper_mode:
         from custom_envs.tasks.deeprobotics_m20_pro.piper_env_cfg import setup_piper_sync
 
@@ -148,7 +160,8 @@ def main():
 
             # ---- check arrival ----
             if is_goal_reached(robot_pose, goal_world, threshold=0.5):
-                print("[INFO] Goal reached!")
+                print("[INFO] Goal reached! Starting Phase 2 (grasp)...")
+                _phase2_grasp(env, args, robot_pose)
                 break
 
             # ---- replan ----
@@ -233,6 +246,149 @@ def main():
     finally:
         env.close()
         simulation_app.close()
+
+
+def _phase2_grasp(env, args, robot_pose):
+    """Phase 2: wrist camera → grasp detection → IK → execute arm."""
+    import subprocess
+    import sys as _sys
+
+    checkpoint = getattr(args, "grasp_checkpoint", None)
+    if checkpoint is None:
+        print("[Phase2] No --grasp_checkpoint specified, skipping grasp.")
+        return
+    if not os.path.exists(checkpoint):
+        print(f"[Phase2] Checkpoint not found: {checkpoint}")
+        return
+
+    print("[Phase2] Reading wrist camera...")
+    raw_env = env.unwrapped
+    raw_env.sim.step()
+    raw_env.sim.render()
+
+    try:
+        camera = raw_env.scene["wrist_camera"]
+        rgb   = camera.data.output["rgb"][0].cpu().numpy()
+        depth = camera.data.output["distance_to_image_plane"][0].cpu().numpy()
+    except (KeyError, AttributeError) as e:
+        print(f"[Phase2] Camera not available: {e}. Skipping.")
+        return
+
+    H, W = depth.shape
+    fx, fy, cx, cy = 616.0, 616.0, W / 2.0, H / 2.0
+    u_g, v_g = np.meshgrid(np.arange(W), np.arange(H))
+    z = depth.astype(np.float32)
+    valid = (z > 0.05) & (z < 2.0)
+    z_v = z[valid]
+    points = np.stack([
+        (u_g[valid] - cx) * z_v / fx,
+        (v_g[valid] - cy) * z_v / fy,
+        z_v,
+    ], axis=-1).astype(np.float32)
+    colors = (rgb[:, :, :3][valid] / 255.0).astype(np.float32)
+    print(f"[Phase2] Point cloud: {len(points)} pts")
+
+    if len(points) < 200:
+        print("[Phase2] Too few points, skipping grasp.")
+        return
+
+    np.savez("/tmp/pointcloud.npz", points=points, colors=colors)
+
+    worker = os.path.join(os.path.dirname(__file__), "grasp_worker.py")
+    topk = getattr(args, "grasp_topk", 1)
+    print("[Phase2] Running grasp_worker subprocess...")
+    result = subprocess.run(
+        [_sys.executable, worker,
+         "--checkpoint", checkpoint,
+         "--topk", str(topk)],
+        timeout=120,
+    )
+    if result.returncode != 0:
+        print(f"[Phase2] grasp_worker failed (code {result.returncode})")
+        return
+
+    if not os.path.exists("/tmp/grasp_result.npz"):
+        print("[Phase2] No grasp result file.")
+        return
+    gr = np.load("/tmp/grasp_result.npz")
+    if len(gr["scores"]) == 0:
+        print("[Phase2] No valid grasps.")
+        return
+
+    t_cam = gr["translations"][0]
+    R_cam = gr["rotations"][0]
+    score = gr["scores"][0]
+    width = gr["widths"][0]
+    print(f"[Phase2] Best grasp score={score:.3f} t={np.round(t_cam,3)} w={width:.3f}")
+
+    _sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "utils"))
+    from arm_ik import solve as ik_solve, world_pos_to_arm_frame
+
+    robot = raw_env.scene["robot"]
+    pos_w  = robot.data.root_pos_w[0].cpu().numpy()
+    quat_w = robot.data.root_quat_w[0].cpu().numpy()
+    t_arm = world_pos_to_arm_frame(t_cam, pos_w, quat_w)
+
+    try:
+        joint_angles = ik_solve(t_arm, target_rot=R_cam)
+    except Exception as e:
+        print(f"[Phase2] IK failed: {e}")
+        return
+    print(f"[Phase2] IK angles: {np.round(joint_angles, 3)}")
+
+    _execute_arm(raw_env, joint_angles)
+    _close_gripper(raw_env)
+    print("[Phase2] Grasp complete!")
+
+
+def _execute_arm(raw_env, target_angles, n_steps=100):
+    """Interpolate arm to target_angles over n_steps."""
+    import torch
+    robot = raw_env.scene["robot"]
+    ARM_JOINTS = ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]
+    joint_ids = []
+    for name in ARM_JOINTS:
+        try:
+            joint_ids.append(robot.find_joints(name)[0][0])
+        except Exception:
+            pass
+    if len(joint_ids) != 6:
+        print(f"[Phase2] Found {len(joint_ids)}/6 arm joints, skipping.")
+        return
+    current = robot.data.joint_pos[0, joint_ids].cpu().numpy()
+    for step in range(n_steps):
+        alpha = (step + 1) / n_steps
+        interp = (1 - alpha) * current + alpha * target_angles
+        pos_t = robot.data.joint_pos_target[0].clone()
+        for i, jid in enumerate(joint_ids):
+            pos_t[jid] = interp[i]
+        robot.set_joint_position_target(pos_t.unsqueeze(0))
+        raw_env.sim.step()
+        raw_env.sim.render()
+
+
+def _close_gripper(raw_env, n_steps=50):
+    """Close Piper gripper."""
+    import torch
+    robot = raw_env.scene["robot"]
+    GRIPPER = {"joint7": 0.035, "joint8": -0.035}
+    joint_ids, targets = [], []
+    for name, val in GRIPPER.items():
+        try:
+            joint_ids.append(robot.find_joints(name)[0][0])
+            targets.append(val)
+        except Exception:
+            pass
+    if not joint_ids:
+        print("[Phase2] Gripper joints not found.")
+        return
+    for _ in range(n_steps):
+        pos_t = robot.data.joint_pos_target[0].clone()
+        for jid, val in zip(joint_ids, targets):
+            pos_t[jid] = val
+        robot.set_joint_position_target(pos_t.unsqueeze(0))
+        raw_env.sim.step()
+        raw_env.sim.render()
 
 
 def _save_nav_png(grid, path_world, robot_pose, goal_world, step):
