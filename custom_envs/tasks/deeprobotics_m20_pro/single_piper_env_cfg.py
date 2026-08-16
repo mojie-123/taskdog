@@ -69,22 +69,30 @@ class DeeproboticsM20ProSinglePiperEnvCfg(DeeproboticsM20ProLidarFlatEnvCfg):
         )
 
         # ---- Wrist RGB-D camera (mounted on gripper_base) ----
-        # Attached to the Piper gripper base link. The camera faces forward
-        # along the +Z axis of gripper_base (ROS convention), offset 5 cm
-        # forward from the link origin so it clears the gripper fingers.
-        # Outputs both RGB and depth (distance_to_image_plane) at 640x480,
-        # updated every 0.1 s (10 Hz), matching the grasp pipeline cadence.
+        # Simulates an Intel RealSense D435 mounted on the Piper gripper_base.
+        #
+        # Coordinate convention (convention="ros": +Z=optical/forward, +X=right, -Y=up):
+        #   gripper_base +X (finger-forward) --> camera +Z (optical axis / forward)
+        #   gripper_base +Y (finger-left)    --> camera -X (image left)
+        #   gripper_base +Z (finger-up)      --> camera -Y (image up)
+        # Quaternion derivation: R columns = parent-axis in ROS-camera frame
+        #   col0=[0,0,1], col1=[-1,0,0], col2=[0,-1,0]  => (w=0.5, x=0.5, y=-0.5, z=0.5)
+        #   (previously wrong: y=-0.5 was listed as -0.5 but z was -0.5 instead of +0.5)
+        #
+        # Intrinsics match Intel RealSense D435 at 640x480:
+        #   fx = fy = 616,  HFOV ≈ 54.9°,  VFOV ≈ 42.6°
         self.scene.wrist_camera = CameraCfg(
             prim_path="{ENV_REGEX_NS}/Robot/gripper_base/wrist_camera",
             offset=CameraCfg.OffsetCfg(
-                pos=(0.05, 0.0, 0.0),
-                rot=(0.5, 0.5, -0.5, -0.5),  # (w,x,y,z): rotates ROS +Z => gripper forward
+                pos=(0.05, 0.0, 0.0),        # 5 cm forward of gripper_base origin
+                rot=(0.5, 0.5, -0.5, 0.5),  # (w,x,y,z): gripper +X => camera optical +Z
                 convention="ros",
             ),
             spawn=PinholeCameraCfg(
-                focal_length=1.93,          # ~90 deg HFOV, typical RGBD depth camera
-                horizontal_aperture=3.896,  # sensor width = 2*focal_length*tan(HFOV/2)
-                clipping_range=(0.1, 5.0),  # 10 cm - 5 m, suitable for table-top grasping
+                focal_length=1.93,             # D435 focal length (arbitrary unit)
+                horizontal_aperture=2.005195,  # => fx = fy = 616 at 640x480
+                vertical_aperture=1.503896,    # = horizontal_aperture * 480/640
+                clipping_range=(0.1, 5.0),     # 10 cm – 5 m (D435 usable range)
             ),
             data_types=["rgb", "distance_to_image_plane"],
             width=640,

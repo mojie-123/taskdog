@@ -20,11 +20,13 @@ BANANA_USD = (
 TABLE_USD = os.path.join(os.path.dirname(__file__), "..", "..", "objects", "Shop_Table.usd")
 
 
-def _banana_cfg(pos=(5.0, 5.0, 0.9), rot=(1.0, 0.0, 0.0, 0.0)):
+def _banana_cfg(pos=(4.8, 5.0, 0.85), rot=(1.0, 0.0, 0.0, 0.0)):
     """RigidObject config for the banana target.
 
-    Spawns slightly above the table (z=0.70) and drops under gravity
-    to rest on the table surface (~z=0.65 + 0.05 clearance).
+    Placed near the -X edge of the table (table center x=5.0, estimated
+    -X edge ~4.52 m) so the Piper arm can reach it without overstretching.
+    Spawned at z=0.85 m (approx 15 cm above estimated table surface of ~0.70 m)
+    so it falls under gravity and settles on the table.
     """
     return RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/banana",

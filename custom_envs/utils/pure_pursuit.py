@@ -58,7 +58,7 @@ class PurePursuitController:
 
         # --- 5. linear speed: slow down on tight turns ---
         vx = self.target_speed / (1.0 + abs(omega) * 0.5)
-        vx = max(0.1, vx)  # never fully stop
+        vx = max(0.1, vx)  
 
         return (vx, omega)
 

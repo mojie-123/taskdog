@@ -10,6 +10,7 @@ Joint limits from SOURCE_M20_Piper.urdf:
   joint6: [-2.094, 2.094]  z-axis
 """
 
+import math
 import os
 import numpy as np
 
@@ -22,20 +23,27 @@ _chain = None
 
 
 def _build_chain():
-    """Build ikpy chain for Piper arm (joints 1-6, base -> gripper_base)."""
+    """Build ikpy chain for Piper arm (joints 1-6, arm_base_link -> joint7).
+
+    Starting from arm_base_link produces a 9-link chain:
+      [Base link, joint1, joint2, joint3, joint4, joint5, joint6,
+       joint6_to_gripper_base, joint7]
+    We activate only joint1..joint6 (indices 1-6).
+    """
     import ikpy.chain
     chain = ikpy.chain.Chain.from_urdf_file(
         os.path.abspath(_URDF_PATH),
-        base_elements=["base_link", "arm_base_link"],
+        base_elements=["arm_base_link"],
         active_links_mask=[
-            False,  # arm_base_link (fixed base)
+            False,  # Base link (arm_base_link, fixed)
             True,   # joint1
             True,   # joint2
             True,   # joint3
             True,   # joint4
             True,   # joint5
             True,   # joint6
-            False,  # gripper_base (fixed ee)
+            False,  # joint6_to_gripper_base (fixed)
+            False,  # joint7 (gripper finger prismatic, not used)
         ],
         name="piper_arm",
     )
@@ -68,29 +76,46 @@ def solve(target_pos, target_rot=None, initial_angles=None):
     """
     chain = get_chain()
 
-    target_frame = np.eye(4)
-    target_frame[:3, 3] = target_pos
-    if target_rot is not None:
-        target_frame[:3, :3] = target_rot
+    # Joint limits for joint1..joint6 used to clip the initial guess so that
+    # scipy least_squares does not raise 'Initial guess outside bounds'.
+    _JOINT_LIMITS = [
+        (-2.618,  2.618),  # joint1
+        ( 0.0,    3.14 ),  # joint2
+        (-2.967,  0.0  ),  # joint3
+        (-1.745,  1.745),  # joint4
+        (-1.22,   1.22 ),  # joint5
+        (-2.094,  2.094),  # joint6
+    ]
 
     if initial_angles is None:
-        q0 = [0.0] * len(chain.links)
+        # Default: joint1=-pi/2 so the arm starts facing the table side
+        # (dog yaw=+pi/2, robot -Y = world +X = table direction).
+        q0 = [0.0, -math.pi / 2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     else:
-        q0 = [0.0] + list(initial_angles) + [0.0]
+        # Clip initial angles to joint limits to avoid scipy bounds error.
+        clipped = np.array([
+            float(np.clip(a, lo, hi))
+            for a, (lo, hi) in zip(initial_angles, _JOINT_LIMITS)
+        ])
+        # chain has 9 links: [base, j1..j6, fixed_ee, j7]
+        q0 = [0.0] + list(clipped) + [0.0, 0.0]
 
+    # ikpy 4.x API: target_position=(3,), target_orientation=(3,3) or None
     result = chain.inverse_kinematics(
-        target_frame,
-        initial_position=q0,
+        target_position=target_pos,
+        target_orientation=target_rot,
         orientation_mode="all" if target_rot is not None else None,
+        initial_position=q0,
     )
-    # strip base and ee placeholders
-    return np.array(result[1:-1], dtype=np.float32)
+    # result has 9 values; extract joint1..joint6 (indices 1-6)
+    return np.array(result[1:7], dtype=np.float32)
 
 
 def fk(joint_angles):
     """Forward kinematics. Returns (4,4) transform in arm_base_link frame."""
     chain = get_chain()
-    q = [0.0] + list(joint_angles) + [0.0]
+    # chain has 9 links; pad with base=0, ee=0, j7=0
+    q = [0.0] + list(joint_angles) + [0.0, 0.0]
     return chain.forward_kinematics(q)
 
 
