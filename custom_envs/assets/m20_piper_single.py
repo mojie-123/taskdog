@@ -21,8 +21,8 @@ ARM_PARKED_POSE = {
     "joint4": 0.0,
     "joint5": 0.8,
     "joint6": 0.0,
-    "joint7": 0.0175,
-    "joint8": -0.0175,
+    "joint7":  0.035,   # fully open
+    "joint8": -0.035,   # fully open
 }
 
 DEEPROBOTICS_M20_PIPER_SINGLE_CFG = ArticulationCfg(

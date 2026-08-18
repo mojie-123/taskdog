@@ -71,21 +71,27 @@ class DeeproboticsM20ProSinglePiperEnvCfg(DeeproboticsM20ProLidarFlatEnvCfg):
         # ---- Wrist RGB-D camera (mounted on gripper_base) ----
         # Simulates an Intel RealSense D435 mounted on the Piper gripper_base.
         #
-        # Coordinate convention (convention="ros": +Z=optical/forward, +X=right, -Y=up):
-        #   gripper_base +X (finger-forward) --> camera +Z (optical axis / forward)
-        #   gripper_base +Y (finger-left)    --> camera -X (image left)
-        #   gripper_base +Z (finger-up)      --> camera -Y (image up)
-        # Quaternion derivation: R columns = parent-axis in ROS-camera frame
-        #   col0=[0,0,1], col1=[-1,0,0], col2=[0,-1,0]  => (w=0.5, x=0.5, y=-0.5, z=0.5)
-        #   (previously wrong: y=-0.5 was listed as -0.5 but z was -0.5 instead of +0.5)
+        # Coordinate convention (convention="ros": +Z=optical/forward, +X=right, +Y=down):
+        #   gripper_base +Z (finger-up) --> camera +Z (optical axis / forward)
+        #   gripper_base -Y (finger-right) --> camera +X (image right)
+        #   gripper_base +X (finger-forward) --> camera +Y (image down)
+        #
+        # Quaternion: Rz(-90deg) = R.from_euler('xyz',[0,0,-pi/2]) => (w=0.7071,x=0,y=0,z=-0.7071)
+        # camera +Z optical => gripper_base +Z (finger-up direction).
+        # During SCAN the arm lowers gripper_base so its +Z points world -Z (downward),
+        # making the camera look down at the table surface -- matching the reference
+        # project convention used by B2/Piper/Tron1A in task_e b2.
+        #
+        # NOTE: The previous value (0.5, 0.5, -0.5, 0.5) was WRONG -- it pointed
+        # the optical axis toward gripper_base -Y (sideways), not downward.
         #
         # Intrinsics match Intel RealSense D435 at 640x480:
-        #   fx = fy = 616,  HFOV ≈ 54.9°,  VFOV ≈ 42.6°
+        #   fx = fy = 616,  HFOV ~ 54.9 deg,  VFOV ~ 42.6 deg
         self.scene.wrist_camera = CameraCfg(
             prim_path="{ENV_REGEX_NS}/Robot/gripper_base/wrist_camera",
             offset=CameraCfg.OffsetCfg(
-                pos=(0.05, 0.0, 0.0),        # 5 cm forward of gripper_base origin
-                rot=(0.5, 0.5, -0.5, 0.5),  # (w,x,y,z): gripper +X => camera optical +Z
+                pos=(-0.05, 0.0, 0.06),            # matches reference project (B2/Piper/Tron1A): -5cm X, +6cm toward fingers (+Z)
+                rot=(0.7071, 0.0, 0.0, -0.7071),   # (w,x,y,z): Rz(-90deg), camera +Z => gripper +Z
                 convention="ros",
             ),
             spawn=PinholeCameraCfg(

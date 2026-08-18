@@ -20,7 +20,7 @@ BANANA_USD = (
 TABLE_USD = os.path.join(os.path.dirname(__file__), "..", "..", "objects", "Shop_Table.usd")
 
 
-def _banana_cfg(pos=(4.8, 5.0, 0.85), rot=(1.0, 0.0, 0.0, 0.0)):
+def _banana_cfg(pos=(4.9, 5.0, 0.75), rot=(1.0, 0.0, 0.0, 0.0)):
     """RigidObject config for the banana target.
 
     Placed near the -X edge of the table (table center x=5.0, estimated
