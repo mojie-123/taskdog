@@ -570,7 +570,7 @@ def main():
                 _arm_step(robot, q6)
                 _gripper_step(robot, close=False)
                 if state_step == 1:
-                    print("[SM] ARM_INIT: retracting arm...", flush=True)
+                    print(f"[SM] ARM_INIT: retracting arm... base_pos_w={np.round(pos_w,3)}", flush=True)
                     # Print banana actual resting position; sim ran during NAV
                     # so the banana has already settled on the table surface.
                     try:
@@ -585,15 +585,18 @@ def main():
                         print(f"[INFO] Could not read banana pos: {_be}", flush=True)
                 _arm_err_now = np.abs(cur_q - ARM_SIDE_ANGLES)
                 if state_step % 50 == 0:
+                    _ai_pos_w = robot.data.root_pos_w[0].cpu().numpy()
                     print(f"[SM] ARM_INIT step {state_step}/{BUDGET[PipelineState.ARM_INIT]}: "
-                          f"q={np.round(cur_q,4)} err={np.round(_arm_err_now,4)} max={_arm_err_now.max():.4f}",
+                          f"q={np.round(cur_q,4)} err={np.round(_arm_err_now,4)} max={_arm_err_now.max():.4f} "
+                          f"base_pos_w={np.round(_ai_pos_w,3)}",
                           flush=True)
                 _arm_converged = (_arm_err_now.max() < 0.02)   # ~1.1 deg threshold
                 _arm_timeout   = (state_step >= BUDGET[PipelineState.ARM_INIT])
                 if _arm_converged or _arm_timeout:
                     _arm_final_err = _arm_err_now
                     _reason = "converged" if _arm_converged else "timeout"
-                    print(f"[SM] ARM_INIT done ({_reason} at step {state_step}): final_q={np.round(cur_q,4)}", flush=True)
+                    _ai_done_pos_w = robot.data.root_pos_w[0].cpu().numpy()
+                    print(f"[SM] ARM_INIT done ({_reason} at step {state_step}): final_q={np.round(cur_q,4)} base_pos_w={np.round(_ai_done_pos_w,3)}", flush=True)
                     print(f"[SM] ARM_INIT target:        {np.round(ARM_SIDE_ANGLES,4)}", flush=True)
                     print(f"[SM] ARM_INIT joint_err:     {np.round(_arm_final_err,4)} max={_arm_final_err.max():.4f} rad ({np.degrees(_arm_final_err.max()):.1f}deg)",
                           flush=True)
@@ -608,8 +611,9 @@ def main():
                 try:
                     camera = raw_env.scene["wrist_camera"]
                     if state_step == 1:
+                        _scan_start_pos_w = robot.data.root_pos_w[0].cpu().numpy()
                         print(f"[SM] SCAN: warmup {SCAN_WARMUP} + accumulate "
-                              f"{SCAN_FRAMES} frames...", flush=True)
+                              f"{SCAN_FRAMES} frames... base_pos_w={np.round(_scan_start_pos_w,3)}", flush=True)
                     if state_step == SCAN_WARMUP + 1:
                         # ---- Save RGB snapshot after warmup (first valid frame) ----
                         try:
@@ -645,8 +649,9 @@ def main():
                     if state_step >= SCAN_WARMUP + SCAN_FRAMES:
                         depth_med = np.median(np.stack(depth_accum, axis=0), axis=0)
                         valid_pct = np.mean((depth_med > 0.05) & (depth_med < 4.0)) * 100
+                        _scan_done_pos_w = robot.data.root_pos_w[0].cpu().numpy()
                         print(f"[SM] SCAN done: {len(depth_accum)} frames, "
-                              f"valid depth {valid_pct:.1f}%", flush=True)
+                              f"valid depth {valid_pct:.1f}% base_pos_w={np.round(_scan_done_pos_w,3)}", flush=True)
                         # ---- DIAG: 相机外参验证 (修正版) ----
                         # 坐标系约定说明：
                         #   camera.data.pos_w      — 相机在「env-local」坐标系中的位置
@@ -803,6 +808,15 @@ def main():
                                 # all 6 joints arrive at the correct orientation.
                                 "R_desired_EE_in_arm": _R_desired,
                                 "q_scan": _q_scan_saved,
+                                # DRIFT FIX: save robot pose at SCAN time.
+                                # t_cam is measured in the camera frame at this exact
+                                # moment, so cam_to_world MUST use these values
+                                # (not the current drifted pos_w) to get the correct
+                                # world-frame target.  pos_w and quat_w are updated
+                                # at the top of every loop iteration, so they reflect
+                                # the robot pose at the time grasp_result is built.
+                                "pos_w_scan":  pos_w.copy(),
+                                "quat_w_scan": quat_w.copy(),
                             }
                             print(f"[SM] Best grasp score={grasp_result['score']:.3f} "
                                   f"t={np.round(grasp_result['t_cam'],3)}", flush=True)
@@ -930,7 +944,15 @@ def main():
                     # cur_q (current joints at PRE_GRASP step=1, arm already moving).
                     # t_cam is in the camera frame at SCAN time, so cam_to_world must
                     # use the joint angles at that moment to get the correct camera pose.
-                    t_world = cam_to_world(pre_t_cam, grasp_result["q_scan"], pos_w, quat_w)
+                    # DRIFT FIX: use pos_w_scan/quat_w_scan (robot pose at SCAN time) instead of
+                    # the current pos_w (which may already be drifted from PRE_GRASP start).
+                    # t_cam was measured in camera frame at SCAN time, so cam_to_world must
+                    # use the robot pose at that same moment to get the correct world target.
+                    t_world = cam_to_world(pre_t_cam, grasp_result["q_scan"],
+                                           grasp_result["pos_w_scan"], grasp_result["quat_w_scan"])
+                    # DRIFT FIX: save fixed world-frame target so every step can re-project
+                    # it into the current robot frame, compensating for body drift during PRE_GRASP.
+                    _pg_t_world_fixed = t_world.copy()
                     pre_t = world_pos_to_arm_frame(t_world, pos_w, quat_w)
                     # Include the desired EE orientation (computed at SCAN time)
                     # so that PRE_GRASP IK solves for all 6 joints simultaneously.
@@ -991,46 +1013,55 @@ def main():
                 cur_q = robot.data.joint_pos[
                     0, list(_get_arm_ids(robot)[0])
                 ].cpu().numpy()
-                # Feed-forward path interpolation for PRE_GRASP:
-                # Linearly interpolate from the initial joint angles (recorded at step=1)
-                # to the IK target.  Unlike the overdrive-alpha approach (which reads cur_q
-                # each step and scales toward target), this open-loop schedule guarantees
-                # the commanded angle advances monotonically regardless of whether the PD
-                # controller has actually reached the previous command.
-                # The previous velocity-clamp fix caused a dead-lock: when j5 was stuck,
-                # cur_q stayed at 1.22, so clip(alpha*(target-cur_q), -0.05, 0.05) kept
-                # the command near 1.17 forever and the joint never moved.
-                _pg_budget  = BUDGET[PipelineState.PRE_GRASP]
-                _pg_progress = min(1.0, state_step / _pg_budget)
-                # Feed-forward command: linearly interpolate from q_init to target.
-                # Overdrive: in the last 15% of the budget, push 0.05 rad past target
-                # (toward the target direction) to overcome gravity/friction.
-                # Overdrive is added as a flat offset so it doesn't scale with path length.
-                _pg_od_offset = 0.05 * max(0.0, (_pg_progress - 0.85) / 0.15) * np.sign(target_angles_arm - _pg_q_init)
-                q6 = _pg_q_init + _pg_progress * (target_angles_arm - _pg_q_init) + _pg_od_offset
+                # Rolling tracking for PRE_GRASP:
+                # Each step command = cur_q + α*(target - cur_q), where α controls
+                # how fast joints move toward the IK target.  Unlike the fixed q_init
+                # feed-forward interpolation (which caused oscillation when IK target
+                # updated mid-way), this approach always starts from the actual current
+                # joint position, so IK target updates are absorbed smoothly.
+                _PRE_GRASP_ALPHA = 0.08  # fraction of remaining error to close per step
+                # DRIFT FIX: re-project the fixed world-frame target into the current
+                # robot arm frame every 5 steps, then re-solve IK.  This compensates
+                # for body drift while keeping IK overhead low.
+                if state_step % 5 == 1:  # fires on step=1,6,11,... (also first step)
+                    _cur_pos_w  = robot.data.root_pos_w[0].cpu().numpy()
+                    _cur_quat_w = robot.data.root_quat_w[0].cpu().numpy()
+                    _pg_pre_t_cur = world_pos_to_arm_frame(_pg_t_world_fixed, _cur_pos_w, _cur_quat_w)
+                    _pg_target_cur = ik_solve_gb(
+                        _pg_pre_t_cur,
+                        target_rot_j7=R_desired_EE,
+                        initial_angles=cur_q,
+                    )
+                # Rolling tracking command: move α fraction toward current IK target
+                q6 = cur_q + _PRE_GRASP_ALPHA * (_pg_target_cur - cur_q)
                 q6 = np.clip(q6, [lo for lo, hi in _IK_JOINT_LIMITS],
                                   [hi for lo, hi in _IK_JOINT_LIMITS])
                 _arm_step(robot, q6)
                 _gripper_width_step(robot, grasp_result["width"])
                 if state_step % 50 == 0:
-                    _err = np.abs(cur_q - target_angles_arm)
+                    _err = np.abs(cur_q - _pg_target_cur)
+                    _pg_step_pos_w = robot.data.root_pos_w[0].cpu().numpy()
                     print(f"[SM] PRE_GRASP step {state_step}/{BUDGET[PipelineState.PRE_GRASP]}: "
-                          f"max_err={_err.max():.3f}", flush=True)
-                # Early-exit: once all joints are within 0.05 rad of IK target
+                          f"max_err={_err.max():.3f} base_pos_w={np.round(_pg_step_pos_w,3)}", flush=True)
+                # Early-exit: once all joints are within 0.05 rad of live IK target
                 # AND at least 100 steps have passed (give time to settle), skip
                 # waiting the full budget and move directly to REACH.
                 _pg_cur_q_check = robot.data.joint_pos[
                     0, list(_get_arm_ids(robot)[0])].cpu().numpy()
-                _pg_err_check = np.abs(_pg_cur_q_check - target_angles_arm)
+                _pg_err_check = np.abs(_pg_cur_q_check - _pg_target_cur)
                 _pg_early_exit = (state_step > 100 and _pg_err_check.max() < 0.05)
                 if _pg_early_exit and state_step % 50 != 0:  # avoid double-print
+                    _pg_exit_pos_w = robot.data.root_pos_w[0].cpu().numpy()
                     print(f"[SM] PRE_GRASP early-exit at step {state_step}: "
-                          f"max_err={_pg_err_check.max():.4f} rad < 0.05 -> REACH",
+                          f"max_err={_pg_err_check.max():.4f} rad < 0.05 -> REACH "
+                          f"base_pos_w={np.round(_pg_exit_pos_w,3)}",
                           flush=True)
                 if state_step >= BUDGET[PipelineState.PRE_GRASP] or _pg_early_exit:
                     cur_q_final = robot.data.joint_pos[
                         0, list(_get_arm_ids(robot)[0])].cpu().numpy()
-                    print(f"[SM] PRE_GRASP done: final={np.round(cur_q_final,3)} -> REACH (ORIENT skipped)",
+                    _pg_done_pos_w = robot.data.root_pos_w[0].cpu().numpy()
+                    print(f"[SM] PRE_GRASP done: final={np.round(cur_q_final,3)} -> REACH (ORIENT skipped) "
+                          f"base_pos_w={np.round(_pg_done_pos_w,3)}",
                           flush=True)
                     # ---- DIAG: actual EE position after PRE_GRASP ----
                     from arm_ik import fk as _fk_pgd, fk_gripper as _fkg_pgd, quat_to_rot as _q2r_pgd, cam_to_world as _c2w_pgd
@@ -1148,7 +1179,14 @@ def main():
                     # cur_q (current joints at REACH step=1, arm already at PRE_GRASP position).
                     # t_cam is in the camera frame at SCAN time, so cam_to_world must
                     # use the joint angles at that moment to get the correct camera pose.
-                    t_world = cam_to_world(reach_t_cam, grasp_result["q_scan"], pos_w, quat_w)
+                    # DRIFT FIX: use pos_w_scan/quat_w_scan (robot pose at SCAN time) instead of
+                    # the current pos_w (which is drifted after PRE_GRASP 800 steps).
+                    # t_cam was measured in camera frame at SCAN time, so cam_to_world must
+                    # use the robot pose at that same moment to get the correct world target.
+                    t_world = cam_to_world(reach_t_cam, grasp_result["q_scan"],
+                                           grasp_result["pos_w_scan"], grasp_result["quat_w_scan"])
+                    # DRIFT FIX: save fixed world-frame target for per-step re-projection
+                    _re_t_world_fixed = t_world.copy()
                     t_arm = world_pos_to_arm_frame(t_world, pos_w, quat_w)
                     # Keep orientation established by PRE_GRASP (which now includes target_rot).
                     # Use the stored R_desired_EE_in_arm (from SCAN time) as the orientation
@@ -1188,21 +1226,32 @@ def main():
                 cur_q = robot.data.joint_pos[
                     0, list(_get_arm_ids(robot)[0])
                 ].cpu().numpy()
-                # Feed-forward path interpolation for REACH (same logic as PRE_GRASP)
-                _reach_budget  = BUDGET[PipelineState.REACH]
-                _re_progress   = min(1.0, state_step / _reach_budget)
-                _re_od_offset = 0.05 * max(0.0, (_re_progress - 0.85) / 0.15) * np.sign(target_angles_arm - _re_q_init)
-                q6 = _re_q_init + _re_progress * (target_angles_arm - _re_q_init) + _re_od_offset
+                # Rolling tracking for REACH (same logic as PRE_GRASP):
+                # Each step command = cur_q + α*(target - cur_q).
+                _REACH_ALPHA = 0.08
+                # DRIFT FIX: re-project the fixed world-frame target into the current
+                # robot arm frame every 5 steps, then re-solve IK.
+                if state_step % 5 == 1:  # fires on step=1,6,11,...
+                    _re_cur_pos_w  = robot.data.root_pos_w[0].cpu().numpy()
+                    _re_cur_quat_w = robot.data.root_quat_w[0].cpu().numpy()
+                    _re_t_cur = world_pos_to_arm_frame(_re_t_world_fixed, _re_cur_pos_w, _re_cur_quat_w)
+                    _re_target_cur = ik_solve_gb_re(
+                        _re_t_cur,
+                        target_rot_j7=R_arm,
+                        initial_angles=cur_q,
+                    )
+                # Rolling tracking command: move α fraction toward current IK target
+                q6 = cur_q + _REACH_ALPHA * (_re_target_cur - cur_q)
                 q6 = np.clip(q6, [lo for lo, hi in _IK_JOINT_LIMITS],
                                   [hi for lo, hi in _IK_JOINT_LIMITS])
                 _arm_step(robot, q6)
                 _gripper_width_step(robot, grasp_result["width"])
                 if state_step % 50 == 0:
-                    _err = np.abs(cur_q - target_angles_arm)
+                    _err = np.abs(cur_q - _re_target_cur)
                     print(f"[SM] REACH step {state_step}/{BUDGET[PipelineState.REACH]}: "
                           f"max_err={_err.max():.3f}", flush=True)
                 # Early-exit: joints converged within 0.05 rad
-                _reach_err_check = np.abs(cur_q - target_angles_arm)
+                _reach_err_check = np.abs(cur_q - _re_target_cur)
                 _reach_early = (state_step > 50 and _reach_err_check.max() < 0.05)
                 if _reach_early and state_step % 50 != 0:
                     print(f"[SM] REACH early-exit at step {state_step}: "
