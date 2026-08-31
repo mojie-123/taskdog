@@ -6,9 +6,9 @@ Supports:
   - Occupancy grid:   <name>.npz          (converts occupied cells to 3D points)
 
 Usage:
-    python custom_envs/scripts/navigation/viz_map.py maps/my_map_cloud.npy
-    python custom_envs/scripts/navigation/viz_map.py maps/my_map.npz
-    python custom_envs/scripts/navigation/viz_map.py maps/my_map_cloud.npy --no_ground
+    python scripts/navigation/viz_map.py maps/my_map_cloud.npy
+    python scripts/navigation/viz_map.py maps/my_map_cloud.npy --no_ground
+    python scripts/navigation/viz_map.py maps/my_map.npz   <---注意建图完后就是要执行这一句
 """
 
 import argparse, os, sys

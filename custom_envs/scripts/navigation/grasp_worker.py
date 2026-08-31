@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""grasp_worker.py — Subprocess grasp detection worker.
+"""grasp_worker.py — AnyGrasp 子进程抓取检测脚本。
 
 Protocol:
   INPUT  : /tmp/pointcloud.npz  {points: (N,3) float32, colors: (N,3) float32}
@@ -9,116 +9,112 @@ Protocol:
                widths:       (K,) float32,
                scores:       (K,) float32,
            }
+
+Note:
+  gsnet.so 在加载 License 时会在当前工作目录下找 license/ 文件夹，
+  因此本脚本启动后会先 os.chdir 到 SDK_DETECTION_DIR。
+  navigate_to_goal.py 的输入/输出协议与 graspnet-baseline 版完全相同，无需改动。
 """
 
 import os
 import sys
 import argparse
-import numpy as np
+# NOTE: numpy must NOT be imported at module level before gsnet/MinkowskiEngine.
+# MinkowskiEngine was compiled against numpy 2.4.6; importing numpy 1.26.0 first
+# causes ABI mismatch inside gsnet.so. numpy is imported inside main() after gsnet.
 
-GRASPNET_ROOT = "/home/mojie/graspnet-baseline"
-sys.path.insert(0, GRASPNET_ROOT)
-sys.path.insert(0, os.path.join(GRASPNET_ROOT, "models"))
-sys.path.insert(0, os.path.join(GRASPNET_ROOT, "utils"))
-sys.path.insert(0, os.path.join(GRASPNET_ROOT, "pointnet2"))
+# ── AnyGrasp SDK 路径 ────────────────────────────────────────────────────────
+SDK_DETECTION_DIR = "/home/mojie/anygrasp_sdk/grasp_detection"
+# gsnet.so 和 license/ 子目录必须在同一个工作目录下
+sys.path.insert(0, SDK_DETECTION_DIR)
+os.chdir(SDK_DETECTION_DIR)
 
 INPUT_PATH  = "/tmp/pointcloud.npz"
 OUTPUT_PATH = "/tmp/grasp_result.npz"
 
-NUM_POINT = 20000
-NUM_VIEW  = 300
-COLLISION_THRESH = 0.01
-VOXEL_SIZE = 0.01
-
-
-def load_model(checkpoint_path, device):
-    from graspnet import GraspNet
-    net = GraspNet(
-        input_feature_dim=0, num_view=NUM_VIEW, num_angle=12, num_depth=4,
-        cylinder_radius=0.05, hmin=-0.02, hmax_list=[0.01, 0.02, 0.03, 0.04],
-        is_training=False,
-    )
-    net.to(device)
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    net.load_state_dict(checkpoint["model_state_dict"])
-    print(f"[grasp_worker] Loaded checkpoint (epoch {checkpoint['epoch']})")
-    net.eval()
-    return net
-
-
-def prepare_input(points, colors, device):
-    N = len(points)
-    if N >= NUM_POINT:
-        idxs = np.random.choice(N, NUM_POINT, replace=False)
-    else:
-        idxs = np.concatenate([
-            np.arange(N), np.random.choice(N, NUM_POINT - N, replace=True)
-        ])
-    pts = points[idxs].astype(np.float32)
-    col = colors[idxs].astype(np.float32)
-    cloud_tensor = torch.from_numpy(pts[np.newaxis]).to(device)
-    return {"point_clouds": cloud_tensor, "cloud_colors": col}, pts
-
-
-def run_inference(net, end_points):
-    from graspnet import pred_decode
-    from graspnetAPI.grasp import GraspGroup
-    with torch.no_grad():
-        end_points = net(end_points)
-        grasp_preds = pred_decode(end_points)
-    gg_array = grasp_preds[0].detach().cpu().numpy()
-    return GraspGroup(gg_array)
-
-
-def do_collision_filter(gg, scene_points):
-    from collision_detector import ModelFreeCollisionDetector
-    mfcdetector = ModelFreeCollisionDetector(scene_points, voxel_size=VOXEL_SIZE)
-    collision_mask = mfcdetector.detect(
-        gg, approach_dist=0.05, collision_thresh=COLLISION_THRESH)
-    return gg[~collision_mask]
+# Piper 手爪参数（单位：米）
+MAX_GRIPPER_WIDTH = 0.08   # 最大张开宽度
+GRIPPER_HEIGHT    = 0.06   # 手指高度（用于碰撞检测）
 
 
 def main():
     parser = argparse.ArgumentParser("grasp_worker")
-    parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--topk", type=int, default=5)
-    parser.add_argument("--no_collision", action="store_true")
+    parser.add_argument("--checkpoint", required=True,
+                        help="AnyGrasp checkpoint 路径（checkpoint_detection.tar）")
+    parser.add_argument("--topk", type=int, default=5,
+                        help="保存的抓取候选数")
+    parser.add_argument("--max_gripper_width", type=float, default=MAX_GRIPPER_WIDTH,
+                        help="手爪最大张开宽度（米）")
+    parser.add_argument("--gripper_height", type=float, default=GRIPPER_HEIGHT,
+                        help="手指高度（米）")
+    parser.add_argument("--no_collision", action="store_true",
+                        help="禁用碰撞过滤（保留更多候选）")
+    parser.add_argument("--dense", action="store_true",
+                        help="启用密集预测模式（更多候选但质量略低）")
     args = parser.parse_args()
 
-    global torch
-    import torch
+    # ── 导入 AnyGrasp（必须在 import numpy 之前！）────────────────────────────
+    # MinkowskiEngine 在 numpy 2.4.6 下编译，若先 import numpy 1.26.0 会导致
+    # C ABI 不兼容：gsnet.so 内部出现 AttributeError: 'dict' has no attr 'endswith'
+    from argparse import Namespace
+    from gsnet import create_detector
 
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    print(f"[grasp_worker] Using device: {device}")
+    # ── 在 gsnet 加载之后再 import numpy ─────────────────────────────────────
+    import numpy as np
 
+    # ── 初始化检测器 ──────────────────────────────────────────────────────────
+    config = Namespace(
+        checkpoint_path=args.checkpoint,
+        max_gripper_width=args.max_gripper_width,
+        gripper_height=args.gripper_height,
+    )
+    print(f"[grasp_worker] Loading AnyGrasp detector from: {args.checkpoint}")
+    detector = create_detector(config)
+    if detector is None:
+        print("[grasp_worker] ERROR: AnyGrasp 初始化失败（License 验证未通过或 checkpoint 错误）")
+        sys.exit(1)
+    print("[grasp_worker] AnyGrasp detector ready")
+
+    # ── 读取点云输入 ──────────────────────────────────────────────────────────
     if not os.path.exists(INPUT_PATH):
-        print(f"[grasp_worker] ERROR: input not found: {INPUT_PATH}")
+        print(f"[grasp_worker] ERROR: 输入文件不存在: {INPUT_PATH}")
         sys.exit(1)
 
-    data = np.load(INPUT_PATH)
-    points = data["points"].astype(np.float32)
-    colors = data["colors"].astype(np.float32)
-    print(f"[grasp_worker] Input cloud: {len(points)} points")
+    data   = np.load(INPUT_PATH)
+    points = data["points"].astype(np.float32)   # (N, 3)
+    # colors 字段保留接口兼容，AnyGrasp 新版 API 只接收 points
+    print(f"[grasp_worker] 输入点云: {len(points)} 个点")
 
-    if len(points) < 100:
-        print("[grasp_worker] ERROR: too few points")
+    if len(points) < 50:
+        print("[grasp_worker] ERROR: 点云点数过少（< 50），退出")
         sys.exit(1)
 
-    net = load_model(args.checkpoint, device)
-    end_points, pts_sampled = prepare_input(points, colors, device)
-    gg = run_inference(net, end_points)
-    print(f"[grasp_worker] Raw grasps: {len(gg)}")
+    # ── 推理 ──────────────────────────────────────────────────────────────────
+    optional_params = {
+        "collision_detection": not args.no_collision,
+        "dense_grasp": args.dense,
+    }
+    gg = detector.get_grasp(points, optional_params)
 
-    gg.nms()
-    gg.sort_by_score()
+    if gg is None or len(gg) == 0:
+        print("[grasp_worker] WARN: 未检测到有效抓取")
+        np.savez(OUTPUT_PATH,
+                 translations=np.zeros((0, 3), dtype=np.float32),
+                 rotations=np.zeros((0, 3, 3), dtype=np.float32),
+                 widths=np.zeros(0, dtype=np.float32),
+                 scores=np.zeros(0, dtype=np.float32))
+        return
 
-    if not args.no_collision and len(gg) > 0:
-        gg = do_collision_filter(gg, points)
-        print(f"[grasp_worker] After collision filter: {len(gg)}")
+    # ── NMS + 排序 ────────────────────────────────────────────────────────────
+    print(f"[grasp_worker] 原始抓取数: {len(gg)}")
+    if not args.dense:
+        gg = gg.nms()
+    gg = gg.sort_by_score()
 
+    # ── 截取 topk ─────────────────────────────────────────────────────────────
     topk = min(args.topk, len(gg))
     if topk == 0:
-        print("[grasp_worker] WARN: no valid grasps found")
+        print("[grasp_worker] WARN: NMS 后无有效抓取")
         np.savez(OUTPUT_PATH,
                  translations=np.zeros((0, 3), dtype=np.float32),
                  rotations=np.zeros((0, 3, 3), dtype=np.float32),
@@ -127,21 +123,24 @@ def main():
         return
 
     gg = gg[:topk]
-    # GraspGroup array: [score, width, height, depth, r00..r22, tx,ty,tz, obj_id]
-    arr = gg.grasp_group_array          # (K, 17)
-    scores       = arr[:, 0].astype(np.float32)
-    widths       = arr[:, 1].astype(np.float32)
-    rotations    = arr[:, 4:13].reshape(-1, 3, 3).astype(np.float32)
-    translations = arr[:, 13:16].astype(np.float32)
+
+    # ── 提取结果并保存 ────────────────────────────────────────────────────────
+    # GraspGroup 属性：translations (K,3), rotation_matrices (K,3,3),
+    #                  widths (K,), scores (K,)
+    translations = gg.translations.astype(np.float32)       # (K, 3)
+    rotations    = gg.rotation_matrices.astype(np.float32)  # (K, 3, 3)
+    widths       = gg.widths.astype(np.float32)             # (K,)
+    scores       = gg.scores.astype(np.float32)             # (K,)
 
     np.savez(OUTPUT_PATH,
              translations=translations,
              rotations=rotations,
              widths=widths,
              scores=scores)
-    print(f"[grasp_worker] Saved {topk} grasps to {OUTPUT_PATH}")
+
+    print(f"[grasp_worker] 保存 {topk} 个抓取到 {OUTPUT_PATH}")
     for i in range(topk):
-        print(f"  [{i}] score={scores[i]:.3f} t={np.round(translations[i],3)} w={widths[i]:.3f}")
+        print(f"  [{i}] score={scores[i]:.3f}  t={np.round(translations[i], 3)}  w={widths[i]:.3f}")
 
 
 if __name__ == "__main__":
