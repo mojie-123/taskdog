@@ -80,7 +80,7 @@ cp ../grasp_detection/gsnet_versions/gsnet.cpython-311-x86_64-linux-gnu.so gsnet
 python -c "from gsnet import get_feature_id; print(get_feature_id())"
 ```
 
-输出示例：`N12345678900987654321`
+输出示例：`N51790452892269025015`
 
 > ⚠️ 如果输出末尾有 `%`，填表时必须手动删掉。
 

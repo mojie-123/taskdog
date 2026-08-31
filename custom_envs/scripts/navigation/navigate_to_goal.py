@@ -49,6 +49,7 @@ class PipelineState(enum.Enum):
     ALIGN_YAW    = "ALIGN_YAW"    # fine-tune rotate in-place to target yaw (+Y)
     ARM_INIT     = "ARM_INIT"     # retract arm to home
     SCAN       = "SCAN"       # accumulate depth frames
+    PRE_ADJUST = "PRE_ADJUST" # transition j5 from +1.2 -> 0 before IK
     GRASP_PLAN = "GRASP_PLAN" # run GraspNet
     PRE_GRASP  = "PRE_GRASP"  # arm to pre-grasp
     ORIENT     = "ORIENT"     # wrist orientation
@@ -193,8 +194,8 @@ def main():
     # Piper gripper_base → fingertip ≈ 0.19 m; GraspNet t is the ideal gripper root.
     # Retreat 15 cm so fingertips clear the object during ORIENT rotation.
     PRE_GRASP_RETREAT   = 0.1
-    # REACH target: stop 5 cm short of GraspNet t so fingertips lightly contact the object.
-    REACH_RETREAT       = 0.05
+    # REACH target: 0 cm retreat so EE targets banana directly (was 0.05m, caused EE-banana≈8cm).
+    REACH_RETREAT       = 0.0
     # ARM_HOME_ANGLES: arm tucked facing robot front (+X body), used during walking
     ARM_HOME_ANGLES   = np.array([0.0,     0.5, -1.0, 0.0, 0.5, 0.0], dtype=np.float32)
     # ARM_SIDE_ANGLES: arm SCAN pose — camera pointing straight down for GraspNet.
@@ -208,18 +209,39 @@ def main():
     # When dog stops with yaw=+π/2 (head → world +Y), robot -Y = world +X → arm
     # extends toward the table/object area.  Used as the home pose during ARM_INIT/grasp phases.
     ARM_SIDE_ANGLES   = np.array([-math.pi/2, 1.5, -1.5, 0.0, 1.2, 0.0], dtype=np.float32)
+    # ARM_PREGRASP_ANGLES: intermediate pose after SCAN, before GRASP_PLAN.
+    # j5 is set to 0.0 so that approach axis (gb_col0) is nearly vertical (appz≈-1).
+    # This ensures PRE_GRASP IK solutions have j5 close to 0, reducing j5 jump
+    # from ~2.2 rad (from ARM_INIT j5=+1.2) to ~1.1 rad — well within π/2 threshold.
+    # All other joints kept same as ARM_SIDE_ANGLES so only j5 moves.
+    ARM_PREGRASP_ANGLES = np.array([-math.pi/2, 1.5, -1.5, 0.0, 0.0, 0.0], dtype=np.float32)
     # Target yaw for the dog after reaching the goal: head faces world +Y (+π/2).
     # The table is at world +X from the goal, so robot -Y side (arm side) faces it.
     TARGET_YAW        = math.pi / 2   # +90 degrees
 
     BUDGET = {
-        PipelineState.ARM_INIT:  600,   # hard ceiling; early-exit once max_joint_err < 0.02 rad
-        PipelineState.PRE_GRASP: 800,   # was 400; PRE_GRASP showed 33cm err at 400 steps
-        PipelineState.ORIENT:    300,
-        PipelineState.REACH:     500,   # was 250; REACH showed max_err=1.16 at 250 steps
-        PipelineState.CLOSE:      80,   # was 40; gripper only reached 1/3 close at 40 steps
-        PipelineState.LIFT:      300,   # was 200; extra time to stabilise with object
+        PipelineState.ARM_INIT:   600,   # hard ceiling; early-exit once max_joint_err < 0.02 rad
+        PipelineState.PRE_ADJUST: 400,   # transition j5 +1.2->0; early-exit once max_joint_err < 0.02 rad
+        PipelineState.PRE_GRASP:  500,   # merged with REACH: direct to banana (no retreat), extra steps for longer travel
+        PipelineState.ORIENT:     300,
+        PipelineState.REACH:      250,   # reduced from 500; same reason as PRE_GRASP
+        PipelineState.CLOSE:       80,   # was 40; gripper only reached 1/3 close at 40 steps
+        PipelineState.LIFT:       300,   # was 200; extra time to stabilise with object
     }
+    PRE_GRASP_MAX_WORLD_ERR = 0.10   # m: above this, skip REACH and re-scan instead of compounding error
+    PRE_GRASP_MAX_JOINT_ERR = 0.35   # rad: roughly 20 deg max joint mismatch allowed before advancing
+    # PRE_GRASP does NOT enforce wrist orientation: the IK is position-only at this stage,
+    # so R_desired_EE vs actual EE rot is always large (rot_err 2.1~2.8 observed in run20).
+    # Orientation is corrected in REACH via full 6-DOF IK with rotation target.
+    # Setting threshold near the theoretical maximum (2*sqrt(2)≈2.83) effectively
+    # disables the rot check in PRE_GRASP, letting pos+joint alone gate advancement.
+    PRE_GRASP_MAX_ROT_ERR   = 2.90   # Frobenius norm: disabled (pos+joint gate advancement)
+    REACH_MAX_WORLD_ERR     = 0.08   # m: require EE to be near the reach target before closing
+    REACH_MAX_JOINT_ERR     = 0.25   # rad: roughly 14 deg max joint mismatch before closing
+    REACH_MAX_ROT_ERR       = 1.00   # Frobenius norm: reject clearly bad end-effector orientation
+    REACH_MAX_OBJECT_DIST   = 0.15   # m: require EE-object distance < 15 cm before CLOSE
+    # Note: REACH target is REACH_RETREAT(5cm) short of banana, so EE-banana ≥ 5cm at REACH end.
+    # Adding ~3cm tracking error gives ~8cm; allow 15cm to handle banana position uncertainty.
     SCAN_WARMUP  = 10
     SCAN_FRAMES  = 30
 
@@ -234,6 +256,7 @@ def main():
     depth_accum    = []
     scan_rgb       = None
     target_angles_arm = None
+    _freeze_root_link_pose = None   # set once at ALIGN_YAW exit, never updated after
 
     print(f"\n[INFO] Navigate to goal {goal_world}")
     print(f"[INFO] Map: {args.map}")
@@ -257,6 +280,11 @@ def main():
                 pass
         if len(arm_joint_ids) != 6:
             print(f"[WARN] Only {len(arm_joint_ids)}/6 arm joints found")
+        # DIAGNOSTIC: print arm_joint_ids to verify j5/j6 PhysX ID order
+        _jnames = robot.data.joint_names
+        _id_map = {i: _jnames[i] for i in arm_joint_ids}
+        print(f"[DIAG] arm_joint_ids={arm_joint_ids} -> names={[_id_map[i] for i in arm_joint_ids]}",
+              flush=True)
         return arm_joint_ids, gripper_ids
 
     def _arm_step(robot, q6):
@@ -477,8 +505,89 @@ def main():
                 obs["policy"] = p_obs
                 with torch.inference_mode():
                     actions  = policy(obs)
+                    # ZERO-LEG-ACTION: during arm-only phases, discard locomotion
+                    # policy's leg/wheel outputs entirely.  The policy still runs
+                    # (so obs stays updated) but its action is replaced with zeros
+                    # so that no residual leg torques reach the physics engine.
+                    # This eliminates the periodic body oscillation ("晃动") caused
+                    # by the balance-maintenance torques the standing policy emits
+                    # even when vel_cmd=0.  BODY-FREEZE still runs as a safety net.
+                    _FREEZE_STATES_ACT = {
+                        PipelineState.ARM_INIT,
+                        PipelineState.SCAN,
+                        PipelineState.PRE_GRASP,
+                        PipelineState.REACH,
+                        PipelineState.CLOSE,
+                        PipelineState.LIFT,
+                    }
+                    if state in _FREEZE_STATES_ACT:
+                        actions = torch.zeros_like(actions)
                     step_res = env.step(actions)
                     obs      = step_res[0]
+
+                # BODY-FREEZE: during arm-only phases, hard-reset root velocity to zero
+                # every step so the locomotion policy's residual leg torques cannot
+                # accumulate into body drift.  This eliminates the ~2-3 cm/50-step
+                # drift observed during PRE_GRASP and REACH without changing the arm
+                # control logic.  write_root_velocity_to_sim sets CoM velocity in the
+                # physics engine before the next substep integrates it.
+                # NOTE: must be called OUTSIDE torch.inference_mode() context because
+                # write_root_velocity_to_sim does inplace updates on internal tensors.
+                _FREEZE_STATES = {
+                    PipelineState.ARM_INIT,   # freeze during arm retraction too
+                    PipelineState.SCAN,       # freeze during camera scan
+                    PipelineState.PRE_GRASP,
+                    PipelineState.REACH,
+                    PipelineState.CLOSE,
+                    PipelineState.LIFT,
+                }
+                if state in _FREEZE_STATES and _freeze_root_link_pose is not None:
+                    # BODY-FREEZE v2: teleport body back to ALIGN_YAW end pose every step.
+                    # v1 only zeroed velocity, which stopped acceleration build-up but
+                    # could not undo the per-step displacement already committed by PhysX.
+                    # v2 additionally overwrites the root link pose so the body is snapped
+                    # to the exact freeze anchor each step, eliminating cumulative drift.
+                    # write_root_link_pose_to_sim and write_root_com_velocity_to_sim both
+                    # do in-place tensor updates, so they must run outside inference_mode.
+                    with torch.inference_mode(False):
+                        _zero_vel = torch.zeros(1, 6, device=robot.data.root_com_vel_w.device)
+                        # BODY-FREEZE v2: snap position+orientation back to freeze anchor
+                        # and zero all velocities every step.
+                        # write_root_link_pose_to_sim does inplace updates on internal
+                        # inference tensors (root_link_pose_w, root_link_state_w, etc.).
+                        # We bypass this by operating directly on .data storage and
+                        # calling PhysX set_root_transforms manually (same pattern as v1).
+                        _dev = robot.data.root_link_pose_w.device
+                        # 1) Update internal pose buffers via .data (no autograd check)
+                        robot.data.root_link_pose_w.data[0:1] = _freeze_root_link_pose
+                        if robot.data._root_link_state_w.data is not None:
+                            robot.data._root_link_state_w.data.data[0:1, :7] = _freeze_root_link_pose
+                        if robot.data._root_state_w.data is not None:
+                            robot.data._root_state_w.data.data[0:1, :7] = _freeze_root_link_pose
+                        # Invalidate cached body pose buffers so they re-query from PhysX
+                        robot.data._body_link_pose_w.timestamp = -1.0
+                        robot.data._body_com_pose_w.timestamp  = -1.0
+                        robot.data._body_state_w.timestamp     = -1.0
+                        robot.data._body_link_state_w.timestamp = -1.0
+                        robot.data._body_com_state_w.timestamp  = -1.0
+                        # 2) Push pose to PhysX (convert wxyz -> xyzw)
+                        _pose_xyzw = _freeze_root_link_pose.clone()
+                        _pose_xyzw[:, 3:] = torch.cat([
+                            _freeze_root_link_pose[:, 4:],   # xyz part of quat
+                            _freeze_root_link_pose[:, 3:4],  # w part of quat
+                        ], dim=-1)
+                        robot.root_physx_view.set_root_transforms(_pose_xyzw, indices=robot._ALL_INDICES)
+                        # 3) Zero velocities in internal buffers
+                        robot.data.root_com_vel_w.data.fill_(0.0)
+                        robot.data.body_acc_w.data.fill_(0.0)
+                        if robot.data._root_com_state_w.data is not None:
+                            robot.data._root_com_state_w.data.data[:, 7:].fill_(0.0)
+                        if robot.data._root_state_w.data is not None:
+                            robot.data._root_state_w.data.data[:, 7:].fill_(0.0)
+                        # 4) Push zero velocities to PhysX
+                        robot.root_physx_view.set_root_velocities(
+                            robot.data.root_com_vel_w.clone(), indices=robot._ALL_INDICES
+                        )
 
             # ---- ALIGN_YAW_1: rotate in-place to TARGET_YAW before PAN ----
             if state == PipelineState.ALIGN_YAW_1:
@@ -550,6 +659,19 @@ def main():
                           f"(yaw={math.degrees(yaw):.1f}deg "
                           f"err={math.degrees(_yaw_err_align):.1f}deg) -> ARM_INIT",
                           flush=True)
+                    # BODY-FREEZE: record anchor HERE (at ALIGN_YAW exit) so that
+                    # ARM_INIT and SCAN are also frozen to this pose.  Previously the
+                    # anchor was recorded at ARM_INIT exit, but ARM_INIT itself drifted
+                    # 4-10 cm (no freeze applied), corrupting the IK base frame.
+                    # From this point onward the anchor never changes: all subsequent
+                    # ARM_INIT retries (after PRE_GRASP/REACH reject) reuse the same
+                    # anchor so the robot stays at the original aligned position.
+                    with torch.inference_mode(False):
+                        _freeze_root_link_pose = robot.data.root_link_pose_w[0:1].clone()
+                    print(f"[SM] ALIGN_YAW freeze anchor set: "
+                          f"pos={np.round(_freeze_root_link_pose[0,:3].cpu().numpy(),4)} "
+                          f"quat={np.round(_freeze_root_link_pose[0,3:].cpu().numpy(),4)}",
+                          flush=True)
                     state = PipelineState.ARM_INIT
                     state_step = 0
 
@@ -599,6 +721,12 @@ def main():
                     print(f"[SM] ARM_INIT done ({_reason} at step {state_step}): final_q={np.round(cur_q,4)} base_pos_w={np.round(_ai_done_pos_w,3)}", flush=True)
                     print(f"[SM] ARM_INIT target:        {np.round(ARM_SIDE_ANGLES,4)}", flush=True)
                     print(f"[SM] ARM_INIT joint_err:     {np.round(_arm_final_err,4)} max={_arm_final_err.max():.4f} rad ({np.degrees(_arm_final_err.max()):.1f}deg)",
+                          flush=True)
+                    # NOTE: freeze anchor is set once at ALIGN_YAW exit and never
+                    # updated here, so every ARM_INIT retry locks to the same pose.
+                    print(f"[SM] ARM_INIT freeze anchor (current): "
+                          f"pos={np.round(_freeze_root_link_pose[0,:3].cpu().numpy(),4)}"
+                          f" quat={np.round(_freeze_root_link_pose[0,3:].cpu().numpy(),4)}",
                           flush=True)
                     print("[SM] ARM_INIT done -> SCAN", flush=True)
                     state = PipelineState.SCAN
@@ -739,11 +867,58 @@ def main():
                         except Exception as _cam_diag_e:
                             print(f"[DIAG-CAM] camera diag failed: {_cam_diag_e}", flush=True)
                         # ---- END DIAG 相机外参验证 ----
-                        state = PipelineState.GRASP_PLAN
+                        # Save joint angles at SCAN time (j5=+1.2) for camera
+                        # extrinsic computation in GRASP_PLAN. Must be captured
+                        # here before PRE_ADJUST changes j5 to 0.
+                        _q_scan_at_scan = robot.data.joint_pos[
+                            0, list(_get_arm_ids(robot)[0])
+                        ].cpu().numpy().copy()
+                        _pos_w_at_scan  = robot.data.root_pos_w[0].cpu().numpy().copy()
+                        _quat_w_at_scan = robot.data.root_quat_w[0].cpu().numpy().copy()
+                        state = PipelineState.PRE_ADJUST
                         state_step = 0
                 except (KeyError, AttributeError) as e:
                     print(f"[SM] SCAN camera unavailable ({e}) — DONE.", flush=True)
                     state = PipelineState.DONE
+
+            # ---- PRE_ADJUST: transition j5 from +1.2 to 0 before GraspNet IK ----
+            # Purpose: ARM_INIT leaves j5=+1.2 (approach axis 65° from vertical, good
+            # for SCAN camera view). But PRE_GRASP IK for a vertical approach grasp
+            # requires j5≈-1.0 from that seed (jump≈2.2rad), which PD cannot track.
+            # By first driving j5→0 (approach nearly vertical, appz≈-1), the subsequent
+            # IK seed has j5≈0 and the solution jump is only ≈1.1rad — PD converges.
+            elif state == PipelineState.PRE_ADJUST:
+                # Read current joint angles every step (CRITICAL: without this the
+                # command is computed from a stale cur_q and the joint never moves).
+                cur_q = robot.data.joint_pos[
+                    0, list(_get_arm_ids(robot)[0])
+                ].cpu().numpy()
+                _pa_budget = BUDGET[PipelineState.PRE_ADJUST]
+                # Fixed-rate command: move each joint at most 0.015 rad/step toward target.
+                # Proportional alpha ramp was too small in early steps (alpha≈0.004 at step1)
+                # giving negligible torque that couldn't overcome gravity on j5.
+                _pa_delta = np.clip(ARM_PREGRASP_ANGLES - cur_q, -0.015, 0.015)
+                q6_pa = cur_q + _pa_delta
+                _arm_step(robot, q6_pa)
+                _gripper_step(robot, close=False)
+                if state_step == 1:
+                    _pa_pos_w = robot.data.root_pos_w[0].cpu().numpy()
+                    print(f"[SM] PRE_ADJUST: transitioning j5 {cur_q[4]:.3f} -> 0.0 ... "
+                          f"base_pos_w={np.round(_pa_pos_w,3)}", flush=True)
+                _pa_err = np.abs(cur_q - ARM_PREGRASP_ANGLES)
+                if state_step % 50 == 0:
+                    _pa_pos_w = robot.data.root_pos_w[0].cpu().numpy()
+                    print(f"[SM] PRE_ADJUST step {state_step}/{_pa_budget}: "
+                          f"q={np.round(cur_q,4)} err={np.round(_pa_err,4)} max={_pa_err.max():.4f} "
+                          f"base_pos_w={np.round(_pa_pos_w,3)}", flush=True)
+                _pa_converged = (_pa_err.max() < 0.05)   # ~3 deg threshold
+                _pa_timeout   = (state_step >= _pa_budget)
+                if _pa_converged or _pa_timeout:
+                    _reason_pa = "converged" if _pa_converged else "timeout"
+                    print(f"[SM] PRE_ADJUST done ({_reason_pa} at step {state_step}): "
+                          f"j5={cur_q[4]:.4f} (target=0.0) -> GRASP_PLAN", flush=True)
+                    state = PipelineState.GRASP_PLAN
+                    state_step = 0
 
             # ---- GRASP_PLAN: build point cloud, run GraspNet ----
             elif state == PipelineState.GRASP_PLAN:
@@ -763,20 +938,66 @@ def main():
                 ], axis=-1).astype(np.float32)
                 rgb_u = scan_rgb if scan_rgb is not None else np.zeros((H,W,3), np.uint8)
                 cols  = (rgb_u[mask] / 255.0).astype(np.float32)
-                print(f"[SM] Point cloud: {len(pts)} pts "
+                print(f"[SM] Point cloud raw: {len(pts)} pts "
                       f"(z min={z_v.min():.2f} max={z_v.max():.2f})", flush=True)
+
+                # ---- 删除主平面（桌面）via RANSAC ----
+                # 桌面是场景中面积最大的平面；RANSAC 拟合后删去内点，
+                # 只保留突出于桌面的物体点云。不依赖物体颜色，通用。
+                def _ransac_remove_plane(cloud, dist_thresh=0.008,
+                                        n_iter=150, min_inlier_ratio=0.15):
+                    N = len(cloud)
+                    if N < 10:
+                        return np.ones(N, dtype=bool)
+                    best_n    = 0
+                    best_mask = np.ones(N, dtype=bool)
+                    best_info = [None, None]
+                    rng = np.random.default_rng(42)
+                    for _ in range(n_iter):
+                        idx = rng.choice(N, 3, replace=False)
+                        p1, p2, p3 = cloud[idx[0]], cloud[idx[1]], cloud[idx[2]]
+                        nv = np.cross(p2 - p1, p3 - p1)
+                        nn = float(np.linalg.norm(nv))
+                        if nn < 1e-8:
+                            continue
+                        nv = nv / nn
+                        dv = float(nv @ p1)
+                        inlier = np.abs(cloud @ nv - dv) < dist_thresh
+                        ni = int(inlier.sum())
+                        if ni > best_n:
+                            best_n    = ni
+                            best_mask = inlier
+                            best_info = [nv, dv]
+                    if best_n < int(N * min_inlier_ratio):
+                        print(f"[SM] RANSAC: no dominant plane "
+                              f"(best={best_n}/{N}), keeping all.", flush=True)
+                        return np.ones(N, dtype=bool)
+                    keep = ~best_mask
+                    pct  = best_n * 100 // N
+                    print(f"[SM] RANSAC (info only) plane={best_n} pts ({pct}%), "
+                          f"object pts={int(keep.sum())}. "
+                          f"normal={np.round(best_info[0],3)} d={best_info[1]:.3f}",
+                          flush=True)
+                    return keep
+
+                _keep_mask = _ransac_remove_plane(pts)  # True=保留(非桌面)
+                pts  = pts[_keep_mask]
+                cols = cols[_keep_mask]
+                print(f"[SM] After plane removal: {len(pts)} pts sent to GraspNet", flush=True)
+                # ---- END RANSAC 去桌面 ----
+
                 if len(pts) < 200:
                     print("[SM] Too few points — DONE.", flush=True)
                     state = PipelineState.DONE
                 else:
                     np.savez("/tmp/pointcloud.npz", points=pts, colors=cols)
                     worker = os.path.join(os.path.dirname(__file__), "grasp_worker.py")
-                    topk   = getattr(args, "grasp_topk", 1)
-                    print("[SM] Running grasp_worker...", flush=True)
+                    _topk_worker = 50
+                    print(f"[SM] Running grasp_worker (topk={_topk_worker})...", flush=True)
                     res = subprocess.run(
                         [_sys.executable, worker,
                          "--checkpoint", args.grasp_checkpoint,
-                         "--topk", str(topk)],
+                         "--topk", str(_topk_worker)],
                         timeout=120,
                     )
                     if res.returncode != 0 or not os.path.exists("/tmp/grasp_result.npz"):
@@ -788,35 +1009,164 @@ def main():
                             print("[SM] No valid grasps — DONE.", flush=True)
                             state = PipelineState.DONE
                         else:
-                            # Capture the joint angles at SCAN time before
-                            # anything moves.  Used to compute the desired EE
-                            # orientation in arm_base_link frame independently
-                            # of subsequent PRE_GRASP motion.
-                            _q_scan_saved = robot.data.joint_pos[
-                                0, list(_get_arm_ids(robot)[0])
-                            ].cpu().numpy().copy()
-                            from arm_ik import compute_desired_ee_rot_in_arm as _cder
-                            _R_desired = _cder(gr["rotations"][0], _q_scan_saved)
+                            # ---- 香蕉颜色过滤：从候选中选落在香蕉上的抓取 ----
+                            _best_grasp_idx = 0  # 默认 fallback：最高分
+                            try:
+                                import cv2 as _cv2_f
+                                if scan_rgb is not None:
+                                    _hsv_f = _cv2_f.cvtColor(scan_rgb, _cv2_f.COLOR_RGB2HSV)
+                                    # H=[20,40] 黄色，S>80，V>80
+                                    # 跑完 DIAG-HSV 后根据实际值调整此阈值
+                                    _lower_b = np.array([20,  80,  80], dtype=np.uint8)
+                                    _upper_b = np.array([40, 255, 255], dtype=np.uint8)
+                                    _banana_px = _cv2_f.inRange(_hsv_f, _lower_b, _upper_b)
+                                    _n_bpx = int(_banana_px.sum() // 255)
+                                    print(f"[SM] 香蕉像素 mask: {_n_bpx} px "
+                                          f"(H=[{_lower_b[0]},{_upper_b[0]}] "
+                                          f"S>={_lower_b[1]} V>={_lower_b[2]})", flush=True)
+                                    # RANSAC 后 pts 已缩小，不能再用图像坐标 mask 索引
+                                    # 改为直接对 cols (已对应 RANSAC 后 pts) 做 HSV 过滤
+                                    _cols_u8 = (cols * 255).astype(np.uint8).reshape(1, -1, 3)
+                                    _hsv_pts = _cv2_f.cvtColor(_cols_u8, _cv2_f.COLOR_RGB2HSV)[0]  # (N,3)
+                                    _banana_in_cloud = (
+                                        (_hsv_pts[:, 0] >= _lower_b[0]) & (_hsv_pts[:, 0] <= _upper_b[0]) &
+                                        (_hsv_pts[:, 1] >= _lower_b[1]) & (_hsv_pts[:, 2] >= _lower_b[2])
+                                    )
+                                    _banana_pts_cam  = pts[_banana_in_cloud]
+                                    print(f"[SM] 香蕉点云: {len(_banana_pts_cam)} pts", flush=True)
+                                    if len(_banana_pts_cam) >= 20:
+                                        from scipy.spatial import cKDTree as _KDTree
+                                        _kd = _KDTree(_banana_pts_cam)
+                                        _trans_all = gr["translations"]
+                                        _dists_all, _ = _kd.query(_trans_all, k=1)
+                                        _bmask = _dists_all < 0.05
+                                        _n_ok = int(_bmask.sum())
+                                        print(f"[SM] 颜色过滤: {_n_ok}/{len(_trans_all)} 个抓取落在香蕉上", flush=True)
+                                        for _gi in range(min(len(_trans_all), 10)):
+                                            print(f"[SM]   [{_gi}] score={gr['scores'][_gi]:.3f} "
+                                                  f"dist={_dists_all[_gi]*100:.1f}cm "
+                                                  f"t={np.round(_trans_all[_gi],3)}", flush=True)
+                                        if _n_ok > 0:
+                                            _best_grasp_idx = int(np.where(_bmask)[0][0])
+                                            print(f"[SM] 颜色过滤选用 [{_best_grasp_idx}] "
+                                                  f"score={gr['scores'][_best_grasp_idx]:.3f}", flush=True)
+                                        else:
+                                            print("[SM] 警告: 无抓取落在香蕉区域，使用最高分 [0]", flush=True)
+                                    else:
+                                        print(f"[SM] 香蕉点云不足({len(_banana_pts_cam)}pts)，使用最高分 [0]", flush=True)
+                                else:
+                                    print("[SM] scan_rgb=None，跳过颜色过滤", flush=True)
+                            except Exception as _cfe:
+                                print(f"[SM] 颜色过滤异常: {_cfe}，使用最高分 [0]", flush=True)
+                            # ---- END 香蕉颜色过滤 ----
+
+                            # Use the joint angles saved at SCAN time (j5=+1.2).
+                            # PRE_ADJUST has already moved j5 to 0, so reading
+                            # current joint_pos here would give wrong camera extrinsics.
+                            _q_scan_saved   = _q_scan_at_scan
+                            _pos_w_scan_pre  = _pos_w_at_scan.copy()
+                            _quat_w_scan_pre = _quat_w_at_scan.copy()
+
+                            # ---- IK pre-screening + ranking of banana candidates ----
+                            # Fast position-only IK (~5ms each) to detect j2=π singular
+                            # configs before committing to a 500-step PRE_GRASP run.
+                            # Candidates sorted: IK-feasible first, then by GraspNet score.
+                            from arm_ik import (
+                                solve as _ik_solve_pos,
+                                cam_to_world as _ctw_pre,
+                                world_pos_to_arm_frame as _w2a_pre,
+                                fk_gripper as _fkg_pre,
+                                _IK_JOINT_LIMITS as _jlims_pre,
+                                compute_desired_ee_rot_in_arm as _cder,
+                            )
+                            # _pos_w_scan_pre and _quat_w_scan_pre already set above
+                            # from _pos_w_at_scan / _quat_w_at_scan (SCAN-time values).
+                            _banana_idxs_pre = list(np.where(_bmask)[0]) if '_bmask' in dir() and _bmask is not None else [_best_grasp_idx]
+                            if not _banana_idxs_pre:
+                                _banana_idxs_pre = [_best_grasp_idx]
+                            # Pre-compute the fixed rotation: world <- arm_base_link <- gripper_base <- camera
+                            # R_cam_to_world = R_robot @ R_gb_in_arm @ _CAM_OFFSET_ROT
+                            # This is constant for all candidates (same SCAN-time robot/arm pose).
+                            # Used to project each candidate's approach axis (R_cam[:,0]) into world frame
+                            # so we can measure how "downward" (|approach_world_z|) each grasp is.
+                            from arm_ik import (
+                                quat_to_rot as _q2r_scan,
+                                fk_gripper  as _fkg_scan,
+                                _CAM_OFFSET_ROT as _COR_scan,
+                            )
+                            _R_rob_scan = _q2r_scan(_quat_w_scan_pre)
+                            _R_gb_scan  = _fkg_scan(_q_scan_saved)[:3, :3]
+                            _R_cam2world = _R_rob_scan @ _R_gb_scan @ _COR_scan
+
+                            _ranked_pre = []  # list of (ik_ok, approach_z_abs, score, idx)
+                            for _ci_pre in _banana_idxs_pre:
+                                _t_ci  = gr["translations"][_ci_pre]
+                                _tw_ci = _ctw_pre(_t_ci, _q_scan_saved, _pos_w_scan_pre, _quat_w_scan_pre)
+                                _ta_ci = _w2a_pre(_tw_ci, _pos_w_scan_pre, _quat_w_scan_pre)
+                                try:
+                                    # Use SCAN-time joint angles (j5=+1.2) as IK seed.
+                                    # This finds IK solutions near the j5-positive branch,
+                                    # giving more natural arm trajectories (j5 decreasing
+                                    # from +1.2 toward solution, no upward flip).
+                                    _q_pre = _ik_solve_pos(_ta_ci, target_rot=None, initial_angles=_q_scan_saved)
+                                    # Use j2 proximity to π as the singular-config proxy.
+                                    # position-only IK FK error is unreliable as a threshold
+                                    # (solver may converge to a different branch, giving large
+                                    # FK err even for reachable targets). j2 > 2.8 rad (within
+                                    # 0.34 rad of π) reliably indicates the j2=π singular config.
+                                    _j2_val = float(_q_pre[1])  # joint2 angle
+                                    _ik_ok_pre = (_j2_val < 2.8)
+                                except Exception:
+                                    _ik_ok_pre = False
+                                # Compute |approach_world_z|: how "downward" this grasp approach is.
+                                # approach axis in camera frame = R_cam[:,0] (GraspNet convention).
+                                # Larger |approach_world_z| => more vertical => j6 axis more vertical
+                                # => less Coriolis disturbance on j6 during PRE_GRASP motion.
+                                _R_cam_ci = gr["rotations"][_ci_pre]  # (3,3) rotation matrix
+                                _approach_world_ci = _R_cam2world @ _R_cam_ci[:, 0]
+                                _approach_z_abs_ci = float(abs(_approach_world_ci[2]))
+                                # fingertip 方向 = gripper_base Z 轴，由相机坐标系旋转得到
+                                # R_cam_ci[:,2] 是 GraspNet 旋转矩阵第三列（approach x closing）
+                                # 经过相同的 cam->world 变换得到 fingertip 在世界的方向
+                                _fingertip_world_ci = _R_cam2world @ _R_cam_ci[:, 2]
+                                _fingertip_z_ci = float(_fingertip_world_ci[2])  # 负值=指尖朝下
+                                _ranked_pre.append((_ik_ok_pre, _approach_z_abs_ci, float(gr["scores"][_ci_pre]), _ci_pre, _fingertip_z_ci))
+                            # Sort: IK-feasible first, then by fingertip_world_z ascending (most
+                            # negative = fingertip pointing most downward = top-down grasp, j5>0),
+                            # then by score descending.
+                            # Previously sorted by |approach_world_z| descending, which wrongly
+                            # preferred horizontal side-grasps (approach down => fingertip horizontal).
+                            _ranked_pre.sort(key=lambda x: (-int(x[0]), x[4], -x[2]))
+                            _ranked_idxs = [x[3] for x in _ranked_pre]
+                            print(f"[SM] 候选排序({len(_ranked_idxs)}个,IK预筛,按fingertip朝下优先): "
+                                  + " ".join(f"[{r[3]}]{'✓' if r[0] else '✗'}s={r[2]:.2f}ft={r[4]:.2f}"
+                                             for r in _ranked_pre[:6]),
+                                  flush=True)
+                            # DIAG: 打印所有候选的 fingertip 世界 Z 分量，判断是否存在「指尖朝下」的候选
+                            print(f"[DIAG-FINGERTIP] 所有{len(_ranked_pre)}个香蕉候选的fingertip_world_z (负值=朝下=从上往下抓):", flush=True)
+                            for _r in _ranked_pre:
+                                _ft_label = "朝下✓" if _r[4] < -0.5 else ("斜下" if _r[4] < -0.2 else "水平✗")
+                                print(f"  [{_r[3]}] score={_r[2]:.3f} approach_z={_r[1]:.2f} fingertip_z={_r[4]:.3f} {_ft_label} ik={'✓' if _r[0] else '✗'}", flush=True)
+                            # ---- END IK pre-screening ----
+
+                            _best_grasp_idx = _ranked_idxs[0]
+                            _R_desired = _cder(gr["rotations"][_best_grasp_idx], _q_scan_saved)
                             grasp_result = {
-                                "t_cam": gr["translations"][0],
-                                "R_cam": gr["rotations"][0],
-                                "score": float(gr["scores"][0]),
-                                "width": float(gr["widths"][0]),
-                                # Desired gripper_base rotation in arm_base_link
-                                # frame, computed using SCAN-time joint angles.
-                                # Passed as target_rot in PRE_GRASP IK so that
-                                # all 6 joints arrive at the correct orientation.
+                                "t_cam": gr["translations"][_best_grasp_idx],
+                                "R_cam": gr["rotations"][_best_grasp_idx],
+                                "score": float(gr["scores"][_best_grasp_idx]),
+                                "width": float(gr["widths"][_best_grasp_idx]),
                                 "R_desired_EE_in_arm": _R_desired,
                                 "q_scan": _q_scan_saved,
-                                # DRIFT FIX: save robot pose at SCAN time.
-                                # t_cam is measured in the camera frame at this exact
-                                # moment, so cam_to_world MUST use these values
-                                # (not the current drifted pos_w) to get the correct
-                                # world-frame target.  pos_w and quat_w are updated
-                                # at the top of every loop iteration, so they reflect
-                                # the robot pose at the time grasp_result is built.
-                                "pos_w_scan":  pos_w.copy(),
-                                "quat_w_scan": quat_w.copy(),
+                                "pos_w_scan":  _pos_w_scan_pre,
+                                "quat_w_scan": _quat_w_scan_pre,
+                                # Ranked candidate list for PRE_GRASP IK fallback
+                                "ranked_candidate_idxs": _ranked_idxs,
+                                "gr_translations": gr["translations"],
+                                "gr_rotations":    gr["rotations"],
+                                "gr_scores":       gr["scores"],
+                                "gr_widths":       gr["widths"],
+                                "tried_set":       {_best_grasp_idx},
                             }
                             print(f"[SM] Best grasp score={grasp_result['score']:.3f} "
                                   f"t={np.round(grasp_result['t_cam'],3)}", flush=True)
@@ -937,60 +1287,109 @@ def main():
                     cur_q = robot.data.joint_pos[
                         0, list(_get_arm_ids(robot)[0])
                     ].cpu().numpy()
-                    # Retreat PRE_GRASP_RETREAT m along approach axis (R_cam[:,0]) in cam frame
-                    # so fingertips clear the object and ORIENT can rotate freely.
-                    pre_t_cam = t_cam - PRE_GRASP_RETREAT * R_cam[:, 0]
+                    # MERGED: PRE_GRASP now targets banana directly (no retreat).
+                    # Previously retreat=10cm caused two-stage IK (pre_t -> t_arm) with
+                    # j4 multi-solution jumps (15~34 deg branch switches). Single IK eliminates this.
                     # BUG FIX: use grasp_result["q_scan"] (SCAN-time joint angles) instead of
                     # cur_q (current joints at PRE_GRASP step=1, arm already moving).
-                    # t_cam is in the camera frame at SCAN time, so cam_to_world must
-                    # use the joint angles at that moment to get the correct camera pose.
-                    # DRIFT FIX: use pos_w_scan/quat_w_scan (robot pose at SCAN time) instead of
-                    # the current pos_w (which may already be drifted from PRE_GRASP start).
-                    # t_cam was measured in camera frame at SCAN time, so cam_to_world must
-                    # use the robot pose at that same moment to get the correct world target.
-                    t_world = cam_to_world(pre_t_cam, grasp_result["q_scan"],
+                    # DRIFT FIX: use pos_w_scan/quat_w_scan (robot pose at SCAN time).
+                    t_world = cam_to_world(t_cam, grasp_result["q_scan"],
                                            grasp_result["pos_w_scan"], grasp_result["quat_w_scan"])
-                    # DRIFT FIX: save fixed world-frame target so every step can re-project
-                    # it into the current robot frame, compensating for body drift during PRE_GRASP.
                     _pg_t_world_fixed = t_world.copy()
                     pre_t = world_pos_to_arm_frame(t_world, pos_w, quat_w)
-                    # Include the desired EE orientation (computed at SCAN time)
-                    # so that PRE_GRASP IK solves for all 6 joints simultaneously.
-                    # This replaces the ORIENT stage, which was mathematically
-                    # incapable of achieving the target orientation by adjusting
-                    # joint6 alone after PRE_GRASP had moved joint1-5.
-                    R_desired_EE = grasp_result["R_desired_EE_in_arm"]
-                    # FIX: use solve_for_gripper_base() so that gripper_base (not joint7)
-                    # reaches pre_t.  solve() passes target_pos to ikpy as the joint7
-                    # target; solve_for_gripper_base() corrects this by adding the
-                    # joint7->gripper_base offset (R_gb_desired @ [0,0,0.1358]) to pre_t
-                    # before calling solve(), so that joint7 lands at the right place and
-                    # gripper_base ends up at pre_t (error ~0 cm instead of ~13.58 cm).
+                    # ---- GRIPPER OFFSET CORRECTION ----
+                    # GraspNet t_cam is the GRASP CENTER (midpoint between finger tips).
+                    # cam_to_world / world_pos_to_arm_frame converts it correctly to arm frame.
+                    # However ik_solve_gb() expects target_gb_pos = gripper_BASE origin,
+                    # which is 13.58cm BEHIND the finger-tip midpoint along the approach axis
+                    # (the _J7_ORIGIN_IN_GB offset baked into solve_for_gripper_base).
+                    #
+                    # Previously pre_t (grasp center) was passed directly as gripper_base target,
+                    # causing the finger tips to end up 13.58cm PAST the grasp center —
+                    # i.e. 13.58cm INSIDE the banana / table, which explains:
+                    #   • machine arm crashing into banana with full PD force
+                    #   • j5 hitting joint limit (-1.22 rad) and locking forearm horizontal
+                    #
+                    # Fix: shift pre_t backward along the approach axis by
+                    #   _J7_OFFSET (13.58cm) + _GRASP_CLEARANCE (5cm safety margin)
+                    # so that the finger-tip midpoint arrives exactly at the grasp center.
+                    #
+                    # approach axis in arm frame = R_gb_desired[:, 0]
+                    # R_gb_desired = R_j7_desired @ _RX_NEG90  (arm_ik.py convention)
+                    from arm_ik import _RX_NEG90 as _RX_NEG90_pg
+                    R_desired_EE = grasp_result["R_desired_EE_in_arm"]  # R_j7_desired
+                    _R_gb_desired_pg = R_desired_EE @ _RX_NEG90_pg      # gripper_base rotation in arm frame
+                    _approach_arm_pg = _R_gb_desired_pg[:, 0]            # approach unit vector in arm frame
+                    _J7_OFFSET    = 0.2   # gripper_base -> finger-tip midpoint (m)
+                    _GRASP_CLEARANCE = 0.0  # extra safety margin so gripper opens around banana (m)
+                    pre_t_gb = pre_t - (_J7_OFFSET + _GRASP_CLEARANCE) * _approach_arm_pg
+                    _pre_t_dist = float(np.linalg.norm(pre_t_gb))
+                    print(f"[INFO] PRE_GRASP t_arm dist={_pre_t_dist*100:.1f}cm "
+                          f"(gripper_base target, offset {(_J7_OFFSET+_GRASP_CLEARANCE)*100:.0f}cm back from grasp center)",
+                          flush=True)
+                    print(f"[INFO] PRE_GRASP grasp_center_arm={np.round(pre_t,4)} "
+                          f"gripper_base_arm={np.round(pre_t_gb,4)}", flush=True)
+                    # PRE_GRASP IK: roll-search over all 72 angles, pick nearest-to-seed valid solution.
+                    # solve_for_gripper_base returns None when ALL roll angles produce at_limit solutions
+                    # (j2=π singular config); in that case we fall through to the candidate-swap logic.
+                    from arm_ik import compute_desired_ee_rot_in_arm as _cder2
                     target_angles_arm = ik_solve_gb(
-                        pre_t,
+                        pre_t_gb,
                         target_rot_j7=R_desired_EE,
-                        initial_angles=cur_q,
+                        initial_angles=grasp_result["q_scan"],  # j5=+1.2 seed -> IK finds j5+ branch
                     )
-                    print(f"[SM] PRE_GRASP t_cam={np.round(t_cam,3)} retreat={PRE_GRASP_RETREAT}m", flush=True)
-                    print(f"[SM] PRE_GRASP pre_t_cam={np.round(pre_t_cam,3)} t_world={np.round(t_world,3)}", flush=True)
-                    print(f"[SM] PRE_GRASP t_arm={np.round(pre_t,3)} IK={np.round(target_angles_arm,3)}", flush=True)
-                    print(f"[SM] PRE_GRASP R_desired_EE_in_arm (from SCAN q):\n{np.round(R_desired_EE,3)}", flush=True)
-                    print(f"[SM] PRE_GRASP opening gripper to width={width:.3f}m (half={width/2:.3f})", flush=True)
                     # ---- DIAG: IK quality check ----
                     from arm_ik import fk_gripper as _fk_pg, cam_to_world as _c2w_pg, world_pos_to_arm_frame as _w2a_pg, _IK_JOINT_LIMITS as _jlims_pg
-                    # FIX: use fk_gripper to get gripper_base position (pre_t is gripper_base origin)
-                    _T_ik = _fk_pg(target_angles_arm)
-                    _ee_arm_ik = _T_ik[:3, 3]
-                    _ik_pos_err = float(np.linalg.norm(_ee_arm_ik - pre_t))
-                    _ik_at_lim = any(
-                        abs(float(_qi) - _lo) < 0.01 or abs(float(_qi) - _hi) < 0.01
-                        for _qi, (_lo, _hi) in zip(target_angles_arm, _jlims_pg)
-                    )
-                    _ik_status = "✓ OK" if (_ik_pos_err < 0.03 and not _ik_at_lim) else "✗ FAIL"
-                    print(f"[DIAG] PRE_GRASP IK FK check: target_arm={np.round(pre_t,4)}"
-                          f" actual_EE_arm={np.round(_ee_arm_ik,4)}"
-                          f" pos_err={_ik_pos_err*100:.1f}cm at_limit={_ik_at_lim} {_ik_status}",
-                          flush=True)
+                    _ik_fail = target_angles_arm is None
+                    if not _ik_fail:
+                        _T_ik = _fk_pg(target_angles_arm)
+                        _ee_arm_ik = _T_ik[:3, 3]  # gripper_base position from FK
+                        # Check against pre_t_gb (gripper_base target), not pre_t (grasp center)
+                        _ik_pos_err = float(np.linalg.norm(_ee_arm_ik - pre_t_gb))
+                        _ik_at_lim = any(
+                            abs(float(_qi) - _lo) < 0.01 or abs(float(_qi) - _hi) < 0.01
+                            for _qi, (_lo, _hi) in zip(target_angles_arm, _jlims_pg)
+                        )
+                        _ik_status = "✓ OK" if (_ik_pos_err < 0.03 and not _ik_at_lim) else "✗ FAIL"
+                        _ik_fail = (_ik_status == "✗ FAIL")
+                        print(f"[DIAG] PRE_GRASP IK FK check: "
+                              f"grasp_center_arm={np.round(pre_t,4)} "
+                              f"gripper_base_target={np.round(pre_t_gb,4)} "
+                              f"actual_gb_arm={np.round(_ee_arm_ik,4)} "
+                              f"pos_err={_ik_pos_err*100:.1f}cm at_limit={_ik_at_lim} {_ik_status}",
+                              flush=True)
+                    else:
+                        print("[DIAG] PRE_GRASP IK returned None (j2=π singular) -> try next candidate",
+                              flush=True)
+                    # ---- IK FAIL: switch to next ranked candidate ----
+                    if _ik_fail:
+                        _cand_list = grasp_result.get("ranked_candidate_idxs", [])
+                        _tried     = grasp_result.get("tried_set", set())
+                        _next_ci   = next((i for i in _cand_list if i not in _tried), None)
+                        if _next_ci is None:
+                            print("[WARN] PRE_GRASP: all ranked candidates IK-failed -> ARM_INIT",
+                                  flush=True)
+                            grasp_result = None; depth_accum.clear(); scan_rgb = None
+                            target_angles_arm = None
+                            state = PipelineState.ARM_INIT; state_step = 0; continue
+                        _tried.add(_next_ci)
+                        grasp_result["tried_set"]   = _tried
+                        grasp_result["t_cam"]        = grasp_result["gr_translations"][_next_ci]
+                        grasp_result["R_cam"]        = grasp_result["gr_rotations"][_next_ci]
+                        grasp_result["width"]        = float(grasp_result["gr_widths"][_next_ci])
+                        grasp_result["score"]        = float(grasp_result["gr_scores"][_next_ci])
+                        grasp_result["R_desired_EE_in_arm"] = _cder2(
+                            grasp_result["gr_rotations"][_next_ci], grasp_result["q_scan"])
+                        print(f"[SM] PRE_GRASP IK FAIL -> switch to candidate [{_next_ci}] "
+                              f"score={grasp_result['score']:.3f}", flush=True)
+                        state_step = 0; continue  # re-run step=1 with new candidate
+                    # IK OK: save and proceed
+                    grasp_result["target_angles_pre"] = target_angles_arm.copy()
+                    print(f"[SM] PRE_GRASP t_cam={np.round(t_cam,3)} (direct, no retreat)", flush=True)
+                    print(f"[SM] PRE_GRASP t_world={np.round(t_world,3)}", flush=True)
+                    print(f"[SM] PRE_GRASP t_arm={np.round(pre_t,3)} IK={np.round(target_angles_arm,3)}", flush=True)
+                    print(f"[SM] PRE_GRASP R_desired_EE_in_arm:\n{np.round(R_desired_EE,3)}", flush=True)
+                    print(f"[SM] PRE_GRASP opening gripper to width={width:.3f}m (half={width/2:.3f})", flush=True)
                     _t_obj_world_pg = _c2w_pg(t_cam, grasp_result["q_scan"], pos_w, quat_w)
                     print(f"[DIAG] PRE_GRASP object world pos={np.round(_t_obj_world_pg,4)}"
                           f" (z={_t_obj_world_pg[2]:.3f}m)", flush=True)
@@ -1009,33 +1408,47 @@ def main():
                           f" (pre-grasp is in this direction from object)", flush=True)
                     # Record initial joint angles for feed-forward interpolation
                     _pg_q_init = cur_q.copy()
-                    # ---- END DIAG PRE_GRASP ----
+                    # Initialise fixed IK target (held constant for all PRE_GRASP steps)
+                    _pg_target_cur = target_angles_arm.copy()
+                    # ---- ALL-JOINT RATE-LIMITED COMMAND INTEGRATOR ----
+                    # Instead of sending the full IK target every step (DIRECT TARGET),
+                    # we ramp each joint command toward the target at a limited rate.
+                    # Motivation:
+                    #   DIRECT TARGET + stiffness=8000 → PD torque = 8000 × full_err
+                    #   (e.g. j2 needs 1 rad → torque = 8000 N·mm instantaneously)
+                    #   This causes extreme angular acceleration in the first few steps,
+                    #   which through the Coriolis/centripetal coupling matrix transfers
+                    #   large disturbance torques to OTHER joints (especially j6).
+                    #   j6 gets flung to -1.2 rad in ~20 steps and then locks there
+                    #   because gravity+Coriolis ≈ PD restoring torque at that angle.
+                    #
+                    # Fix: ramp each joint at MAX_DELTA rad/step. At 0.05 rad/step,
+                    #   j2 (1 rad travel) reaches target in ~20 steps. Angular velocity
+                    #   is bounded → Coriolis ∝ ω² is 100× smaller → j6 stays near cmd.
+                    #   After ~30 steps all joints are at their IK targets; PD then does
+                    #   fine-settling with small errors and minimal cross-coupling.
+                    _pg_cmd = cur_q.copy()  # start from current pose → zero first-step torque
+                    # Per-joint max rate (rad/step). Chosen so all joints reach target
+                    # within ~30 steps, leaving 470 steps for PD fine-settling.
+                    _PG_MAX_DELTA = np.array([0.03, 0.05, 0.05, 0.04, 0.04, 0.04])
+                    # ---- END PRE_GRASP 初始化 ----
                 cur_q = robot.data.joint_pos[
                     0, list(_get_arm_ids(robot)[0])
                 ].cpu().numpy()
-                # Rolling tracking for PRE_GRASP:
-                # Each step command = cur_q + α*(target - cur_q), where α controls
-                # how fast joints move toward the IK target.  Unlike the fixed q_init
-                # feed-forward interpolation (which caused oscillation when IK target
-                # updated mid-way), this approach always starts from the actual current
-                # joint position, so IK target updates are absorbed smoothly.
-                _PRE_GRASP_ALPHA = 0.08  # fraction of remaining error to close per step
-                # DRIFT FIX: re-project the fixed world-frame target into the current
-                # robot arm frame every 5 steps, then re-solve IK.  This compensates
-                # for body drift while keeping IK overhead low.
-                if state_step % 5 == 1:  # fires on step=1,6,11,... (also first step)
-                    _cur_pos_w  = robot.data.root_pos_w[0].cpu().numpy()
-                    _cur_quat_w = robot.data.root_quat_w[0].cpu().numpy()
-                    _pg_pre_t_cur = world_pos_to_arm_frame(_pg_t_world_fixed, _cur_pos_w, _cur_quat_w)
-                    _pg_target_cur = ik_solve_gb(
-                        _pg_pre_t_cur,
-                        target_rot_j7=R_desired_EE,
-                        initial_angles=cur_q,
-                    )
-                # Rolling tracking command: move α fraction toward current IK target
-                q6 = cur_q + _PRE_GRASP_ALPHA * (_pg_target_cur - cur_q)
-                q6 = np.clip(q6, [lo for lo, hi in _IK_JOINT_LIMITS],
+                # ALL-JOINT RATE-LIMITED COMMAND: advance each joint toward the
+                # IK target by at most _PG_MAX_DELTA[i] rad per step.
+                # Using _pg_cmd (prev command) as base keeps trajectories monotone
+                # regardless of where the actual joint ended up (Coriolis disturbance).
+                for _ji in range(6):
+                    _pg_cmd[_ji] += float(np.clip(
+                        _pg_target_cur[_ji] - _pg_cmd[_ji],
+                        -_PG_MAX_DELTA[_ji],
+                        +_PG_MAX_DELTA[_ji],
+                    ))
+                _pg_cmd = np.clip(_pg_cmd,
+                                  [lo for lo, hi in _IK_JOINT_LIMITS],
                                   [hi for lo, hi in _IK_JOINT_LIMITS])
+                q6 = _pg_cmd.copy()
                 _arm_step(robot, q6)
                 _gripper_width_step(robot, grasp_result["width"])
                 if state_step % 50 == 0:
@@ -1049,7 +1462,7 @@ def main():
                 _pg_cur_q_check = robot.data.joint_pos[
                     0, list(_get_arm_ids(robot)[0])].cpu().numpy()
                 _pg_err_check = np.abs(_pg_cur_q_check - _pg_target_cur)
-                _pg_early_exit = (state_step > 100 and _pg_err_check.max() < 0.05)
+                _pg_early_exit = (state_step > 150 and _pg_err_check.max() < 0.05)  # 150 min steps for longer direct travel
                 if _pg_early_exit and state_step % 50 != 0:  # avoid double-print
                     _pg_exit_pos_w = robot.data.root_pos_w[0].cpu().numpy()
                     print(f"[SM] PRE_GRASP early-exit at step {state_step}: "
@@ -1072,9 +1485,10 @@ def main():
                     _ee_final_arm = _T_final_gb[:3, 3]   # gripper_base position
                     _R_final_ee = _T_final[:3, :3]        # joint7 rotation (for rot_err vs R_desired_EE)
                     _R_rob_pgd = _q2r_pgd(quat_w)
-                    _ee_final_world = _R_rob_pgd @ _ee_final_arm + pos_w + _R_rob_pgd @ np.array([0.,0.,0.0888])
-                    # BUG FIX: use q_scan (SCAN-time joints) for cam_to_world, not cur_q_final
-                    _target_world = _c2w_pgd(t_cam - PRE_GRASP_RETREAT * R_cam[:, 0], grasp_result["q_scan"], pos_w, quat_w)
+                    # EE世界坐标 = R_robot @ ee_arm_local + robot_base_world (无额外偏移)
+                    _ee_final_world = _R_rob_pgd @ _ee_final_arm + pos_w
+                    # target是gripper_base在世界坐标 (pre_t_gb在arm frame转世界)
+                    _target_world = _R_rob_pgd @ pre_t_gb + pos_w
                     _pos_err_final = float(np.linalg.norm(_ee_final_world - _target_world))
                     _joint_err_final = np.abs(cur_q_final - target_angles_arm)
                     _rot_err_final = np.linalg.norm(_R_final_ee - R_desired_EE, ord='fro')
@@ -1091,8 +1505,34 @@ def main():
                           flush=True)
                     print(f"[DIAG] PRE_GRASP actual EE rot:\n{np.round(_R_final_ee,4)}", flush=True)
                     print(f"[DIAG] PRE_GRASP desired EE rot:\n{np.round(R_desired_EE,4)}", flush=True)
+                    _pg_can_advance = (
+                        _pos_err_final <= PRE_GRASP_MAX_WORLD_ERR
+                        and _joint_err_final.max() <= PRE_GRASP_MAX_JOINT_ERR
+                        and _rot_err_final <= PRE_GRASP_MAX_ROT_ERR
+                    )
+                    if not _pg_can_advance:
+                        print(
+                            f"[WARN] PRE_GRASP reject -> ARM_INIT: pos_err={_pos_err_final*100:.1f}cm, "
+                            f"joint_err_max={_joint_err_final.max()*57.3:.1f}deg, rot_err={_rot_err_final:.4f}",
+                            flush=True,
+                        )
+                        # CRITICAL: go back to ARM_INIT (not SCAN) so the arm is
+                        # driven back to ARM_SIDE_ANGLES before the next SCAN.
+                        # Jumping directly to SCAN leaves the arm in whatever
+                        # extreme pose PRE_GRASP ended with (j4→±π/2, j5→±1.22,
+                        # j6→±1.88), which causes IK to find degenerate solutions
+                        # seeded from those extreme angles, creating an unstable
+                        # reject→SCAN→reject divergence loop.
+                        grasp_result = None
+                        depth_accum.clear()
+                        scan_rgb = None
+                        target_angles_arm = None
+                        state = PipelineState.ARM_INIT
+                        state_step = 0
+                        continue
                     # ---- END DIAG PRE_GRASP done ----
-                    state = PipelineState.REACH
+                    # MERGED: skip ORIENT and REACH; go directly to CLOSE
+                    state = PipelineState.CLOSE
                     state_step = 0
 
             # ---- ORIENT: [BYPASSED] PRE_GRASP now includes target_rot=R_desired_EE_in_arm ----
@@ -1188,6 +1628,9 @@ def main():
                     # DRIFT FIX: save fixed world-frame target for per-step re-projection
                     _re_t_world_fixed = t_world.copy()
                     t_arm = world_pos_to_arm_frame(t_world, pos_w, quat_w)
+                    # 不做球形 clamp：理由同 PRE_GRASP，让 ikpy 自己处理关节限位。
+                    _re_t_dist = float(np.linalg.norm(t_arm))
+                    print(f"[INFO] REACH t_arm dist={_re_t_dist*100:.1f}cm (no clamp)", flush=True)
                     # Keep orientation established by PRE_GRASP (which now includes target_rot).
                     # Use the stored R_desired_EE_in_arm (from SCAN time) as the orientation
                     # constraint so REACH IK warm-starts from the PRE_GRASP end config and only
@@ -1195,7 +1638,8 @@ def main():
                     R_arm = grasp_result["R_desired_EE_in_arm"]
                     # FIX: use solve_for_gripper_base() same reason as PRE_GRASP:
                     # t_arm is the desired gripper_base position; ikpy needs the joint7 target.
-                    target_angles_arm = ik_solve_gb_re(t_arm, target_rot_j7=R_arm, initial_angles=cur_q)
+                    target_angles_arm = ik_solve_gb_re(t_arm, target_rot_j7=None,
+                                                       initial_angles=grasp_result["target_angles_pre"])
                     print(f"[SM] REACH t_cam={np.round(t_cam,3)} retreat={REACH_RETREAT}m", flush=True)
                     print(f"[SM] REACH reach_t_cam={np.round(reach_t_cam,3)} "
                           f"t_world={np.round(t_world,3)} t_arm={np.round(t_arm,3)}", flush=True)
@@ -1222,28 +1666,27 @@ def main():
                     print(f"[DIAG] REACH EE world pos={np.round(_re_world,4)}", flush=True)
                     # Record initial joint angles for feed-forward interpolation
                     _re_q_init = cur_q.copy()
+                    # Initialise fixed IK target (held constant for all REACH steps)
+                    _re_target_cur = target_angles_arm.copy()
+                    # j2/j3/j4/j5/j6 integrators for REACH (same gravity-drift as PRE_GRASP)
+                    _re_j2_cmd = float(cur_q[1])
+                    _re_j3_cmd = float(cur_q[2])
+                    _re_j4_cmd = float(cur_q[3])
+                    _re_j5_cmd = float(cur_q[4])
+                    _re_j6_cmd = float(cur_q[5])
                     # ---- END DIAG REACH ----
                 cur_q = robot.data.joint_pos[
                     0, list(_get_arm_ids(robot)[0])
                 ].cpu().numpy()
                 # Rolling tracking for REACH (same logic as PRE_GRASP):
                 # Each step command = cur_q + α*(target - cur_q).
-                _REACH_ALPHA = 0.08
-                # DRIFT FIX: re-project the fixed world-frame target into the current
-                # robot arm frame every 5 steps, then re-solve IK.
-                if state_step % 5 == 1:  # fires on step=1,6,11,...
-                    _re_cur_pos_w  = robot.data.root_pos_w[0].cpu().numpy()
-                    _re_cur_quat_w = robot.data.root_quat_w[0].cpu().numpy()
-                    _re_t_cur = world_pos_to_arm_frame(_re_t_world_fixed, _re_cur_pos_w, _re_cur_quat_w)
-                    _re_target_cur = ik_solve_gb_re(
-                        _re_t_cur,
-                        target_rot_j7=R_arm,
-                        initial_angles=cur_q,
-                    )
-                # Rolling tracking command: move α fraction toward current IK target
-                q6 = cur_q + _REACH_ALPHA * (_re_target_cur - cur_q)
-                q6 = np.clip(q6, [lo for lo, hi in _IK_JOINT_LIMITS],
-                                  [hi for lo, hi in _IK_JOINT_LIMITS])
+                # alpha lowered from 0.25 → 0.10: PRE_GRASP j5-blast now ensures
+                # joints start REACH near target, so large alpha is no longer
+                # needed to escape limits.  Smaller alpha prevents j4/j6 overshoot
+                # that caused 28° errors in run10.
+                # DIRECT TARGET: send the IK target directly every step (same logic as PRE_GRASP).
+                q6 = np.clip(_re_target_cur.copy(), [lo for lo, hi in _IK_JOINT_LIMITS],
+                                                    [hi for lo, hi in _IK_JOINT_LIMITS])
                 _arm_step(robot, q6)
                 _gripper_width_step(robot, grasp_result["width"])
                 if state_step % 50 == 0:
@@ -1277,6 +1720,7 @@ def main():
                     print(f"[DIAG] REACH actual    q:    {np.round(cur_q_final,4)}", flush=True)
                     print(f"[DIAG] REACH joint err (deg):{np.round(_re_joint_err*57.3,2)}", flush=True)
                     print(f"[DIAG] REACH EE rot_err vs R_desired: {_re_rot_err:.4f}", flush=True)
+                    _dist_re = None
                     try:
                         _banana_re = raw_env.scene["banana"]
                         _bp_re = _banana_re.data.root_pos_w[0].cpu().numpy()
@@ -1286,6 +1730,41 @@ def main():
                               f" (EE should be within ~5cm for successful grasp)", flush=True)
                     except Exception:
                         pass
+                    _re_can_close = (
+                        _re_joint_err.max() <= REACH_MAX_JOINT_ERR
+                        and _re_rot_err <= REACH_MAX_ROT_ERR
+                    )
+                    _re_world_target_err = None
+                    try:
+                        _re_world_target_err = float(np.linalg.norm(_ee_red_world - _re_t_world_fixed))
+                        print(
+                            f"[DIAG] REACH EE-target dist={_re_world_target_err*100:.1f}cm"
+                            f" (must be < {REACH_MAX_WORLD_ERR*100:.1f}cm to close)",
+                            flush=True,
+                        )
+                        _re_can_close = _re_can_close and (_re_world_target_err <= REACH_MAX_WORLD_ERR)
+                    except Exception:
+                        pass
+                    if _dist_re is not None:
+                        _re_can_close = _re_can_close and (_dist_re <= REACH_MAX_OBJECT_DIST)
+                    if not _re_can_close:
+                        _obj_msg = "n/a" if _dist_re is None else f"{_dist_re*100:.1f}cm"
+                        _target_msg = "n/a" if _re_world_target_err is None else f"{_re_world_target_err*100:.1f}cm"
+                        print(
+                            f"[WARN] REACH reject -> ARM_INIT: joint_err_max={_re_joint_err.max()*57.3:.1f}deg, "
+                            f"rot_err={_re_rot_err:.4f}, ee_target_dist={_target_msg}, ee_obj_dist={_obj_msg}",
+                            flush=True,
+                        )
+                        # Same reason as PRE_GRASP reject: go back to ARM_INIT so
+                        # the arm is reset to ARM_SIDE_ANGLES before next SCAN,
+                        # avoiding degenerate IK seeds from the REACH end pose.
+                        grasp_result = None
+                        depth_accum.clear()
+                        scan_rgb = None
+                        target_angles_arm = None
+                        state = PipelineState.ARM_INIT
+                        state_step = 0
+                        continue
                     # ---- END DIAG REACH done ----
                     state = PipelineState.CLOSE
                     state_step = 0
@@ -1330,8 +1809,26 @@ def main():
                     print(f"[SM] LIFT step {state_step}/{BUDGET[PipelineState.LIFT]}: "
                           f"max_err={_err.max():.3f}", flush=True)
                 if state_step >= BUDGET[PipelineState.LIFT]:
-                    print("[SM] LIFT done -> DONE", flush=True)
-                    state = PipelineState.DONE
+                    # Check if banana was actually lifted (z > 0.75 m)
+                    try:
+                        _banana_pos = raw_env.scene["banana"].data.root_pos_w[0].cpu().numpy()
+                        _banana_z = float(_banana_pos[2])
+                    except Exception:
+                        _banana_z = 0.0
+                    if _banana_z > 0.75:
+                        print(f"[SM] LIFT done: banana z={_banana_z:.3f}m > 0.75 -> DONE (SUCCESS)",
+                              flush=True)
+                        state = PipelineState.DONE
+                    else:
+                        print(f"[SM] LIFT done: banana z={_banana_z:.3f}m <= 0.75 -> GRASP FAILED, retry PRE_GRASP",
+                              flush=True)
+                        grasp_result = None
+                        depth_accum.clear()
+                        scan_rgb = None
+                        target_angles_arm = None
+                        state = PipelineState.ARM_INIT
+                        state_step = 0
+                        continue
 
     except Exception as e:
         print(f"[ERROR] {e}", flush=True)

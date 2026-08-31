@@ -81,12 +81,37 @@ DEEPROBOTICS_M20_PIPER_SINGLE_CFG = ArticulationCfg(
             min_delay=0,
             max_delay=1,
         ),
+        # j1/j2/j3/j4: stiffness=1800 / damping=180 (general arm joints).
+        # j5/j6: stiffness=2600 / damping=260 — both show gravity-driven constant
+        # velocity drift in extended arm poses:
+        #   j5: wrist pitch drifts from scan pose (1.2 rad) under gravity
+        #   j6: wrist roll drifts ~-0.003 rad/step = -0.42 rad in 300 steps
+        # Higher stiffness ensures PD restoring torque dominates gravity torque.
+        # All 6 arm joints: stiffness=2600 / damping=260
+        # j4 shows identical gravity-drift pattern to j5/j6 when arm is extended
+        # (j2≈π, arm nearly horizontal): constant -0.003 rad/step drift over 300 steps.
+        # Raising stiffness from 1800→2600 ensures PD restoring torque dominates gravity
+        # torque for all joints, including j1-j4 in extreme IK poses (j2 near π).
         "arm": ImplicitActuatorCfg(
-            joint_names_expr=ARM_JOINT_NAMES,
-            effort_limit=100.0,
+            joint_names_expr=["joint1", "joint2", "joint3", "joint4"],
+            effort_limit=140.0,
             velocity_limit=5.0,
-            stiffness=800.0,
-            damping=80.0,
+            stiffness=8000.0,
+            damping=400.0,
+        ),
+        "arm_j5": ImplicitActuatorCfg(
+            joint_names_expr=["joint5"],
+            effort_limit=220.0,
+            velocity_limit=5.0,
+            stiffness=15000.0,   # raised from 8000: j5 wrist pitch residual was 15deg under gravity
+            damping=600.0,
+        ),
+        "arm_j6": ImplicitActuatorCfg(
+            joint_names_expr=["joint6"],
+            effort_limit=220.0,
+            velocity_limit=5.0,
+            stiffness=8000.0,
+            damping=400.0,
         ),
         "gripper": ImplicitActuatorCfg(
             joint_names_expr=GRIPPER_JOINT_NAMES,

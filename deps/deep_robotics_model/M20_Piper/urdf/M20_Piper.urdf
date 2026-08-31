@@ -67,7 +67,7 @@
     <parent link="base_link"/>
     <child link="fl_hipx"/>
     <axis xyz="-1 0 0"/>
-    <limit lower="-0.436" upper="0。611" effort="76.4" velocity="22.4"/>
+    <limit lower="-0.436" upper="0.611" effort="76.4" velocity="22.4"/>
   </joint>
   <link name="fl_hipy">
     <inertial>

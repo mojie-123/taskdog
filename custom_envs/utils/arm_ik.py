@@ -172,8 +172,24 @@ def solve_for_gripper_base(target_gb_pos, target_rot_j7=None, initial_angles=Non
         (approximately) at target_gb_pos with the desired orientation.
     """
     if target_rot_j7 is None:
-        # No rotation constraint: fall back to position-only solve.
-        return solve(target_gb_pos, target_rot=None, initial_angles=initial_angles)
+        # No rotation constraint: position-only solve.
+        # We must still convert the gripper_base target to a joint7 target by
+        # adding the joint7-origin-in-gripper_base offset (0.1358 m along the
+        # gripper_base Z axis).  When target_rot is None we estimate the
+        # gripper_base orientation from the FK at initial_angles (or identity
+        # when initial_angles is None), then iterate once to refine.
+        if initial_angles is not None:
+            _q0 = np.asarray(initial_angles, dtype=np.float64)
+            _R_gb_est = fk_gripper(_q0)[:3, :3]
+        else:
+            _R_gb_est = np.eye(3)
+        _target_j7 = target_gb_pos + _R_gb_est @ _J7_ORIGIN_IN_GB
+        _q_pos = solve(_target_j7, target_rot=None, initial_angles=initial_angles)
+        # Refine once with the updated gripper_base orientation from the solution
+        _R_gb_refined = fk_gripper(_q_pos)[:3, :3]
+        _target_j7_refined = target_gb_pos + _R_gb_refined @ _J7_ORIGIN_IN_GB
+        _q_pos2 = solve(_target_j7_refined, target_rot=None, initial_angles=_q_pos)
+        return _q_pos2
 
     R_gb_desired  = target_rot_j7 @ _RX_NEG90
     target_j7_pos = target_gb_pos + R_gb_desired @ _J7_ORIGIN_IN_GB
@@ -185,8 +201,20 @@ def solve_for_gripper_base(target_gb_pos, target_rot_j7=None, initial_angles=Non
     # distance from initial_angles.  This ensures we never commit to a large
     # discontinuous joint motion (e.g. j5 flip by 103°) when a smoother
     # equivalent grasp orientation exists.
+    #
+    # Dual-seed strategy: for each roll angle we try TWO seeds:
+    #   seed A = initial_angles (original, j5=+1.2)  -> may converge to j5<0 branch
+    #   seed B = q0 with j5=+0.3, j2=1.5            -> biases toward j5>0 branch
+    #     (j5>0 branch: j2≈1.5 far from π, j5≈+0.3~+0.8, natural arm posture)
+    # Both seeds are tried for every roll angle; the valid candidate with
+    # smallest joint-space distance from q0 is returned.
     approach_arm = R_gb_desired[:, 0]
     q0 = np.asarray(initial_angles, dtype=np.float64) if initial_angles is not None else np.zeros(6)
+    # Build j5-positive seed: keep all joints from q0 but fix j5=+0.3 and j2=1.5
+    # to anchor IK in the natural (non-singular) branch.
+    _q_seed_j5pos = q0.copy()
+    _q_seed_j5pos[4] = 0.3   # j5=+0.3: far from both limits, biases to j5>0 solution
+    _q_seed_j5pos[1] = 1.5   # j2=1.5: far from π singularity
     best_q, best_err = q, float(np.linalg.norm(fk_gripper(q)[:3, 3] - target_gb_pos))
     valid_candidates = []   # list of (joint_dist, q_cand)
     for deg in range(0, 360, 5):
@@ -196,19 +224,34 @@ def solve_for_gripper_base(target_gb_pos, target_rot_j7=None, initial_angles=Non
             continue
         R_j7_new  = R_gb_new @ _RX_NEG90.T
         t_j7_new  = target_gb_pos + R_gb_new @ _J7_ORIGIN_IN_GB
-        q_cand    = solve(t_j7_new, target_rot=R_j7_new, initial_angles=initial_angles)
-        T_gb_c    = fk_gripper(q_cand)
-        err_c     = float(np.linalg.norm(T_gb_c[:3, 3] - target_gb_pos))
-        rot_err_c = float(np.linalg.norm(fk(q_cand)[:3, :3] - R_j7_new, ord="fro"))
-        at_lim_c  = any(
-            abs(float(qi) - lo) < 0.01 or abs(float(qi) - hi) < 0.01
-            for qi, (lo, hi) in zip(q_cand, _IK_JOINT_LIMITS)
-        )
-        if err_c < best_err:
-            best_err, best_q = err_c, q_cand
-        if err_c <= 0.03 and not at_lim_c and rot_err_c < 0.1:
-            joint_dist = float(np.linalg.norm(q_cand - q0))
-            valid_candidates.append((joint_dist, q_cand))
+        # Try both seeds for this roll angle
+        for _seed in (initial_angles, _q_seed_j5pos):
+            q_cand    = solve(t_j7_new, target_rot=R_j7_new, initial_angles=_seed)
+            T_gb_c    = fk_gripper(q_cand)
+            err_c     = float(np.linalg.norm(T_gb_c[:3, 3] - target_gb_pos))
+            rot_err_c = float(np.linalg.norm(fk(q_cand)[:3, :3] - R_j7_new, ord="fro"))
+            at_lim_c  = any(
+                abs(float(qi) - lo) < 0.01 or abs(float(qi) - hi) < 0.01
+                for qi, (lo, hi) in zip(q_cand, _IK_JOINT_LIMITS)
+            )
+            if err_c < best_err:
+                best_err, best_q = err_c, q_cand
+            if err_c <= 0.03 and not at_lim_c and rot_err_c < 0.1:
+                joint_dist = float(np.linalg.norm(q_cand - q0))
+                # Additionally require each joint to stay within per-joint limits of q0.
+                # This prevents selecting a roll that lands on the opposite side of
+                # a dual-solution joint (e.g. j6: target=+0.82 but PD converges to
+                # -0.77 because both are kinematically equivalent but controller
+                # picks the closer one from its current position, not the IK target).
+                # Per-joint jump limits:
+                #   j5 (index 4) is allowed up to π (180°): seed j5=+1.2 → solution j5≈+0.3
+                #   is a valid continuous motion via the j5>0 branch (0.9 rad < π).
+                #   All other joints keep the π/2 (90°) limit to prevent dual-solution flips.
+                _jump_lims = np.full(6, math.pi / 2)
+                _jump_lims[4] = math.pi  # j5: allow up to 180° jump
+                _per_joint_jumps = np.abs(q_cand - q0)
+                if np.all(_per_joint_jumps < _jump_lims):
+                    valid_candidates.append((joint_dist, q_cand))
 
     if valid_candidates:
         # Return the valid candidate with smallest joint-space distance
@@ -216,6 +259,32 @@ def solve_for_gripper_base(target_gb_pos, target_rot_j7=None, initial_angles=Non
         valid_candidates.sort(key=lambda x: x[0])
         return valid_candidates[0][1]
 
+    # Only return best_q if it is not at a joint limit AND pos error is acceptable
+    # AND the per-joint jump is within limits.
+    # If best_q hit j2=π (singular config), returning it causes 500 steps of failed
+    # tracking; return None instead so the caller can try the next GraspNet candidate.
+    _at_lim_best = any(
+        abs(float(_qi) - _lo) < 0.01 or abs(float(_qi) - _hi) < 0.01
+        for _qi, (_lo, _hi) in zip(best_q, _IK_JOINT_LIMITS)
+    )
+    _jump_lims_fb = np.full(6, math.pi / 2)
+    _jump_lims_fb[4] = math.pi
+    _per_joint_jumps_best = np.abs(best_q - q0)
+    _max_jump_best = float(np.max(_per_joint_jumps_best))
+    _jump_exceeded = not np.all(_per_joint_jumps_best < _jump_lims_fb)
+    if (_at_lim_best and best_err > 0.05) or _jump_exceeded:
+        # Fallback solution is either at a limit with large pos error, or requires
+        # a joint to exceed its per-joint limit.  Signal caller to try next candidate.
+        print(f"[IK-WARN] fallback best_q rejected: at_lim={_at_lim_best} "
+              f"pos_err={best_err:.3f}m max_jump={_max_jump_best:.3f}rad "
+              f"per_joint={np.round(_per_joint_jumps_best,3)} q={np.round(best_q,3)}", flush=True)
+        return None
+    if not valid_candidates:
+        # best_q passed all checks but was reached via fallback (valid_candidates empty).
+        # Log a warning so the caller is aware this is not a roll-search validated solution.
+        print(f"[IK-WARN] valid_candidates empty, using fallback best_q: "
+              f"pos_err={best_err:.3f}m max_jump={_max_jump_best:.3f}rad "
+              f"q={np.round(best_q,3)}", flush=True)
     return best_q   # return best found even if not perfect
 
 
