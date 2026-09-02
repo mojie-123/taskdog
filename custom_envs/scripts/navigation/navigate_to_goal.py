@@ -27,7 +27,8 @@ Usage:
 
 机器狗走到合适位置：        
 python scripts/navigation/navigate_to_goal.py --task Flat-Deeprobotics-M20Pro-Piper-Single-v0 --policy_task Flat-Deeprobotics-M20-v0 --load_run 2026-07-18_10-57-32 --checkpoint model_4999.pt --map maps/my_map.npz --goal 4.5 4.9 --target_speed 1.0 --grasp_checkpoint /home/mojie/graspnet-baseline/logs/checkpoint-rs.tar --enable_cameras True
-
+使用anygrasp的api：--grasp_checkpoint /home/mojie/anygrasp_sdk/grasp_detection/log/checkpoint_detection.tar
+写入日志：2>&1 | tee /tmp/nav_run.log
 """
 
 import argparse
@@ -484,10 +485,9 @@ def main():
                     _cy, _sy = math.cos(yaw), math.sin(yaw)
                     if state == PipelineState.PAN_VX:
                         # Only vx: align world-Y. body_vx ≈ dy_world when yaw≈+π/2
-                        _bvx  = _dx_w * _sy + _dy_w * _cy
                         _err  = abs(_dy_w)
                         _v_cap = float(np.clip(0.4 * _err, 0.0, 0.3))
-                        p_obs[0, 6] = float(np.clip(math.copysign(_v_cap, _bvx), -0.3, 0.3))
+                        p_obs[0, 6] = float(np.clip(math.copysign(_v_cap, _dy_w), -0.3, 0.3))
                         p_obs[0, 7] = 0.0
                     else:  # PAN_VY
                         # Only vy: align world-X. body_vy ≈ -dx_world when yaw≈+π/2
@@ -515,6 +515,7 @@ def main():
                     _FREEZE_STATES_ACT = {
                         PipelineState.ARM_INIT,
                         PipelineState.SCAN,
+                        PipelineState.PRE_ADJUST,  # prevent leg torques from drifting body during j5 transition
                         PipelineState.PRE_GRASP,
                         PipelineState.REACH,
                         PipelineState.CLOSE,
@@ -536,6 +537,7 @@ def main():
                 _FREEZE_STATES = {
                     PipelineState.ARM_INIT,   # freeze during arm retraction too
                     PipelineState.SCAN,       # freeze during camera scan
+                    PipelineState.PRE_ADJUST, # freeze during j5 transition to prevent ~15cm body drift
                     PipelineState.PRE_GRASP,
                     PipelineState.REACH,
                     PipelineState.CLOSE,
@@ -980,6 +982,29 @@ def main():
                           flush=True)
                     return keep
 
+                # ---- 颜色筛选桌面点云并保存（须在 RANSAC 之前，供穿桌检测使用）----
+                # 桌面为中性灰 RGB≈(80,80,80)：HSV 的 S<40，V 在 40~160
+                import cv2 as _cv2_tb
+                _cols_u8_tb = (cols * 255).astype(np.uint8).reshape(1, -1, 3)
+                _hsv_tb = _cv2_tb.cvtColor(_cols_u8_tb, _cv2_tb.COLOR_RGB2HSV)[0]  # (N,3)
+                _table_mask_tb = (_hsv_tb[:, 1] < 40) & (_hsv_tb[:, 2] > 40) & (_hsv_tb[:, 2] < 160)
+                _pts_table_cam = pts[_table_mask_tb]  # 相机坐标系桌面点云
+                print(f'[SM] 桌面颜色点云: {len(_pts_table_cam)} pts', flush=True)
+                if len(_pts_table_cam) > 50:
+                    from arm_ik import fk_gripper as _fk_gb_tc, quat_to_rot as _q2r_tc, _CAM_OFFSET_POS as _cop_tc, _CAM_OFFSET_ROT as _cor_tc
+                    _R_rob_tc    = _q2r_tc(_quat_w_at_scan.astype(np.float64))
+                    _arm_base_tc = _pos_w_at_scan + _R_rob_tc @ np.array([0., 0., 0.0888])
+                    _T_gb_tc     = _fk_gb_tc(_q_scan_at_scan.astype(np.float64))
+                    _R_c2w_tc    = _R_rob_tc @ _T_gb_tc[:3, :3] @ _cor_tc
+                    _t_cam_tc    = _R_rob_tc @ (_T_gb_tc[:3, :3] @ _cop_tc + _T_gb_tc[:3, 3]) + _arm_base_tc
+                    _pts_table_world = (_pts_table_cam.astype(np.float64) @ _R_c2w_tc.T) + _t_cam_tc
+                    np.savez('/tmp/table_cloud.npz',
+                             points=_pts_table_world.astype(np.float32))
+                    print(f'[SM] 桌面点云已保存 /tmp/table_cloud.npz（世界坐标系，{len(_pts_table_world)} pts）', flush=True)
+                else:
+                    print(f'[SM] WARN: 桌面颜色点云过少({len(_pts_table_cam)} pts)，跳过保存', flush=True)
+                # ---- END 桌面点云保存 ----
+
                 _keep_mask = _ransac_remove_plane(pts)  # True=保留(非桌面)
                 pts  = pts[_keep_mask]
                 cols = cols[_keep_mask]
@@ -1118,35 +1143,31 @@ def main():
                                     _ik_ok_pre = (_j2_val < 2.8)
                                 except Exception:
                                     _ik_ok_pre = False
-                                # Compute |approach_world_z|: how "downward" this grasp approach is.
-                                # approach axis in camera frame = R_cam[:,0] (GraspNet convention).
-                                # Larger |approach_world_z| => more vertical => j6 axis more vertical
-                                # => less Coriolis disturbance on j6 during PRE_GRASP motion.
+                                # approach 轴在世界坐标系的方向：R_cam[:,0] 是 AnyGrasp approach 轴。
+                                # approach_world[2] 越负 = approach 越朝下 = 越接近从上方垂直抓取。
+                                # 这是排序的核心指标：负值越大越优先。
                                 _R_cam_ci = gr["rotations"][_ci_pre]  # (3,3) rotation matrix
                                 _approach_world_ci = _R_cam2world @ _R_cam_ci[:, 0]
-                                _approach_z_abs_ci = float(abs(_approach_world_ci[2]))
-                                # fingertip 方向 = gripper_base Z 轴，由相机坐标系旋转得到
-                                # R_cam_ci[:,2] 是 GraspNet 旋转矩阵第三列（approach x closing）
-                                # 经过相同的 cam->world 变换得到 fingertip 在世界的方向
-                                _fingertip_world_ci = _R_cam2world @ _R_cam_ci[:, 2]
-                                _fingertip_z_ci = float(_fingertip_world_ci[2])  # 负值=指尖朝下
-                                _ranked_pre.append((_ik_ok_pre, _approach_z_abs_ci, float(gr["scores"][_ci_pre]), _ci_pre, _fingertip_z_ci))
-                            # Sort: IK-feasible first, then by fingertip_world_z ascending (most
-                            # negative = fingertip pointing most downward = top-down grasp, j5>0),
+                                _approach_z_abs_ci = float(abs(_approach_world_ci[2]))  # 保留兼容
+                                _approach_z_ci = float(_approach_world_ci[2])           # 负值=approach朝下
+                                _ranked_pre.append((_ik_ok_pre, _approach_z_abs_ci, float(gr["scores"][_ci_pre]), _ci_pre, _approach_z_ci))
+                            # Sort: IK-feasible first, then by approach_world_z ascending (most
+                            # negative = approach pointing most downward = top-down grasp),
                             # then by score descending.
-                            # Previously sorted by |approach_world_z| descending, which wrongly
-                            # preferred horizontal side-grasps (approach down => fingertip horizontal).
+                            # FIX: previously used R_cam[:,2] (binormal axis) as "fingertip" direction,
+                            # which has no physical meaning for top-down grasp selection.
+                            # Now correctly use R_cam[:,0] (approach axis) world-z component.
                             _ranked_pre.sort(key=lambda x: (-int(x[0]), x[4], -x[2]))
                             _ranked_idxs = [x[3] for x in _ranked_pre]
-                            print(f"[SM] 候选排序({len(_ranked_idxs)}个,IK预筛,按fingertip朝下优先): "
-                                  + " ".join(f"[{r[3]}]{'✓' if r[0] else '✗'}s={r[2]:.2f}ft={r[4]:.2f}"
+                            print(f"[SM] 候选排序({len(_ranked_idxs)}个,IK预筛,按approach朝下优先): "
+                                  + " ".join(f"[{r[3]}]{'✓' if r[0] else '✗'}s={r[2]:.2f}az={r[4]:.2f}"
                                              for r in _ranked_pre[:6]),
                                   flush=True)
-                            # DIAG: 打印所有候选的 fingertip 世界 Z 分量，判断是否存在「指尖朝下」的候选
-                            print(f"[DIAG-FINGERTIP] 所有{len(_ranked_pre)}个香蕉候选的fingertip_world_z (负值=朝下=从上往下抓):", flush=True)
+                            # DIAG: 打印所有候选的 approach 世界 Z 分量
+                            print(f"[DIAG-APPROACH] 所有{len(_ranked_pre)}个香蕉候选的approach_world_z (负值=朝下=从上往下抓):", flush=True)
                             for _r in _ranked_pre:
-                                _ft_label = "朝下✓" if _r[4] < -0.5 else ("斜下" if _r[4] < -0.2 else "水平✗")
-                                print(f"  [{_r[3]}] score={_r[2]:.3f} approach_z={_r[1]:.2f} fingertip_z={_r[4]:.3f} {_ft_label} ik={'✓' if _r[0] else '✗'}", flush=True)
+                                _az_label = "朝下✓" if _r[4] < -0.5 else ("斜下" if _r[4] < -0.2 else "水平✗")
+                                print(f"  [{_r[3]}] score={_r[2]:.3f} approach_z={_r[4]:.3f} {_az_label} ik={'✓' if _r[0] else '✗'}", flush=True)
                             # ---- END IK pre-screening ----
 
                             _best_grasp_idx = _ranked_idxs[0]
@@ -1298,30 +1319,33 @@ def main():
                     _pg_t_world_fixed = t_world.copy()
                     pre_t = world_pos_to_arm_frame(t_world, pos_w, quat_w)
                     # ---- GRIPPER OFFSET CORRECTION ----
-                    # GraspNet t_cam is the GRASP CENTER (midpoint between finger tips).
-                    # cam_to_world / world_pos_to_arm_frame converts it correctly to arm frame.
-                    # However ik_solve_gb() expects target_gb_pos = gripper_BASE origin,
-                    # which is 13.58cm BEHIND the finger-tip midpoint along the approach axis
-                    # (the _J7_ORIGIN_IN_GB offset baked into solve_for_gripper_base).
+                    # AnyGrasp translation = gripper_base WRIST ORIGIN (not finger-tip midpoint).
+                    # cam_to_world / world_pos_to_arm_frame converts it to arm frame as pre_t.
+                    # ik_solve_gb() also expects target_gb_pos = gripper_base origin,
+                    # so pre_t can be passed directly — NO backward offset needed.
                     #
-                    # Previously pre_t (grasp center) was passed directly as gripper_base target,
-                    # causing the finger tips to end up 13.58cm PAST the grasp center —
-                    # i.e. 13.58cm INSIDE the banana / table, which explains:
-                    #   • machine arm crashing into banana with full PD force
-                    #   • j5 hitting joint limit (-1.22 rad) and locking forearm horizontal
+                    # Confirmed by AnyGrasp convention:
+                    #   translation  = wrist origin in camera frame
+                    #   tip position = translation + depth * R_cam[:,0]  (approach direction)
+                    #   gripper_height only affects collision filtering, does NOT shift translation
                     #
-                    # Fix: shift pre_t backward along the approach axis by
-                    #   _J7_OFFSET (13.58cm) + _GRASP_CLEARANCE (5cm safety margin)
-                    # so that the finger-tip midpoint arrives exactly at the grasp center.
-                    #
-                    # approach axis in arm frame = R_gb_desired[:, 0]
-                    # R_gb_desired = R_j7_desired @ _RX_NEG90  (arm_ik.py convention)
-                    from arm_ik import _RX_NEG90 as _RX_NEG90_pg
+                    # _J7_OFFSET = 0.0: gripper_base target == AnyGrasp wrist origin
+                    # approach axis in arm frame: 直接从 AnyGrasp R_cam[:,0] 变换到 arm frame，
+                    # 绕过 R_desired_EE 避免因 _RY_NEG90 修复导致方向错误。
+                    # 变换链：approach_arm = R_gb_scan @ _CAM_OFFSET_ROT @ R_cam[:,0]
+                    #   R_gb_scan        : SCAN时 gripper_base 在 arm_base_link 的朝向
+                    #   _CAM_OFFSET_ROT  : 相机系 -> gripper_base 系（物理安装旋转）
+                    #   R_cam[:,0]       : AnyGrasp approach 方向（相机系，朝向香蕉）
+                    from arm_ik import _CAM_OFFSET_ROT as _COR_ap, fk_gripper as _fkg_ap
+                    _R_gb_scan_ap    = _fkg_ap(grasp_result["q_scan"])[:3, :3]
+                    _approach_arm_pg = _R_gb_scan_ap @ _COR_ap @ grasp_result["R_cam"][:, 0]
                     R_desired_EE = grasp_result["R_desired_EE_in_arm"]  # R_j7_desired
-                    _R_gb_desired_pg = R_desired_EE @ _RX_NEG90_pg      # gripper_base rotation in arm frame
-                    _approach_arm_pg = _R_gb_desired_pg[:, 0]            # approach unit vector in arm frame
-                    _J7_OFFSET    = 0.2   # gripper_base -> finger-tip midpoint (m)
-                    _GRASP_CLEARANCE = 0.0  # extra safety margin so gripper opens around banana (m)
+                    # FIX: AnyGrasp t = finger root midpoint (joint7/8 origin), 0.1358m along
+                    # gripper_base +Z from gripper_base origin (URDF joint7 xyz=(0,0,0.1358)).
+                    # ik_solve_gb() targets gripper_base origin, so retreat 0.1358m back along
+                    # approach axis so that after IK converges, finger root midpoint lands on t.
+                    _J7_OFFSET    = 0.14  # gripper_base -> finger root midpoint (URDF joint7 z)
+                    _GRASP_CLEARANCE = 0.0  # extra safety margin (m)
                     pre_t_gb = pre_t - (_J7_OFFSET + _GRASP_CLEARANCE) * _approach_arm_pg
                     _pre_t_dist = float(np.linalg.norm(pre_t_gb))
                     print(f"[INFO] PRE_GRASP t_arm dist={_pre_t_dist*100:.1f}cm "
@@ -1358,6 +1382,36 @@ def main():
                               f"actual_gb_arm={np.round(_ee_arm_ik,4)} "
                               f"pos_err={_ik_pos_err*100:.1f}cm at_limit={_ik_at_lim} {_ik_status}",
                               flush=True)
+                        # ---- 穿桌检测：指尖 XY 邻域内桌面点云最大 Z ----
+                        if not _ik_fail and os.path.exists('/tmp/table_cloud.npz'):
+                            try:
+                                _tc_data = np.load('/tmp/table_cloud.npz')
+                                _pts_tbl = _tc_data['points'].astype(np.float64)  # 世界坐标系
+                                from arm_ik import fk_gripper as _fk_gb_tb, quat_to_rot as _q2r_tb3
+                                _R_rob_tb3    = _q2r_tb3(grasp_result['quat_w_scan'].astype(np.float64))
+                                _arm_base_tb3 = grasp_result['pos_w_scan'] + _R_rob_tb3 @ np.array([0., 0., 0.0888])
+                                # 用 gripper_base 原点做穿桌检测（fk_gripper 返回 gripper_base，比 fk/joint7 更靠近手指端）
+                                _T_gb_tb  = _fk_gb_tb(target_angles_arm.astype(np.float64))
+                                _p_tip_w  = _R_rob_tb3 @ _T_gb_tb[:3, 3] + _arm_base_tb3
+                                _RADIUS_TB = 0.03   # XY 邻域半径 3cm
+                                _SAFETY_TB = 0.01   # 安全余量 1cm
+                                _xy_dist_tb = np.linalg.norm(_pts_tbl[:, :2] - _p_tip_w[:2], axis=1)
+                                _nearby_tb  = _pts_tbl[_xy_dist_tb < _RADIUS_TB]
+                                if len(_nearby_tb) >= 5:
+                                    _local_tbl_z = float(_nearby_tb[:, 2].max())
+                                    _tip_penetrate = _p_tip_w[2] < _local_tbl_z + _SAFETY_TB
+                                    print(f'[DIAG] PRE_GRASP 穿桌检测: '
+                                          f'tip_z={_p_tip_w[2]:.4f}m '
+                                          f'local_table_z={_local_tbl_z:.4f}m '
+                                          f'nearby={len(_nearby_tb)}pts '
+                                          f'{"✗ 穿桌->过滤" if _tip_penetrate else "✓ OK"}',
+                                          flush=True)
+                                    if _tip_penetrate:
+                                        _ik_fail = True
+                                else:
+                                    print(f'[DIAG] PRE_GRASP 穿桌检测: 邻域内桌面点过少({len(_nearby_tb)} pts)，跳过', flush=True)
+                            except Exception as _e_tb:
+                                print(f'[WARN] 穿桌检测异常: {_e_tb}', flush=True)
                     else:
                         print("[DIAG] PRE_GRASP IK returned None (j2=π singular) -> try next candidate",
                               flush=True)
@@ -1390,11 +1444,14 @@ def main():
                     print(f"[SM] PRE_GRASP t_arm={np.round(pre_t,3)} IK={np.round(target_angles_arm,3)}", flush=True)
                     print(f"[SM] PRE_GRASP R_desired_EE_in_arm:\n{np.round(R_desired_EE,3)}", flush=True)
                     print(f"[SM] PRE_GRASP opening gripper to width={width:.3f}m (half={width/2:.3f})", flush=True)
-                    _t_obj_world_pg = _c2w_pg(t_cam, grasp_result["q_scan"], pos_w, quat_w)
+                    # BUG FIX: use SCAN-time pos_w_scan/quat_w_scan (not current pos_w/quat_w)
+                    # to correctly reconstruct where the AnyGrasp point lies in world frame.
+                    _t_obj_world_pg = _c2w_pg(t_cam, grasp_result["q_scan"],
+                                              grasp_result["pos_w_scan"], grasp_result["quat_w_scan"])
                     print(f"[DIAG] PRE_GRASP object world pos={np.round(_t_obj_world_pg,4)}"
                           f" (z={_t_obj_world_pg[2]:.3f}m)", flush=True)
                     print(f"[DIAG] PRE_GRASP target world pos={np.round(t_world,4)}"
-                          f" (z={t_world[2]:.3f}m, should be ~0.05-0.15m ABOVE object)", flush=True)
+                          f" (z={t_world[2]:.3f}m, = AnyGrasp finger root midpoint / grasp center)", flush=True)
                     # approach axis in world
                     from arm_ik import _CAM_OFFSET_ROT as _COR_pg, quat_to_rot as _q2r_pg
                     _R_rob_pg = _q2r_pg(quat_w)
@@ -1406,6 +1463,12 @@ def main():
                           f" (expect to point FROM cam TOWARD object)", flush=True)
                     print(f"[DIAG] PRE_GRASP retreat world dir={np.round(-_app_w_pg,3)}"
                           f" (pre-grasp is in this direction from object)", flush=True)
+                    # Save gripper_base IK target in world frame for pos_err comparison.
+                    # pre_t_gb is in arm_base_link frame; convert same way as _ee_final_world.
+                    _arm_base_w_pg = pos_w + _R_rob_pg @ np.array([0., 0., 0.0888])
+                    _pg_t_gb_world_fixed = _R_rob_pg @ pre_t_gb + _arm_base_w_pg
+                    print(f"[DIAG] PRE_GRASP gripper_base IK target world={np.round(_pg_t_gb_world_fixed,4)}"
+                          f" (= t_world - 13.58cm along approach)", flush=True)
                     # Record initial joint angles for feed-forward interpolation
                     _pg_q_init = cur_q.copy()
                     # Initialise fixed IK target (held constant for all PRE_GRASP steps)
@@ -1479,32 +1542,56 @@ def main():
                     # ---- DIAG: actual EE position after PRE_GRASP ----
                     from arm_ik import fk as _fk_pgd, fk_gripper as _fkg_pgd, quat_to_rot as _q2r_pgd, cam_to_world as _c2w_pgd
                     # FIX: use fk_gripper for position (target pre_t is gripper_base origin)
-                    # keep fk() for rotation (R_desired_EE is joint7-frame, so compare in same frame)
                     _T_final_gb = _fkg_pgd(cur_q_final)
                     _T_final    = _fk_pgd(cur_q_final)
                     _ee_final_arm = _T_final_gb[:3, 3]   # gripper_base position
-                    _R_final_ee = _T_final[:3, :3]        # joint7 rotation (for rot_err vs R_desired_EE)
+                    # 旋转诊断在 gripper_base frame 下进行（而非 joint7 frame），便于直观理解。
+                    # R_desired_EE 是 R_j7_desired（joint7 frame），右乘 _RX_NEG90 转到 gripper_base frame。
+                    # 在 gb frame 下：[:,2] = gb+Z = approach 方向，姿态正确时 rot_err 接近 0。
+                    from arm_ik import _RX_NEG90 as _RX_NEG90_pgd
+                    _R_final_j7  = _T_final[:3, :3]                      # joint7 frame（ikpy FK 输出）
+                    _R_final_gb  = _R_final_j7  @ _RX_NEG90_pgd          # gripper_base frame（实际）
+                    _R_desired_gb = R_desired_EE @ _RX_NEG90_pgd          # gripper_base frame（期望）
                     _R_rob_pgd = _q2r_pgd(quat_w)
-                    # EE世界坐标 = R_robot @ ee_arm_local + robot_base_world (无额外偏移)
-                    _ee_final_world = _R_rob_pgd @ _ee_final_arm + pos_w
-                    # target是gripper_base在世界坐标 (pre_t_gb在arm frame转世界)
-                    _target_world = _R_rob_pgd @ pre_t_gb + pos_w
+                    # arm_base_link 在世界坐标系的偏移（相对 root_link 有 +0.0888m 的 z 偏移）
+                    _arm_base_offset_pgd = _R_rob_pgd @ np.array([0., 0., 0.0888])
+                    # EE世界坐标 = R_robot @ ee_arm_local + arm_base_world
+                    # NOTE: ee_arm_local 是 arm frame 坐标，arm frame 原点 = root_link + [0,0,0.0888]
+                    _ee_final_world = _R_rob_pgd @ _ee_final_arm + pos_w + _arm_base_offset_pgd
+                    # FIX: compare gripper_base actual vs gripper_base IK target (both in world frame).
+                    # _pg_t_world_fixed = AnyGrasp t (finger root midpoint); _ee_final_world = gripper_base.
+                    # They differ by 13.58cm structurally -> use _pg_t_gb_world_fixed (gripper_base target)
+                    # so that pos_err → 0 when controller converges perfectly.
+                    _target_world = _pg_t_gb_world_fixed  # gripper_base IK target in world frame
                     _pos_err_final = float(np.linalg.norm(_ee_final_world - _target_world))
                     _joint_err_final = np.abs(cur_q_final - target_angles_arm)
-                    _rot_err_final = np.linalg.norm(_R_final_ee - R_desired_EE, ord='fro')
-                    print(f"[DIAG] PRE_GRASP actual EE arm ={np.round(_ee_final_arm,4)}", flush=True)
-                    print(f"[DIAG] PRE_GRASP actual EE world={np.round(_ee_final_world,4)}", flush=True)
-                    print(f"[DIAG] PRE_GRASP target    world={np.round(_target_world,4)}", flush=True)
+                    # rot_err 在 gripper_base frame 下计算，正确时接近 0（≠ joint7 frame 下的 2.8）
+                    _rot_err_final = np.linalg.norm(_R_final_gb - _R_desired_gb, ord='fro')
+                    # approach 方向（gb+Z）在 arm frame 和世界坐标
+                    _app_actual_arm   = _R_final_gb[:, 2]
+                    _app_desired_arm  = _R_desired_gb[:, 2]
+                    _app_actual_world  = _R_rob_pgd @ _app_actual_arm
+                    _app_desired_world = _R_rob_pgd @ _app_desired_arm
+                    print(f"[DIAG] PRE_GRASP actual EE arm    ={np.round(_ee_final_arm,4)}", flush=True)
+                    print(f"[DIAG] PRE_GRASP actual EE world  ={np.round(_ee_final_world,4)}", flush=True)
+                    print(f"[DIAG] PRE_GRASP target GB world  ={np.round(_target_world,4)}", flush=True)
+                    print(f"[DIAG] PRE_GRASP finger root world={np.round(_pg_t_world_fixed,4)}", flush=True)
                     print(f"[DIAG] PRE_GRASP pos err={_pos_err_final*100:.1f}cm"
                           f" (joint err max={_joint_err_final.max()*57.3:.1f}deg)", flush=True)
                     print(f"[DIAG] PRE_GRASP joint err per joint (deg): {np.round(_joint_err_final*57.3,2)}",
                           flush=True)
                     print(f"[DIAG] PRE_GRASP IK target q: {np.round(target_angles_arm,4)}", flush=True)
                     print(f"[DIAG] PRE_GRASP actual    q: {np.round(cur_q_final,4)}", flush=True)
-                    print(f"[DIAG] PRE_GRASP EE rot_err (Frobenius vs R_desired): {_rot_err_final:.4f}",
+                    print(f"[DIAG] PRE_GRASP gb rot_err (Frobenius, gripper_base frame): {_rot_err_final:.4f}"
+                          f"  (正确时接近0；≠joint7 frame下的2.8)", flush=True)
+                    print(f"[DIAG] PRE_GRASP actual  gb rot (gripper_base frame):\n{np.round(_R_final_gb,4)}",
                           flush=True)
-                    print(f"[DIAG] PRE_GRASP actual EE rot:\n{np.round(_R_final_ee,4)}", flush=True)
-                    print(f"[DIAG] PRE_GRASP desired EE rot:\n{np.round(R_desired_EE,4)}", flush=True)
+                    print(f"[DIAG] PRE_GRASP desired gb rot (gripper_base frame):\n{np.round(_R_desired_gb,4)}",
+                          flush=True)
+                    print(f"[DIAG] PRE_GRASP actual  approach(arm)={np.round(_app_actual_arm,3)}"
+                          f"  world={np.round(_app_actual_world,3)}", flush=True)
+                    print(f"[DIAG] PRE_GRASP desired approach(arm)={np.round(_app_desired_arm,3)}"
+                          f"  world={np.round(_app_desired_world,3)}", flush=True)
                     _pg_can_advance = (
                         _pos_err_final <= PRE_GRASP_MAX_WORLD_ERR
                         and _joint_err_final.max() <= PRE_GRASP_MAX_JOINT_ERR

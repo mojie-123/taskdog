@@ -208,7 +208,7 @@ def solve_for_gripper_base(target_gb_pos, target_rot_j7=None, initial_angles=Non
     #     (j5>0 branch: j2≈1.5 far from π, j5≈+0.3~+0.8, natural arm posture)
     # Both seeds are tried for every roll angle; the valid candidate with
     # smallest joint-space distance from q0 is returned.
-    approach_arm = R_gb_desired[:, 0]
+    approach_arm = R_gb_desired[:, 2]  # R_gb_desired[:,2] = gb+Z（夹爪伸出方向，右乘_RY_POS90后的 approach 轴）
     q0 = np.asarray(initial_angles, dtype=np.float64) if initial_angles is not None else np.zeros(6)
     # Build j5-positive seed: keep all joints from q0 but fix j5=+0.3 and j2=1.5
     # to anchor IK in the natural (non-singular) branch.
@@ -237,6 +237,26 @@ def solve_for_gripper_base(target_gb_pos, target_rot_j7=None, initial_angles=Non
             if err_c < best_err:
                 best_err, best_q = err_c, q_cand
             if err_c <= 0.03 and not at_lim_c and rot_err_c < 0.1:
+                # Approach-direction guard: reject 180-deg flipped solutions.
+                # rot_err_c is measured vs R_j7_new (the roll-rotated target),
+                # so a 180-deg flip also passes rot_err_c < 0.1 against its own
+                # rolled target. Verify the candidate gb+Z agrees with the
+                # ORIGINAL desired approach_arm (dot > 0 = same half-space).
+                _R_gb_cand = fk_gripper(q_cand)[:3, :3]
+                _approach_c = _R_gb_cand[:, 2]
+                if float(np.dot(_approach_c, approach_arm)) < 0.0:
+                    continue  # 180-deg approach flip -> discard
+                # Closing-axis guard: reject ~180-deg roll about the approach axis.
+                # rot_err_c is measured vs the roll-rotated target R_j7_new, so any
+                # roll angle that IK converges to gets rot_err_c ≈ 0 regardless of
+                # how far it is from the ORIGINAL desired closing direction.
+                # A ~180-deg roll passes the approach guard (approach dot > 0) but
+                # flips the closing axis (gb+Y), causing the gripper to close in the
+                # wrong direction.  Guard: dot(actual_closing, desired_closing) > 0.
+                _closing_c   = _R_gb_cand[:, 1]      # actual  gb+Y (closing axis)
+                _closing_des = R_gb_desired[:, 1]     # desired gb+Y (from ORIGINAL target)
+                if float(np.dot(_closing_c, _closing_des)) < 0.0:
+                    continue  # ~180-deg roll about approach axis -> discard
                 joint_dist = float(np.linalg.norm(q_cand - q0))
                 # Additionally require each joint to stay within per-joint limits of q0.
                 # This prevents selecting a roll that lands on the opposite side of
@@ -322,6 +342,30 @@ _RX_POS90 = np.array([[1,  0,  0],
                        [0,  0, -1],
                        [0,  1,  0]], dtype=np.float64)   # Rx(+pi/2)
 _J7_ORIGIN_IN_GB = np.array([0.0, 0.0, 0.1358])         # joint7 origin in gripper_base
+
+# AnyGrasp 约定: 旋转矩阵第 0 列(X轴)是 approach 方向。
+# Piper gripper_base 约定: Z 轴是 approach 方向（夹爪伸出方向）。
+# 相机安装: 相机+Z 对齐 gripper_base +Z（夹爪伸出方向），_CAM_OFFSET_ROT = Rz(-90°)。
+#
+# 修正思路：
+#   AnyGrasp 用相机+X 表示 approach，但夹爪实际伸出方向是相机+Z。
+#   需要在相机系内先把 AnyGrasp 的 X 轴转到 +Z 轴，即右乘 Ry(-90°)：
+#     Ry(-90°) @ [1,0,0] = [0,0,1]  =>  相机X -> 相机+Z ✓
+#     (注意: Ry(+90°) @ [1,0,0] = [0,0,-1]，方向相反，是错误的)
+#   再用 _CAM_OFFSET_ROT 把相机系变换到 gripper_base 系。
+#   最终：R_gb_desired = R_gb_in_arm @ _CAM_OFFSET_ROT @ R_cam_grasp @ _RY_NEG90
+#
+# 验证（R_gb_in_arm=I, R_cam_grasp=I）：
+#   R_gb_desired = _CAM_OFFSET_ROT @ _RY_NEG90
+#   R_gb_desired[:,2] = _CAM_OFFSET_ROT @ [1,0,0] = [0,-1,0]（gb +Z 对齐 approach）
+#   但注意 _CAM_OFFSET_ROT @ [1,0,0] = [0,-1,0]，即 gb -Y = approach，
+#   这实际上是 SCAN 时夹爪朝下时 gb +Z 朝向，符合从上方抓取的约定 ✓
+_RY_POS90 = np.array([[ 0.,  0.,  1.],
+                       [ 0.,  1.,  0.],
+                       [-1.,  0.,  0.]], dtype=np.float64)  # Ry(+90°)  [kept for reference]
+_RY_NEG90 = np.array([[ 0.,  0., -1.],
+                       [ 0.,  1.,  0.],
+                       [ 1.,  0.,  0.]], dtype=np.float64)  # Ry(-90°): X->[0,0,1]=+Z ✓
 
 
 def fk_gripper(joint_angles):
@@ -455,8 +499,16 @@ def compute_desired_ee_rot_in_arm(R_cam_grasp, q_scan):
     """
     # gripper_base rotation at SCAN (corrected from raw ikpy FK end frame)
     R_gb_in_arm = fk_gripper(q_scan)[:3, :3]
-    # desired gripper_base orientation that aligns camera with grasp direction
-    R_gb_desired = R_gb_in_arm @ _CAM_OFFSET_ROT @ R_cam_grasp
+    # desired gripper_base orientation that aligns the gripper +Z (approach) with AnyGrasp approach.
+    # 变换链：R_gb_desired = R_gb_in_arm @ _CAM_OFFSET_ROT @ R_cam_grasp @ _RY_POS90
+    #   _CAM_OFFSET_ROT : 相机系 -> gripper_base 系（物理安装旋转）
+    #   右乘 _RY_POS90  : 列置换，_RY_POS90[:,2]=[1,0,0]，所以结果[:,2] = A @ [1,0,0] = A[:,0]
+    #                     即 R_gb_desired[:,2] = (_CAM_OFFSET_ROT @ R_cam)[:,0]
+    #                                          = _CAM_OFFSET_ROT @ approach_cam
+    #                                          = approach in gb frame  ✓
+    #   NOTE: 不要改成 _RY_NEG90！_RY_NEG90[:,2]=[-1,0,0]，结果[:,2]=-approach（反向 ✗）
+    # 结果: R_gb_desired[:,2] = gripper_base +Z（夹爪伸出方向）= approach 方向 ✓
+    R_gb_desired = R_gb_in_arm @ _CAM_OFFSET_ROT @ R_cam_grasp @ _RY_POS90
     # convert to joint7 frame (what ikpy expects as target_orientation)
     return R_gb_desired @ _RX_POS90
 
@@ -479,8 +531,11 @@ def cam_rot_to_arm_frame(R_cam, joint_angles, robot_quat_w):
     """
     # FK gives gripper_base orientation in arm_base_link frame (corrected from joint7 end frame)
     R_gb = fk_gripper(joint_angles)[:3, :3]
-    # Full chain: R_arm = R_gb @ R_gb_from_cam @ R_cam
-    R_arm = R_gb @ _CAM_OFFSET_ROT @ R_cam
+    # Full chain: R_arm = R_gb @ _CAM_OFFSET_ROT @ R_cam @ _RY_POS90
+    # _RY_POS90[:,2]=[1,0,0]，右乘后结果[:,2] = R_gb @ _CAM_OFFSET_ROT @ R_cam[:,0]
+    #                        = approach 转到 arm frame ✓
+    # NOTE: 不要改成 _RY_NEG90！_RY_NEG90[:,2]=[-1,0,0]，结果[:,2]=-approach（反向 ✗）
+    R_arm = R_gb @ _CAM_OFFSET_ROT @ R_cam @ _RY_POS90
     return R_arm
 
 
