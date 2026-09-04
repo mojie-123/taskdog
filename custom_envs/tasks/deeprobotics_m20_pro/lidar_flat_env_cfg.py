@@ -13,9 +13,8 @@ from rl_training.tasks.manager_based.locomotion.velocity.velocity_env_cfg import
     MySceneCfg,
 )
 
-BANANA_USD = (
-    "/home/mojie/PycharmProjects/ATEC2026_Simulation_Challenge_jiemo/"
-    "atec_robot_model/objects/task_b/011_banana.usd"
+BANANA_USD = os.path.join(
+    os.path.dirname(__file__), "..", "..", "objects", "011_banana.usd"
 )
 TABLE_USD = os.path.join(os.path.dirname(__file__), "..", "..", "objects", "Shop_Table.usd")
 

@@ -117,7 +117,7 @@ DEEPROBOTICS_M20_PIPER_SINGLE_CFG = ArticulationCfg(
             joint_names_expr=GRIPPER_JOINT_NAMES,
             effort_limit=10.0,
             velocity_limit=1.0,
-            stiffness=400.0,
+            stiffness=3000.0,
             damping=20.0,
         ),
     },

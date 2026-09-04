@@ -39,8 +39,11 @@ def spawn_banana(scene, pos=(10.0, 10.0, 0.03), rot=(1.0, 0.0, 0.0, 0.0)):
             ),
             mass_props=sim_utils.MassPropertiesCfg(mass=0.5),
             collision_props=sim_utils.CollisionPropertiesCfg(
-                contact_offset=0.01,
+                contact_offset=0.001,
                 rest_offset=0.0,
+            ),
+            mesh_collision_props=sim_utils.MeshCollisionPropertiesCfg(
+                mesh_approximation="convexDecomposition",
             ),
         ),
         init_state=RigidObjectCfg.InitialStateCfg(pos=pos, rot=rot),

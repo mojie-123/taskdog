@@ -24,9 +24,10 @@ PIPER_COLLIDERS = {
     "link4": ("cylinder", "0 0 0", "0 0 0", {"radius": "0.060", "length": "0.10"}),
     "link5": ("box", "0 -0.050 0", "0 0 0", {"size": "0.07 0.11 0.07"}),
     "link6": ("cylinder", "0 0 0", "0 0 0", {"radius": "0.045", "length": "0.05"}),
-    "gripper_base": ("box", "0 0 0.06", "0 0 0", {"size": "0.13 0.09 0.12"}),
-    "link7": ("box", "0 -0.05 0.01", "0 0 0", {"size": "0.025 0.10 0.025"}),
-    "link8": ("box", "0 -0.05 0.01", "0 0 0", {"size": "0.025 0.10 0.025"}),
+    "gripper_base": ("box", "0 0 0.032", "0 0 0", {"size": "0.075 0.075 0.064"}),
+    # link7 and link8 (gripper fingers) intentionally omitted:
+    # their collision geometry is kept as the original STL mesh collider
+    # for accurate finger-object contact detection during grasping.
 }
 
 
@@ -45,9 +46,7 @@ def build() -> Path:
     """Generate and statically validate the conversion input URDF."""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     source_text = SOURCE_URDF.read_text(encoding="utf-8")
-    if "0。611" not in source_text:
-        raise RuntimeError("Expected full-width decimal typo was not found in source URDF")
-    source_text = source_text.replace('upper="0。611"', 'upper="0.611"')
+    # Full-width decimal typo was already fixed in source URDF; skip replacement.
     root = ET.fromstring(source_text)
 
     for mesh in root.findall(".//mesh"):

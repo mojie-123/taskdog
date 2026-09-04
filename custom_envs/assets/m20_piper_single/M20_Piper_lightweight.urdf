@@ -766,9 +766,9 @@
       </material>
     </visual>
     <collision name="simplified_collision">
-      <origin xyz="0 0 0.06" rpy="0 0 0" />
+      <origin xyz="0 0 0.032" rpy="0 0 0" />
       <geometry>
-        <box size="0.13 0.09 0.12" />
+        <box size="0.075 0.075 0.064" />
       </geometry>
     </collision>
   </link>
@@ -792,10 +792,10 @@
         <color rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
       </material>
     </visual>
-    <collision name="simplified_collision">
-      <origin xyz="0 -0.05 0.01" rpy="0 0 0" />
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <box size="0.025 0.10 0.025" />
+        <mesh filename="/home/mojie/taskdog/deps/deep_robotics_model/M20_Piper/urdf/meshes/link7.STL" />
       </geometry>
     </collision>
   </link>
@@ -821,10 +821,10 @@
         <color rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
       </material>
     </visual>
-    <collision name="simplified_collision">
-      <origin xyz="0 -0.05 0.01" rpy="0 0 0" />
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <box size="0.025 0.10 0.025" />
+        <mesh filename="/home/mojie/taskdog/deps/deep_robotics_model/M20_Piper/urdf/meshes/link8.STL" />
       </geometry>
     </collision>
   </link>

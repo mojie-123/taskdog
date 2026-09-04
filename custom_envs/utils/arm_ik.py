@@ -271,11 +271,23 @@ def solve_for_gripper_base(target_gb_pos, target_rot_j7=None, initial_angles=Non
                 _jump_lims[4] = math.pi  # j5: allow up to 180° jump
                 _per_joint_jumps = np.abs(q_cand - q0)
                 if np.all(_per_joint_jumps < _jump_lims):
-                    valid_candidates.append((joint_dist, q_cand))
+                    # Score = joint_dist + roll_penalty.
+                    # roll_penalty biases the search toward deg≈0 (closest to the
+                    # original AnyGrasp orientation) so that when multiple roll angles
+                    # are kinematically valid the one that preserves the AnyGrasp
+                    # closing direction is preferred.
+                    # deg is in [0, 355]; map to signed angle in (-180, 180] so that
+                    # e.g. deg=350 is treated as -10° (penalty=10°) not +350°.
+                    _signed_deg = deg if deg <= 180 else deg - 360
+                    _roll_penalty = abs(_signed_deg) * (math.pi / 180.0) * 0.1
+                    _score = joint_dist + _roll_penalty
+                    valid_candidates.append((_score, q_cand))
 
     if valid_candidates:
-        # Return the valid candidate with smallest joint-space distance
-        # from initial_angles, minimising discontinuous joint motion.
+        # Return the valid candidate with smallest score.
+        # score = joint_dist + 0.1 * |roll_rad|: penalises large roll deviations
+        # from the original AnyGrasp orientation while still preferring
+        # kinematically smooth solutions (joint_dist term).
         valid_candidates.sort(key=lambda x: x[0])
         return valid_candidates[0][1]
 
@@ -539,50 +551,41 @@ def cam_rot_to_arm_frame(R_cam, joint_angles, robot_quat_w):
     return R_arm
 
 
-def extract_j6_angle(cur_q, R_cam_grasp, R_arm_target):
-    """[DEPRECATED — ORIENT stage is now skipped in favour of PRE_GRASP with target_rot]
+def extract_j6_angle(cur_q, R_gb_desired):
+    """Compute the joint6 angle required to align the gripper closing axis with R_gb_desired,
+    keeping joint1-5 fixed at cur_q.
 
-    Extract the joint6 angle required to achieve R_arm_target, keeping joint1-5 fixed.
+    Physical basis
+    --------------
+    Numerically verified (via FK Jacobian): joint6 rotates gripper_base *exactly* around
+    its own +Z axis (the approach / finger-extension axis).  This means:
+      - j6 does NOT change the gripper_base position.
+      - j6 does NOT change the approach direction (gb+Z).
+      - j6 only changes the closing axis (gb+Y) and binormal (gb+X).
 
-    IMPORTANT KNOWN LIMITATION: This function assumes that the target orientation
-    R_arm_target can be reached by adjusting joint6 alone (with joint1-5 held at their
-    PRE_GRASP-end values).  Numerical experiments show this is FALSE: after PRE_GRASP
-    moves joint1-5 to a new configuration, the desired gripper orientation is no longer
-    reachable by only rotating joint6 (Frobenius error ≈ 0.50, vs. ≈ 0.065 when using
-    the SCAN-time joint1-5).  The ORIENT stage is therefore bypassed; PRE_GRASP now
-    solves IK with target_rot=R_desired_EE_in_arm so all six joints arrive correctly.
-
-    FK decomposition (numerically verified):
-        R_full(q) = fk(q_j6=0)[:3,:3] @ Ry(j6)
-    where Ry is a Y-axis rotation in the gripper_base local frame (ikpy absorbs the
-    joint6 origin rpy=1.5708 0 0 into the chain, making joint6 appear as Ry in
-    gripper_base coordinates despite URDF declaring axis="0 0 1").
-
-    Correct j6 extraction formula (if R_arm_target is achievable with current j1-5):
-        Ry = fk(q_j6zero)[:3,:3].T @ R_arm_target
-        j6 = atan2(Ry[0,2], Ry[0,0])   # Y-axis rotation
+    Formula (Z-axis rotation extraction, numerically verified to give err < 1e-5):
+        Rz = fk_gripper(q_j6=0)[:3,:3].T @ R_gb_desired
+        j6 = atan2(Rz[1,0], Rz[0,0])   # Z-axis: atan2(sin theta, cos theta)
 
     Parameters
     ----------
-    cur_q        : (6,) current joint angles (joint1-5 define R_j1to5; joint6 is ignored)
-    R_cam_grasp  : (3,3) GraspNet rotation in camera frame (grasp_result["R_cam"])
-    R_arm_target : (3,3) desired EE orientation in arm_base_link frame
-                   Must be computed from SCAN-time q, NOT from PRE_GRASP-end q.
+    cur_q       : (6,) current joint angles; joint1-5 define the approach direction;
+                  joint6 value is ignored (overwritten).
+    R_gb_desired: (3,3) desired gripper_base rotation in arm_base_link frame.
+                  Use  grasp_result["R_desired_EE_in_arm"] @ _RX_NEG90  to convert
+                  from the joint7-frame target stored in grasp_result.
 
     Returns
     -------
     j6 : float
-        Target angle for joint6 (radians), clipped to [-2.094, 2.094].
+        Target angle for joint6 (radians), clipped to [-2.0944, 2.0944].
     """
     q_j6zero = np.array(cur_q, dtype=np.float64)
     q_j6zero[5] = 0.0
-    T_j6zero = fk(q_j6zero)
-    R_j1to5 = T_j6zero[:3, :3]
-    # Correct formula: joint6 is effectively Ry in gripper_base local frame
-    # (verified numerically: fk(q_j6=0) @ Ry(j6) = fk(q) with error < 1e-5)
-    Ry = R_j1to5.T @ R_arm_target
-    j6 = math.atan2(Ry[0, 2], Ry[0, 0])   # Y-axis: atan2(sin, cos) = atan2(R[0,2], R[0,0])
-    return float(np.clip(j6, -2.094, 2.094))
+    R_gb_base = fk_gripper(q_j6zero)[:3, :3]
+    Rz = R_gb_base.T @ R_gb_desired
+    j6 = math.atan2(Rz[1, 0], Rz[0, 0])
+    return float(np.clip(j6, -2.0944, 2.0944))
 
 
 def world_pos_to_arm_frame(world_pos, robot_pos_w, robot_quat_w):
