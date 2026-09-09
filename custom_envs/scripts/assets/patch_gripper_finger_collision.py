@@ -59,7 +59,7 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _SCRIPT_DIR.parents[2]  # .../custom_envs/scripts/assets -> repo root
-_DEFAULT_USD_DIR = _REPO_ROOT / "custom_envs/assets/m20_piper_single/configuration"
+_DEFAULT_USD_DIR = _REPO_ROOT / "custom_envs/assets/m20_piper_single/configuration"  # 找到.usd的位置
 
 # 要补写碰撞体的 link 列表
 _FINGER_LINKS = ["link7", "link8"]
@@ -94,23 +94,30 @@ def _patch_base_usd(base_usd: Path, dry_run: bool) -> None:
     修改 M20_Piper_base.usd：
     把 /colliders/<link>/<link> 从空 Xform 改为 Mesh，
     并从 /visuals/<link>/<link>/node_STL_BINARY_/mesh 复制几何属性。
+
+    pxr.Usd   — 高层 API：操作「Stage」（整个场景）和「Prim」（场景中的节点）
+              适合读取属性值、创建属性、设置值
+
+    pxr.Sdf   — 低层 API：直接操作「Layer」（单个 .usd 文件）和「PrimSpec」（文件里的原始记录）
+                  适合修改 typeName、apiSchemas 等元数据，以及在 instanceable prim 场景下绕过限制
+
     """
     from pxr import Sdf, Usd  # noqa: PLC0415
 
     print(f"[base.usd] 打开 {base_usd}")
-    stage = Usd.Stage.Open(str(base_usd))
-    layer = stage.GetRootLayer()
+    stage = Usd.Stage.Open(str(base_usd))   # 获取stage
+    layer = stage.GetRootLayer()   # 获取layer
 
     for link in _FINGER_LINKS:
-        src_path = _VISUAL_MESH_PATH.format(link=link)
-        dst_path = _COLLIDER_PRIM_PATH.format(link=link)
+        src_path = _VISUAL_MESH_PATH.format(link=link)   # 格式化源路径（视觉 mesh）
+        dst_path = _COLLIDER_PRIM_PATH.format(link=link)   # 格式化目标路径（碰撞体 prim）
 
-        src_prim = stage.GetPrimAtPath(src_path)
+        src_prim = stage.GetPrimAtPath(src_path)   # 获取源prim
         if not src_prim.IsValid():
             print(f"  [ERROR] 源 prim 不存在: {src_path}")
             sys.exit(1)
 
-        dst_prim = stage.GetPrimAtPath(dst_path)
+        dst_prim = stage.GetPrimAtPath(dst_path)   # 获取目标prim
         if not dst_prim.IsValid():
             print(f"  [ERROR] 目标 prim 不存在: {dst_path}")
             sys.exit(1)
@@ -118,24 +125,24 @@ def _patch_base_usd(base_usd: Path, dry_run: bool) -> None:
         print(f"  [{link}] src={src_path}")
         print(f"  [{link}] dst={dst_path}  当前 typeName={dst_prim.GetTypeName()}")
 
-        if dry_run:
+        if dry_run:   # 预览模式，仅打印要执行的操作而不作实际修改
             print(f"  [{link}] [DRY-RUN] 将把 typeName 改为 Mesh 并复制几何属性")
             continue
 
-        # 1. 通过 SdfLayer 修改 prim spec 的 typeName
-        sdf_dst = Sdf.Path(dst_path)
+        # 1. 通过 SdfLayer 修改 prim spec 的 typeName：Xform -> Mesh
+        sdf_dst = Sdf.Path(dst_path)   # 获取目标 prim 的 Sdf spec
         prim_spec = layer.GetPrimAtPath(sdf_dst)
         if prim_spec is None:
             # prim 可能只存在于 sublayer，在 root layer 创建 over spec
             parent_spec = layer.GetPrimAtPath(Sdf.Path("/colliders/" + link))
             prim_spec = Sdf.PrimSpec(parent_spec, link, Sdf.SpecifierOver)
-        prim_spec.typeName = "Mesh"
+        prim_spec.typeName = "Mesh"   # 将 typeName 改为 "Mesh"
         print(f"  [{link}] typeName -> Mesh")
 
         # 2. 复制几何属性（重新获取 prim，typeName 已改）
-        dst_prim = stage.GetPrimAtPath(dst_path)
+        dst_prim = stage.GetPrimAtPath(dst_path)   # 重新获取目标 prim（typeName 已改）
         for attr_name in _MESH_ATTRS:
-            src_attr = src_prim.GetAttribute(attr_name)
+            src_attr = src_prim.GetAttribute(attr_name)   # 从源 prim 读取需要的属性值
             if not src_attr.IsValid():
                 continue
             value = src_attr.Get()
@@ -157,7 +164,7 @@ def _patch_base_usd(base_usd: Path, dry_run: bool) -> None:
         purpose_attr.Set("guide")
         print(f"  [{link}] purpose -> guide")
 
-    if not dry_run:
+    if not dry_run:   # 非预览模式，保存修改
         layer.Save()
         print(f"[base.usd] 已保存")
 
@@ -176,7 +183,7 @@ def _patch_physics_usd(physics_usd: Path, dry_run: bool) -> None:
     from pxr import Sdf  # noqa: PLC0415
 
     print(f"[physics.usd] 打开 {physics_usd}")
-    layer = Sdf.Layer.FindOrOpen(str(physics_usd))
+    layer = Sdf.Layer.FindOrOpen(str(physics_usd))   # 使用 Sdf.Layer.FindOrOpen 打开 USD 层。如果已打开则返回已有实例，否则打开新实例
     if layer is None:
         print(f"  [ERROR] 无法打开 SdfLayer: {physics_usd}")
         sys.exit(1)
@@ -217,7 +224,7 @@ def _patch_physics_usd(physics_usd: Path, dry_run: bool) -> None:
         prim_spec.SetInfo("apiSchemas", Sdf.TokenListOp.CreateExplicit(current_items))
         print(f"  [{link}] apiSchemas -> {current_items}")
 
-        # physics:collisionEnabled = True
+        # physics:collisionEnabled = True    启用碰撞
         ce_key = "physics:collisionEnabled"
         ce_attr_spec = prim_spec.attributes.get(ce_key)
         if ce_attr_spec is None:

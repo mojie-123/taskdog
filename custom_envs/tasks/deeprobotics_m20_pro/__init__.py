@@ -31,8 +31,8 @@ gym.register(
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.rough_env_cfg:DeeproboticsM20ProRoughEnvCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:DeeproboticsM20ProRoughPPORunnerCfg",
+        "env_cfg_entry_point": f"{__name__}.rough_env_cfg:DeeproboticsM20ProRoughEnvCfg",   # "custom_envs.tasks.deeprobotics_m20_pro.rough_env_cfg:DeeproboticsM20ProRoughEnvCfg"
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:DeeproboticsM20ProRoughPPORunnerCfg",   # "custom_envs.tasks.deeprobotics_m20_pro.agents.rsl_rl_ppo_cfg:DeeproboticsM20ProRoughPPORunnerCfg"
     },
 )
 

@@ -33,7 +33,7 @@ def _build_chain():
     import ikpy.chain
     chain = ikpy.chain.Chain.from_urdf_file(
         os.path.abspath(_URDF_PATH),
-        base_elements=["arm_base_link"],
+        base_elements=["arm_base_link"],   # 从arm_base_link这个link开始的所有joint
         active_links_mask=[
             False,  # Base link (arm_base_link, fixed)
             True,   # joint1
@@ -57,7 +57,7 @@ def get_chain():
     return _chain
 
 
-def solve(target_pos, target_rot=None, initial_angles=None):
+def solve(target_pos, target_rot=None, initial_angles=None):   # target_pos为j7（即指尖）到达的位置。可选目标旋转矩阵；初始各个关节的角度
     """Solve IK for Piper arm.
 
     Parameters
@@ -85,9 +85,9 @@ def solve(target_pos, target_rot=None, initial_angles=None):
         (-1.745,  1.745),  # joint4
         (-1.22,   1.22 ),  # joint5
         (-2.094,  2.094),  # joint6
-    ]
+    ]   # 各个关节的限位
 
-    if initial_angles is None:
+    if initial_angles is None:   # 注意不同的初始点触发可能收敛到不同解
         # Default: joint1=-pi/2 so the arm starts facing the table side
         # (dog yaw=+pi/2, robot -Y = world +X = table direction).
         q0 = [0.0, -math.pi / 2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
@@ -106,12 +106,12 @@ def solve(target_pos, target_rot=None, initial_angles=None):
         target_orientation=target_rot,
         orientation_mode="all" if target_rot is not None else None,
         initial_position=q0,
-    )
+    )   # ikpy内部用scipy.optimize.least_squares最小化末端误差
     # result has 9 values; extract joint1..joint6 (indices 1-6)
-    return np.array(result[1:7], dtype=np.float32)
+    return np.array(result[1:7], dtype=np.float32)   # 取joint1-joint6的值
 
 
-def _rot_axis_angle(axis, angle):
+def _rot_axis_angle(axis, angle):   # Rodrigues 旋转公式，用于 roll 搜索中生成旋转矩阵
     """Rotation matrix for rotating angle radians around axis (3-vector)."""
     axis = np.asarray(axis, dtype=np.float64)
     axis = axis / np.linalg.norm(axis)
@@ -135,7 +135,7 @@ _IK_JOINT_LIMITS = [
 ]
 
 
-def solve_for_gripper_base(target_gb_pos, target_rot_j7=None, initial_angles=None):
+def solve_for_gripper_base(target_gb_pos, target_rot_j7=None, initial_angles=None):   # 指定gripper base的目标位置，计算joint1~joint6。如果有target_rot_j7，则是位置+旋转ik，带roll搜索
     """Solve IK so that gripper_base reaches target_gb_pos.
 
     Corrected wrapper around solve() that accounts for the joint7->gripper_base
@@ -171,7 +171,7 @@ def solve_for_gripper_base(target_gb_pos, target_rot_j7=None, initial_angles=Non
         Angles for joint1..joint6 in radians such that gripper_base is
         (approximately) at target_gb_pos with the desired orientation.
     """
-    if target_rot_j7 is None:
+    if target_rot_j7 is None:   # 纯位置ik：目标gb位置 -> 直接用初始各关节角度计算R_gb，然后算一个j7的位置（其实就是随便一个方向） -> 以这个j7位置作为目标求解各关节角度 -> 求此时的R_gb -> 再求一次
         # No rotation constraint: position-only solve.
         # We must still convert the gripper_base target to a joint7 target by
         # adding the joint7-origin-in-gripper_base offset (0.1358 m along the
@@ -180,20 +180,21 @@ def solve_for_gripper_base(target_gb_pos, target_rot_j7=None, initial_angles=Non
         # when initial_angles is None), then iterate once to refine.
         if initial_angles is not None:
             _q0 = np.asarray(initial_angles, dtype=np.float64)
-            _R_gb_est = fk_gripper(_q0)[:3, :3]
+            _R_gb_est = fk_gripper(_q0)[:3, :3]   # gb在世界坐标系下的旋转
         else:
             _R_gb_est = np.eye(3)
         _target_j7 = target_gb_pos + _R_gb_est @ _J7_ORIGIN_IN_GB
-        _q_pos = solve(_target_j7, target_rot=None, initial_angles=initial_angles)
+        _q_pos = solve(_target_j7, target_rot=None, initial_angles=initial_angles)   # 第一次计算
         # Refine once with the updated gripper_base orientation from the solution
         _R_gb_refined = fk_gripper(_q_pos)[:3, :3]
         _target_j7_refined = target_gb_pos + _R_gb_refined @ _J7_ORIGIN_IN_GB
-        _q_pos2 = solve(_target_j7_refined, target_rot=None, initial_angles=_q_pos)
+        _q_pos2 = solve(_target_j7_refined, target_rot=None, initial_angles=_q_pos)   # 第二次计算。不动点迭代：每次用上一步的解估算偏移，再求新解
         return _q_pos2
 
+    # 位置+旋转ik
     R_gb_desired  = target_rot_j7 @ _RX_NEG90
-    target_j7_pos = target_gb_pos + R_gb_desired @ _J7_ORIGIN_IN_GB
-    q = solve(target_j7_pos, target_rot=target_rot_j7, initial_angles=initial_angles)
+    target_j7_pos = target_gb_pos + R_gb_desired @ _J7_ORIGIN_IN_GB   # 根据目标j7朝向反解j7目标位置
+    q = solve(target_j7_pos, target_rot=target_rot_j7, initial_angles=initial_angles)   # 求解
 
     # --- roll search: rotate grasp frame around approach axis (gb +X) ---
     # Enumerate ALL roll angles (including 0 = original rotation) and collect
@@ -208,43 +209,45 @@ def solve_for_gripper_base(target_gb_pos, target_rot_j7=None, initial_angles=Non
     #     (j5>0 branch: j2≈1.5 far from π, j5≈+0.3~+0.8, natural arm posture)
     # Both seeds are tried for every roll angle; the valid candidate with
     # smallest joint-space distance from q0 is returned.
+
+    # roll搜索：找一个最合理的解（ik可解且关节运动最平滑）
     approach_arm = R_gb_desired[:, 2]  # R_gb_desired[:,2] = gb+Z（夹爪伸出方向，右乘_RY_POS90后的 approach 轴）
-    q0 = np.asarray(initial_angles, dtype=np.float64) if initial_angles is not None else np.zeros(6)
+    q0 = np.asarray(initial_angles, dtype=np.float64) if initial_angles is not None else np.zeros(6)   # 当前关节角，作为平滑性基准
     # Build j5-positive seed: keep all joints from q0 but fix j5=+0.3 and j2=1.5
     # to anchor IK in the natural (non-singular) branch.
     _q_seed_j5pos = q0.copy()
     _q_seed_j5pos[4] = 0.3   # j5=+0.3: far from both limits, biases to j5>0 solution
     _q_seed_j5pos[1] = 1.5   # j2=1.5: far from π singularity
-    best_q, best_err = q, float(np.linalg.norm(fk_gripper(q)[:3, 3] - target_gb_pos))
-    valid_candidates = []   # list of (joint_dist, q_cand)
-    for deg in range(0, 360, 5):
-        R_roll   = _rot_axis_angle(approach_arm, math.radians(deg))
-        R_gb_new = R_roll @ R_gb_desired
-        if abs(float(np.linalg.det(R_gb_new)) - 1.0) > 0.02:
+    best_q, best_err = q, float(np.linalg.norm(fk_gripper(q)[:3, 3] - target_gb_pos))   # 把原始解作为保底方案
+    valid_candidates = []   # list of (joint_dist, q_cand)   所有合法候选
+    for deg in range(0, 360, 5):   # 枚举72个roll角
+        R_roll   = _rot_axis_angle(approach_arm, math.radians(deg))   # 在 arm 系的固定坐标轴上，绕 approach 方向旋转 deg 度的旋转操作矩阵
+        R_gb_new = R_roll @ R_gb_desired   # 新的R_gb_new
+        if abs(float(np.linalg.det(R_gb_new)) - 1.0) > 0.02:   # 检验旋转矩阵是正交矩阵（必要条件）
             continue
-        R_j7_new  = R_gb_new @ _RX_NEG90.T
-        t_j7_new  = target_gb_pos + R_gb_new @ _J7_ORIGIN_IN_GB
+        R_j7_new  = R_gb_new @ _RX_NEG90.T   # j7目标旋转，_RX_NEG90.T即Rx(+π/2)
+        t_j7_new  = target_gb_pos + R_gb_new @ _J7_ORIGIN_IN_GB   # j7目标位置
         # Try both seeds for this roll angle
-        for _seed in (initial_angles, _q_seed_j5pos):
+        for _seed in (initial_angles, _q_seed_j5pos):   # 对每个 roll 角用两个初始猜测分别求解，后续评分决定用哪个
             q_cand    = solve(t_j7_new, target_rot=R_j7_new, initial_angles=_seed)
             T_gb_c    = fk_gripper(q_cand)
-            err_c     = float(np.linalg.norm(T_gb_c[:3, 3] - target_gb_pos))
-            rot_err_c = float(np.linalg.norm(fk(q_cand)[:3, :3] - R_j7_new, ord="fro"))
+            err_c     = float(np.linalg.norm(T_gb_c[:3, 3] - target_gb_pos))   # 算gripper_base 实际位置与目标位置的欧氏距离
+            rot_err_c = float(np.linalg.norm(fk(q_cand)[:3, :3] - R_j7_new, ord="fro"))   # 算旋转差异
             at_lim_c  = any(
                 abs(float(qi) - lo) < 0.01 or abs(float(qi) - hi) < 0.01
                 for qi, (lo, hi) in zip(q_cand, _IK_JOINT_LIMITS)
-            )
-            if err_c < best_err:
+            )   # 检查解中是否有任何关节处于限位边缘
+            if err_c < best_err:   # 更新最优解
                 best_err, best_q = err_c, q_cand
-            if err_c <= 0.03 and not at_lim_c and rot_err_c < 0.1:
+            if err_c <= 0.03 and not at_lim_c and rot_err_c < 0.1:   # 要求：位置误差<=3cm，没有关节在限位处，旋转误差小于0.1
                 # Approach-direction guard: reject 180-deg flipped solutions.
                 # rot_err_c is measured vs R_j7_new (the roll-rotated target),
                 # so a 180-deg flip also passes rot_err_c < 0.1 against its own
                 # rolled target. Verify the candidate gb+Z agrees with the
                 # ORIGINAL desired approach_arm (dot > 0 = same half-space).
                 _R_gb_cand = fk_gripper(q_cand)[:3, :3]
-                _approach_c = _R_gb_cand[:, 2]
-                if float(np.dot(_approach_c, approach_arm)) < 0.0:
+                _approach_c = _R_gb_cand[:, 2]   # 要求approach轴基本对齐
+                if float(np.dot(_approach_c, approach_arm)) < 0.0:   # 翻转了，舍去
                     continue  # 180-deg approach flip -> discard
                 # Closing-axis guard: reject ~180-deg roll about the approach axis.
                 # rot_err_c is measured vs the roll-rotated target R_j7_new, so any
@@ -253,11 +256,12 @@ def solve_for_gripper_base(target_gb_pos, target_rot_j7=None, initial_angles=Non
                 # A ~180-deg roll passes the approach guard (approach dot > 0) but
                 # flips the closing axis (gb+Y), causing the gripper to close in the
                 # wrong direction.  Guard: dot(actual_closing, desired_closing) > 0.
-                _closing_c   = _R_gb_cand[:, 1]      # actual  gb+Y (closing axis)
+                _closing_c   = _R_gb_cand[:, 1]      # actual  gb+Y (closing axis)   closing轴也检查一下（检查夹爪闭合方向，虽然感觉这个似乎不需要检查，因为夹爪对称，交换左右手指无所谓？）
                 _closing_des = R_gb_desired[:, 1]     # desired gb+Y (from ORIGINAL target)
                 if float(np.dot(_closing_c, _closing_des)) < 0.0:
                     continue  # ~180-deg roll about approach axis -> discard
-                joint_dist = float(np.linalg.norm(q_cand - q0))
+
+                joint_dist = float(np.linalg.norm(q_cand - q0))   # 逐关节检查跳变
                 # Additionally require each joint to stay within per-joint limits of q0.
                 # This prevents selecting a roll that lands on the opposite side of
                 # a dual-solution joint (e.g. j6: target=+0.82 but PD converges to
@@ -280,10 +284,10 @@ def solve_for_gripper_base(target_gb_pos, target_rot_j7=None, initial_angles=Non
                     # e.g. deg=350 is treated as -10° (penalty=10°) not +350°.
                     _signed_deg = deg if deg <= 180 else deg - 360
                     _roll_penalty = abs(_signed_deg) * (math.pi / 180.0) * 0.1
-                    _score = joint_dist + _roll_penalty
+                    _score = joint_dist + _roll_penalty   # 评分：平滑性 + 选的deg与当前deg（0）的差距
                     valid_candidates.append((_score, q_cand))
 
-    if valid_candidates:
+    if valid_candidates:   # 对合理解进行排序
         # Return the valid candidate with smallest score.
         # score = joint_dist + 0.1 * |roll_rad|: penalises large roll deviations
         # from the original AnyGrasp orientation while still preferring
@@ -298,20 +302,20 @@ def solve_for_gripper_base(target_gb_pos, target_rot_j7=None, initial_angles=Non
     _at_lim_best = any(
         abs(float(_qi) - _lo) < 0.01 or abs(float(_qi) - _hi) < 0.01
         for _qi, (_lo, _hi) in zip(best_q, _IK_JOINT_LIMITS)
-    )
-    _jump_lims_fb = np.full(6, math.pi / 2)
+    )   # 检查 best_q 是否有关节在限位
+    _jump_lims_fb = np.full(6, math.pi / 2)   # 检查跳变是否超限
     _jump_lims_fb[4] = math.pi
     _per_joint_jumps_best = np.abs(best_q - q0)
     _max_jump_best = float(np.max(_per_joint_jumps_best))
     _jump_exceeded = not np.all(_per_joint_jumps_best < _jump_lims_fb)
-    if (_at_lim_best and best_err > 0.05) or _jump_exceeded:
+    if (_at_lim_best and best_err > 0.05) or _jump_exceeded:   # best在限位附近且误差大 或者 跳变严重 就返回None
         # Fallback solution is either at a limit with large pos error, or requires
         # a joint to exceed its per-joint limit.  Signal caller to try next candidate.
         print(f"[IK-WARN] fallback best_q rejected: at_lim={_at_lim_best} "
               f"pos_err={best_err:.3f}m max_jump={_max_jump_best:.3f}rad "
               f"per_joint={np.round(_per_joint_jumps_best,3)} q={np.round(best_q,3)}", flush=True)
         return None
-    if not valid_candidates:
+    if not valid_candidates:   # 通过，但是有警告
         # best_q passed all checks but was reached via fallback (valid_candidates empty).
         # Log a warning so the caller is aware this is not a roll-search validated solution.
         print(f"[IK-WARN] valid_candidates empty, using fallback best_q: "
@@ -331,7 +335,7 @@ def fk(joint_angles):
     chain = get_chain()
     # chain has 9 links; pad with base=0, ee=0, j7=0
     q = [0.0] + list(joint_angles) + [0.0, 0.0]
-    return chain.forward_kinematics(q)
+    return chain.forward_kinematics(q)   # 返回joint7坐标系在arm_base_link中的位姿（4*4）
 
 
 # ---------------------------------------------------------------------------
@@ -380,7 +384,7 @@ _RY_NEG90 = np.array([[ 0.,  0., -1.],
                        [ 1.,  0.,  0.]], dtype=np.float64)  # Ry(-90°): X->[0,0,1]=+Z ✓
 
 
-def fk_gripper(joint_angles):
+def fk_gripper(joint_angles):   # 返回gripper_base在arm_base_link下的转移矩阵
     """FK returning the gripper_base frame (4,4) in arm_base_link.
 
     Corrects the joint7 offset baked into the raw ikpy FK result:
@@ -395,15 +399,17 @@ def fk_gripper(joint_angles):
     T_j7 = fk(joint_angles)               # joint7 frame in arm_base_link
     R_j7 = T_j7[:3, :3]
     p_j7 = T_j7[:3, 3]
-    R_gb = R_j7 @ _RX_NEG90              # gripper_base rotation
-    p_gb = p_j7 - R_gb @ _J7_ORIGIN_IN_GB  # gripper_base origin
+
+    # 注意这里的变换
+    R_gb = R_j7 @ _RX_NEG90              # gripper_base rotation   旋转修正：右乘Rx(-90°)        gb系 -> j7系 -> arm_base系
+    p_gb = p_j7 - R_gb @ _J7_ORIGIN_IN_GB  # gripper_base origin   位置修正：减去13.58cm偏移
     T_gb = np.eye(4)
     T_gb[:3, :3] = R_gb
     T_gb[:3,  3] = p_gb
     return T_gb
 
 
-def quat_to_rot(quat_wxyz):
+def quat_to_rot(quat_wxyz):   # 四元数 -> 3*3旋转矩阵
     """Convert quaternion [w, x, y, z] to 3x3 rotation matrix."""
     w, x, y, z = quat_wxyz
     R = np.array([
@@ -430,7 +436,7 @@ _CAM_OFFSET_ROT = np.array([
 ], dtype=np.float64)  # Rz(-90deg): camera +Z => gripper_base +Z
 
 
-def cam_to_world(t_cam, joint_angles, robot_pos_w, robot_quat_w):
+def cam_to_world(t_cam, joint_angles, robot_pos_w, robot_quat_w):   # 算香蕉世界坐标
     """Convert a position in wrist_camera frame to world frame.
 
     Pipeline:
@@ -466,7 +472,7 @@ def cam_to_world(t_cam, joint_angles, robot_pos_w, robot_quat_w):
     return t_world
 
 
-def compute_desired_ee_rot_in_arm(R_cam_grasp, q_scan):
+def compute_desired_ee_rot_in_arm(R_cam_grasp, q_scan):   # 目标旋转（arm_base_link下）
     """Compute the desired gripper_base rotation in arm_base_link frame.
 
     Called once after GraspNet returns a result (using the joint angles at SCAN
@@ -520,12 +526,12 @@ def compute_desired_ee_rot_in_arm(R_cam_grasp, q_scan):
     #                                          = approach in gb frame  ✓
     #   NOTE: 不要改成 _RY_NEG90！_RY_NEG90[:,2]=[-1,0,0]，结果[:,2]=-approach（反向 ✗）
     # 结果: R_gb_desired[:,2] = gripper_base +Z（夹爪伸出方向）= approach 方向 ✓
-    R_gb_desired = R_gb_in_arm @ _CAM_OFFSET_ROT @ R_cam_grasp @ _RY_POS90
+    R_gb_desired = R_gb_in_arm @ _CAM_OFFSET_ROT @ R_cam_grasp @ _RY_POS90   # 这里_RY_POS90看作是gb in anygrasp
     # convert to joint7 frame (what ikpy expects as target_orientation)
-    return R_gb_desired @ _RX_POS90
+    return R_gb_desired @ _RX_POS90   # gb帧 -> j7帧
 
 
-def cam_rot_to_arm_frame(R_cam, joint_angles, robot_quat_w):
+def cam_rot_to_arm_frame(R_cam, joint_angles, robot_quat_w):   # 相机系 -> arm_base_link系
     """Convert a rotation matrix from wrist_camera frame to arm_base_link frame.
 
     This transforms the GraspNet grasp orientation (in camera frame) into
@@ -580,15 +586,16 @@ def extract_j6_angle(cur_q, R_gb_desired):
     j6 : float
         Target angle for joint6 (radians), clipped to [-2.0944, 2.0944].
     """
+    # 注意这里不是直接提取j6，而是考虑了j1~j5现在的角度，这样的话j6在一定程度上可以修正j1~j5的偏差给最终旋转带来的差距
     q_j6zero = np.array(cur_q, dtype=np.float64)
     q_j6zero[5] = 0.0
-    R_gb_base = fk_gripper(q_j6zero)[:3, :3]
-    Rz = R_gb_base.T @ R_gb_desired
-    j6 = math.atan2(Rz[1, 0], Rz[0, 0])
+    R_gb_base = fk_gripper(q_j6zero)[:3, :3]   # 把 j6 设为0，用FK算基准旋转
+    Rz = R_gb_base.T @ R_gb_desired   # 目标旋转 相对于 基准旋转 的差值
+    j6 = math.atan2(Rz[1, 0], Rz[0, 0])   # 从差值旋转矩阵中提取绕Z轴的角度
     return float(np.clip(j6, -2.0944, 2.0944))
 
 
-def world_pos_to_arm_frame(world_pos, robot_pos_w, robot_quat_w):
+def world_pos_to_arm_frame(world_pos, robot_pos_w, robot_quat_w):   # 世界坐标 → arm_base_link 坐标，用于把感知到的香蕉位置转换成 IK 能用的格式
     """Convert world-frame position to Piper arm_base_link frame.
 
     Parameters

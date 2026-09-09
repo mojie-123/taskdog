@@ -296,16 +296,16 @@ def main():
               flush=True)
         return arm_joint_ids, gripper_ids
 
-    def _arm_step(robot, q6):
+    def _arm_step(robot, q6):   # 驱动机械臂 6 个关节
         ids, _ = _get_arm_ids(robot)
         if len(ids) != 6:
             return
-        pos_t = robot.data.joint_pos_target[0].clone()
+        pos_t = robot.data.joint_pos_target[0].clone()   # 接口：目标角度。底层的 PD 控制器会自动计算力矩，驱动关节移动到目标角度。shape(24,)
         for i, jid in enumerate(ids):
             pos_t[jid] = float(q6[i])
-        robot.set_joint_position_target(pos_t.unsqueeze(0))
+        robot.set_joint_position_target(pos_t.unsqueeze(0))   # shape: (24,) -> (1, 24)   更新robot.data.joint_pos_target，写入 PhysX Articulation 的驱动目标（供PhysX PD控制器计算并施加力矩）
 
-    def _gripper_step(robot, close=False):
+    def _gripper_step(robot, close=False):   # 控制夹爪开合
         _, gids = _get_arm_ids(robot)
         targets = GRIPPER_CLOSE_POS if close else GRIPPER_OPEN_POS
         pos_t = robot.data.joint_pos_target[0].clone()
@@ -742,17 +742,17 @@ def main():
                 # alpha ramps 0->1.3 over the first 60% of the budget, then stays
                 # clamped at 1.3 until convergence or hard timeout.
                 _arm_budget = BUDGET[PipelineState.ARM_INIT]
-                _arm_alpha  = min(1.3, state_step / max(_arm_budget * 0.6, 1))
-                q6 = cur_q + _arm_alpha * (ARM_SIDE_ANGLES - cur_q)
-                _arm_step(robot, q6)
-                _gripper_step(robot, close=False)
+                _arm_alpha  = min(1.3, state_step / max(_arm_budget * 0.6, 1))   # 超调系数
+                q6 = cur_q + _arm_alpha * (ARM_SIDE_ANGLES - cur_q)   # 目标位置稍微超调
+                _arm_step(robot, q6)   # 将计算出的目标角度 q6 发送给机器人，执行移动
+                _gripper_step(robot, close=False)   # 夹爪闭合
                 if state_step == 1:
                     print(f"[SM] ARM_INIT: retracting arm... base_pos_w={np.round(pos_w,3)}", flush=True)
                     # Print banana actual resting position; sim ran during NAV
                     # so the banana has already settled on the table surface.
                     try:
                         banana = raw_env.scene["banana"]
-                        bpos = banana.data.root_pos_w[0].cpu().numpy()
+                        bpos = banana.data.root_pos_w[0].cpu().numpy()   # 香蕉位置
                         print(
                             f"[INFO] Banana resting pos: "
                             f"x={bpos[0]:.4f}  y={bpos[1]:.4f}  z={bpos[2]:.4f}",
@@ -760,16 +760,16 @@ def main():
                         )
                     except Exception as _be:
                         print(f"[INFO] Could not read banana pos: {_be}", flush=True)
-                _arm_err_now = np.abs(cur_q - ARM_SIDE_ANGLES)
+                _arm_err_now = np.abs(cur_q - ARM_SIDE_ANGLES)   # 当前角度到目标的差距
                 if state_step % 50 == 0:
                     _ai_pos_w = robot.data.root_pos_w[0].cpu().numpy()
                     print(f"[SM] ARM_INIT step {state_step}/{BUDGET[PipelineState.ARM_INIT]}: "
                           f"q={np.round(cur_q,4)} err={np.round(_arm_err_now,4)} max={_arm_err_now.max():.4f} "
                           f"base_pos_w={np.round(_ai_pos_w,3)}",
                           flush=True)
-                _arm_converged = (_arm_err_now.max() < 0.02)   # ~1.1 deg threshold
-                _arm_timeout   = (state_step >= BUDGET[PipelineState.ARM_INIT])
-                if _arm_converged or _arm_timeout:
+                _arm_converged = (_arm_err_now.max() < 0.02)   # ~1.1 deg threshold   小于阈值，认为到达关节目标
+                _arm_timeout   = (state_step >= BUDGET[PipelineState.ARM_INIT])   # 超时
+                if _arm_converged or _arm_timeout:   # 阶段结束
                     _arm_final_err = _arm_err_now
                     _reason = "converged" if _arm_converged else "timeout"
                     _ai_done_pos_w = robot.data.root_pos_w[0].cpu().numpy()
@@ -792,20 +792,20 @@ def main():
             # ---- SCAN: warm camera, accumulate depth frames ----
             elif state == PipelineState.SCAN:
                 try:
-                    camera = raw_env.scene["wrist_camera"]
+                    camera = raw_env.scene["wrist_camera"]   # 获取名为 "wrist_camera" 的相机对象（手腕相机）
                     if state_step == 1:
-                        _scan_start_pos_w = robot.data.root_pos_w[0].cpu().numpy()
+                        _scan_start_pos_w = robot.data.root_pos_w[0].cpu().numpy()   # 记录机器人根坐标
                         print(f"[SM] SCAN: warmup {SCAN_WARMUP} + accumulate "
                               f"{SCAN_FRAMES} frames... base_pos_w={np.round(_scan_start_pos_w,3)}", flush=True)
                     if state_step == SCAN_WARMUP + 1:
                         # ---- Save RGB snapshot after warmup (first valid frame) ----
                         try:
                             from PIL import Image as _PIL_Image
-                            _arm_ids_snap, _ = _get_arm_ids(robot)
+                            _arm_ids_snap, _ = _get_arm_ids(robot)   # 获取手臂关节索引
                             _cur_q_snap = robot.data.joint_pos[
-                                0, list(_arm_ids_snap)].cpu().numpy()
+                                0, list(_arm_ids_snap)].cpu().numpy()   # 获取手臂关节角度
                             # joint indices: 0=j1,1=j2,2=j3,3=j4,4=j5,5=j6
-                            def _fmt(v):
+                            def _fmt(v):   # 记录SCAN_WARMUP结束时的手臂关节角度
                                 return f"{v:.2f}".replace("-", "n").replace(".", "p")
                             _snap_name = (
                                 f"j2_{_fmt(_cur_q_snap[1])}"
@@ -815,24 +815,24 @@ def main():
                             )
                             _snap_dir = "/home/mojie/taskdog/custom_envs/tmp_pictures"
                             os.makedirs(_snap_dir, exist_ok=True)
-                            _rgb_snap = camera.data.output["rgb"][0].cpu().numpy()[:, :, :3]
+                            _rgb_snap = camera.data.output["rgb"][0].cpu().numpy()[:, :, :3]   # 从相机输出中提取 RGB 图像（取第一张图，并保留前三个通道）
                             _PIL_Image.fromarray(_rgb_snap).save(
                                 os.path.join(_snap_dir, _snap_name))
                             print(f"[SCAN] Snapshot saved: {_snap_dir}/{_snap_name}",
                                   flush=True)
                         except Exception as _snap_e:
                             raise RuntimeError(f"[SCAN] Snapshot failed: {_snap_e}") from _snap_e
-                    if state_step > SCAN_WARMUP:
-                        d = camera.data.output["distance_to_image_plane"][0].cpu().numpy()
-                        if d.ndim == 3:
+                    if state_step > SCAN_WARMUP:   # 预热完毕
+                        d = camera.data.output["distance_to_image_plane"][0].cpu().numpy()   # 获取深度图
+                        if d.ndim == 3:   # 如果深度图是三维（宽×高×通道），取第一个通道（因为深度通常单通道）
                             d = d[:, :, 0]
-                        depth_accum.append(d.astype(np.float32))
-                        if scan_rgb is None:
+                        depth_accum.append(d.astype(np.float32))   #将深度图转换为 float32 并添加到累积列表 depth_accum 中
+                        if scan_rgb is None:   # 如果 scan_rgb 尚未赋值，则保存当前的 RGB 图像
                             scan_rgb = camera.data.output["rgb"][0].cpu().numpy()[:, :, :3]
                     if state_step >= SCAN_WARMUP + SCAN_FRAMES:
-                        depth_med = np.median(np.stack(depth_accum, axis=0), axis=0)
-                        valid_pct = np.mean((depth_med > 0.05) & (depth_med < 4.0)) * 100
-                        _scan_done_pos_w = robot.data.root_pos_w[0].cpu().numpy()
+                        depth_med = np.median(np.stack(depth_accum, axis=0), axis=0)   # 对累积的深度图堆叠成三维数组（帧数×高×宽），沿帧维度取中位数，得到 depth_med（单张深度图）
+                        valid_pct = np.mean((depth_med > 0.05) & (depth_med < 4.0)) * 100   # 计算有效深度像素比例：深度值在 0.05 到 4.0 米之间的像素占比（百分比）
+                        _scan_done_pos_w = robot.data.root_pos_w[0].cpu().numpy()   # 记录当前机器人位置并打印完成信息
                         print(f"[SM] SCAN done: {len(depth_accum)} frames, "
                               f"valid depth {valid_pct:.1f}% base_pos_w={np.round(_scan_done_pos_w,3)}", flush=True)
                         # ---- DIAG: 相机外参验证 (修正版) ----
@@ -840,21 +840,21 @@ def main():
                         #   camera.data.pos_w      — 相机在「env-local」坐标系中的位置
                         #                            （Isaac Lab 多环境下各 env 有偏移，env_0 原点通常≠世界原点）
                         #   camera.data.quat_w_ros — ROS convention 四元数：前轴=+Z，上轴=-Y
-                        #                            旋转矩阵第3列([:,2]) = 相机光轴方向（+Z=朝前/朝物体）
-                        #   camera.data.quat_w_world — World convention：前轴=+X，旋转矩阵[:,0]=光轴，不要用[:,2]
+                        #                            旋转矩阵第3列([:,2]) = 相机光轴方向（+Z=朝前/朝物体）。注：这个值是世界坐标系下的值
+                        #   camera.data.quat_w_world — World convention：前轴=+X，旋转矩阵[:,0]=光轴，不要用[:,2]。注：这个值是世界坐标系下的值
                         # 因此：
                         #   光轴应用 quat_w_ros → R[:,2]
                         #   位置对比需先获取 env_origins 补偿 env-local → world
                         try:
                             from arm_ik import cam_to_world as _c2w_scan
                             _cur_q_scan_diag = robot.data.joint_pos[
-                                0, list(_get_arm_ids(robot)[0])].cpu().numpy()
+                                0, list(_get_arm_ids(robot)[0])].cpu().numpy()   # 获取六个关节角度
 
                             # --- A) 代码计算的相机原点（全局世界坐标）---
                             _cam_orig_code = _c2w_scan(
                                 np.array([0.0, 0.0, 0.0]),
                                 _cur_q_scan_diag, pos_w, quat_w
-                            )
+                            )   # 计算出相机的世界坐标
 
                             # --- B) Isaac Lab 真值：pos_w 是 env-local，需加 env_origin 才是世界坐标 ---
                             _cam_pos_envlocal = camera.data.pos_w[0].cpu().numpy()  # env-local (3,)
@@ -863,21 +863,21 @@ def main():
                                 _env_origin = raw_env.scene.env_origins[0].cpu().numpy()  # (3,)
                             except Exception:
                                 _env_origin = np.zeros(3)
-                            _cam_pos_world_isaac = _cam_pos_envlocal + _env_origin
+                            _cam_pos_world_isaac = _cam_pos_envlocal + _env_origin   # 相机的世界位置 
 
                             _cam_pos_err = np.linalg.norm(_cam_orig_code - _cam_pos_world_isaac)
                             print(f"[DIAG-CAM] cur_q at SCAN      : {np.round(_cur_q_scan_diag, 4)}",
-                                  flush=True)
+                                  flush=True)   # 机械臂关节角
                             print(f"[DIAG-CAM] env_origin          : {np.round(_env_origin, 4)}",
-                                  flush=True)
+                                  flush=True)   # env原点偏移
                             print(f"[DIAG-CAM] Isaac cam env-local : {np.round(_cam_pos_envlocal, 4)}",
-                                  flush=True)
+                                  flush=True)   # 相机env-local坐标
                             print(f"[DIAG-CAM] Isaac cam world     : {np.round(_cam_pos_world_isaac, 4)}",
-                                  flush=True)
+                                  flush=True)   # 相机真实世界坐标
                             print(f"[DIAG-CAM] Code  cam world     : {np.round(_cam_orig_code, 4)}",
-                                  flush=True)
+                                  flush=True)   # 计算得到的世界坐标
                             print(f"[DIAG-CAM] Position error (code vs Isaac+origin) = {_cam_pos_err*100:.2f} cm",
-                                  flush=True)
+                                  flush=True)   # 计算得到的世界坐标与真实世界坐标的差距
 
                             # --- C) 光轴方向：用 quat_w_ros，ROS convention 下 R[:,2] = 光轴(+Z=朝前) ---
                             _quat_ros = camera.data.quat_w_ros[0].cpu().numpy()  # (w,x,y,z)
@@ -907,7 +907,7 @@ def main():
                                 _dist_cam_banana = np.linalg.norm(_cam_to_banana)
                                 _dir_cam_banana  = _cam_to_banana / (_dist_cam_banana + 1e-9)
                                 _cos_angle = float(np.dot(_optical_axis_ros, _dir_cam_banana))
-                                _angle_deg = float(np.degrees(np.arccos(np.clip(_cos_angle, -1, 1))))
+                                _angle_deg = float(np.degrees(np.arccos(np.clip(_cos_angle, -1, 1))))   # 计算光心-香蕉连线和光轴的夹角
                                 print(f"[DIAG-CAM] Banana world pos    : {np.round(_bp_diag, 4)}",
                                       flush=True)
                                 print(f"[DIAG-CAM] Cam -> Banana dir   : {np.round(_dir_cam_banana, 4)}",
@@ -927,8 +927,8 @@ def main():
                         # here before PRE_ADJUST changes j5 to 0.
                         _q_scan_at_scan = robot.data.joint_pos[
                             0, list(_get_arm_ids(robot)[0])
-                        ].cpu().numpy().copy()
-                        _pos_w_at_scan  = robot.data.root_pos_w[0].cpu().numpy().copy()
+                        ].cpu().numpy().copy()   # 保存SCAN时的机械臂关节角度
+                        _pos_w_at_scan  = robot.data.root_pos_w[0].cpu().numpy().copy()   # SCAN时的狗的位姿
                         _quat_w_at_scan = robot.data.root_quat_w[0].cpu().numpy().copy()
                         state = PipelineState.PRE_ADJUST
                         state_step = 0
@@ -942,7 +942,7 @@ def main():
             # requires j5≈-1.0 from that seed (jump≈2.2rad), which PD cannot track.
             # By first driving j5→0 (approach nearly vertical, appz≈-1), the subsequent
             # IK seed has j5≈0 and the solution jump is only ≈1.1rad — PD converges.
-            elif state == PipelineState.PRE_ADJUST:
+            elif state == PipelineState.PRE_ADJUST:   # 跳过该阶段
                 # Read current joint angles every step (CRITICAL: without this the
                 # command is computed from a stale cur_q and the joint never moves).
                 cur_q = robot.data.joint_pos[
@@ -979,28 +979,36 @@ def main():
             elif state == PipelineState.GRASP_PLAN:
                 import subprocess, sys as _sys
                 print("[SM] GRASP_PLAN: building point cloud...", flush=True)
-                depth_med = np.median(np.stack(depth_accum, axis=0), axis=0)
+                depth_med = np.median(np.stack(depth_accum, axis=0), axis=0)   # 将之前累积的 30 帧深度图叠在一起，取中值
                 H, W = depth_med.shape
-                fx_c, fy_c, cx_c, cy_c = 616.0, 616.0, W/2.0, H/2.0
-                u_g, v_g = np.meshgrid(np.arange(W), np.arange(H))
+                fx_c, fy_c, cx_c, cy_c = 616.0, 616.0, W/2.0, H/2.0   # 相机内参（焦距、光心）
+                u_g, v_g = np.meshgrid(np.arange(W), np.arange(H))   # 生成两个矩阵，分别代表图像中每个像素的 X 坐标 (u) 和 Y 坐标 (v)
                 z    = depth_med
                 mask = (z > 0.05) & (z < 4.0)
-                z_v  = z[mask]
+                z_v  = z[mask]   # 只保留深度在 0.05 米 到 4.0 米 之间的像素
                 pts  = np.stack([
                     (u_g[mask] - cx_c) * z_v / fx_c,
                     (v_g[mask] - cy_c) * z_v / fy_c,
                     z_v,
-                ], axis=-1).astype(np.float32)
+                ], axis=-1).astype(np.float32)   # 反投影计算，像素坐标->相机坐标，得到点云
                 rgb_u = scan_rgb if scan_rgb is not None else np.zeros((H,W,3), np.uint8)
-                cols  = (rgb_u[mask] / 255.0).astype(np.float32)
+                cols  = (rgb_u[mask] / 255.0).astype(np.float32)   # 利用同样的 mask，从 RGB 图像中提取对应像素的颜色，然后缩放到[0., 1.]
                 print(f"[SM] Point cloud raw: {len(pts)} pts "
                       f"(z min={z_v.min():.2f} max={z_v.max():.2f})", flush=True)
 
                 # ---- 删除主平面（桌面）via RANSAC ----
                 # 桌面是场景中面积最大的平面；RANSAC 拟合后删去内点，
                 # 只保留突出于桌面的物体点云。不依赖物体颜色，通用。
-                def _ransac_remove_plane(cloud, dist_thresh=0.008,
-                                        n_iter=150, min_inlier_ratio=0.15):
+                """
+                基本思想：
+                1、随机采样：每次随机从点云中挑出 3 个点。
+                2、拟合模型：3 个点确定一个平面。
+                3、统计一致性：计算点云中有多少个点距离这个平面非常近（这些点称为“内点” Inliers）。
+                4、迭代择优：重复上述步骤多次，保留内点数量最多的那个平面。
+                5、剔除：假设内点最多的平面就是桌面，将其剔除。
+                """                
+                def _ransac_remove_plane(cloud, dist_thresh=0.008,   # 距离阈值 8mm。如果一个点距离拟合平面的距离小于 8mm，就认为它属于这个平面
+                                        n_iter=150, min_inlier_ratio=0.15):   # 迭代 150 次，次数越多，找到正确平面的概率越大。如果找到的最大平面包含的点数不到总点数的 15%，说明场景中没有明显的平面（比如对着墙角），此时不剔除任何点。
                     N = len(cloud)
                     if N < 10:
                         return np.ones(N, dtype=bool)
@@ -1009,25 +1017,25 @@ def main():
                     best_info = [None, None]
                     rng = np.random.default_rng(42)
                     for _ in range(n_iter):
-                        idx = rng.choice(N, 3, replace=False)
+                        idx = rng.choice(N, 3, replace=False)   # 从 N 个点中随机抽取 3 个不重复的点
                         p1, p2, p3 = cloud[idx[0]], cloud[idx[1]], cloud[idx[2]]
-                        nv = np.cross(p2 - p1, p3 - p1)
+                        nv = np.cross(p2 - p1, p3 - p1)   # 利用向量叉乘 cross 计算平面的法向量 nv
                         nn = float(np.linalg.norm(nv))
                         if nn < 1e-8:
                             continue
-                        nv = nv / nn
-                        dv = float(nv @ p1)
-                        inlier = np.abs(cloud @ nv - dv) < dist_thresh
-                        ni = int(inlier.sum())
-                        if ni > best_n:
+                        nv = nv / nn   # nv / nn 将法向量长度变为 1
+                        dv = float(nv @ p1)   # 平面距离参数 dv（平面到相机光心的距离）
+                        inlier = np.abs(cloud @ nv - dv) < dist_thresh  # 点云中每个点到平面的距离，与阈值进行比较
+                        ni = int(inlier.sum())   # 距离小于阈值的点数
+                        if ni > best_n:   # 更新记录
                             best_n    = ni
                             best_mask = inlier
-                            best_info = [nv, dv]
-                    if best_n < int(N * min_inlier_ratio):
+                            best_info = [nv, dv]   # 记录该平面的法向量及它到相机光心的距离
+                    if best_n < int(N * min_inlier_ratio):   # 最大平面的点数占比太低，说明可能没有桌面，或者点云太稀疏，此时放弃剔除，保留所有点以防误删物体
                         print(f"[SM] RANSAC: no dominant plane "
                               f"(best={best_n}/{N}), keeping all.", flush=True)
                         return np.ones(N, dtype=bool)
-                    keep = ~best_mask
+                    keep = ~best_mask   # 要删除的点best_mask -> 要保留的点keep
                     pct  = best_n * 100 // N
                     print(f"[SM] RANSAC (info only) plane={best_n} pts ({pct}%), "
                           f"object pts={int(keep.sum())}. "
@@ -1037,20 +1045,21 @@ def main():
 
                 # ---- 颜色筛选桌面点云并保存（须在 RANSAC 之前，供穿桌检测使用）----
                 # 桌面为中性灰 RGB≈(80,80,80)：HSV 的 S<40，V 在 40~160
+                # 相机系 pts  →[相机安装变换]→  gripper_base系  →[FK]→  arm_base_link系  →[机器人位姿]→  世界系
                 import cv2 as _cv2_tb
-                _cols_u8_tb = (cols * 255).astype(np.uint8).reshape(1, -1, 3)
-                _hsv_tb = _cv2_tb.cvtColor(_cols_u8_tb, _cv2_tb.COLOR_RGB2HSV)[0]  # (N,3)
-                _table_mask_tb = (_hsv_tb[:, 1] < 40) & (_hsv_tb[:, 2] > 40) & (_hsv_tb[:, 2] < 160)
+                _cols_u8_tb = (cols * 255).astype(np.uint8).reshape(1, -1, 3)   # (N, 3) -> (1, N, 3)
+                _hsv_tb = _cv2_tb.cvtColor(_cols_u8_tb, _cv2_tb.COLOR_RGB2HSV)[0]  # rgb -> hsv，(N, 3)
+                _table_mask_tb = (_hsv_tb[:, 1] < 40) & (_hsv_tb[:, 2] > 40) & (_hsv_tb[:, 2] < 160)   # _hsv_tb[:, 1]是s饱和度，_hsv_tb[:, 2]是v明度。 (N, )
                 _pts_table_cam = pts[_table_mask_tb]  # 相机坐标系桌面点云
                 print(f'[SM] 桌面颜色点云: {len(_pts_table_cam)} pts', flush=True)
-                if len(_pts_table_cam) > 50:
-                    from arm_ik import fk_gripper as _fk_gb_tc, quat_to_rot as _q2r_tc, _CAM_OFFSET_POS as _cop_tc, _CAM_OFFSET_ROT as _cor_tc
-                    _R_rob_tc    = _q2r_tc(_quat_w_at_scan.astype(np.float64))
-                    _arm_base_tc = _pos_w_at_scan + _R_rob_tc @ np.array([0., 0., 0.0888])
-                    _T_gb_tc     = _fk_gb_tc(_q_scan_at_scan.astype(np.float64))
-                    _R_c2w_tc    = _R_rob_tc @ _T_gb_tc[:3, :3] @ _cor_tc
+                if len(_pts_table_cam) > 50:   # 桌面至少50个点
+                    from arm_ik import fk_gripper as _fk_gb_tc, quat_to_rot as _q2r_tc, _CAM_OFFSET_POS as _cop_tc, _CAM_OFFSET_ROT as _cor_tc   # gb在arm_base_link系的4*4变换矩阵，四元数->3*3旋转矩阵，相机偏移在gb系下([-0.05, 0, 0.06])，相机旋转（gb系下）
+                    _R_rob_tc    = _q2r_tc(_quat_w_at_scan.astype(np.float64))   # _quat_w_at_scan：SCAN 时机器人 base_link 在世界系的四元数 `[w,x,y,z]`，shape `(4,)`
+                    _arm_base_tc = _pos_w_at_scan + _R_rob_tc @ np.array([0., 0., 0.0888])   # _pos_w_at_scan：SCAN 时机器人 base_link 在世界坐标系的位置，shape `(3,)`   ->   _arm_base_tc：arm_base_link 在世界系的位置
+                    _T_gb_tc     = _fk_gb_tc(_q_scan_at_scan.astype(np.float64))   # _q_scan_at_scan：SCAN 时保存的机械臂 6 个关节角（joint1~6），numpy array shape `(6,)`
+                    _R_c2w_tc    = _R_rob_tc @ _T_gb_tc[:3, :3] @ _cor_tc   # 相机在世界坐标系下的旋转
                     _t_cam_tc    = _R_rob_tc @ (_T_gb_tc[:3, :3] @ _cop_tc + _T_gb_tc[:3, 3]) + _arm_base_tc
-                    _pts_table_world = (_pts_table_cam.astype(np.float64) @ _R_c2w_tc.T) + _t_cam_tc
+                    _pts_table_world = (_pts_table_cam.astype(np.float64) @ _R_c2w_tc.T) + _t_cam_tc   # 将桌面点云转换到世界坐标系下
                     np.savez('/tmp/table_cloud.npz',
                              points=_pts_table_world.astype(np.float32))
                     print(f'[SM] 桌面点云已保存 /tmp/table_cloud.npz（世界坐标系，{len(_pts_table_world)} pts）', flush=True)
@@ -1059,30 +1068,32 @@ def main():
                 # ---- END 桌面点云保存 ----
 
                 _keep_mask = _ransac_remove_plane(pts)  # True=保留(非桌面)
+                # 获取删去桌面点云的点云图和rgb图
                 pts  = pts[_keep_mask]
                 cols = cols[_keep_mask]
                 print(f"[SM] After plane removal: {len(pts)} pts sent to GraspNet", flush=True)
                 # ---- END RANSAC 去桌面 ----
 
-                if len(pts) < 200:
+                if len(pts) < 200:   # 点云太少 -> 转换出错或者香蕉不在视野范围内
                     print("[SM] Too few points — DONE.", flush=True)
                     state = PipelineState.DONE
                 else:
-                    np.savez("/tmp/pointcloud.npz", points=pts, colors=cols)
+                    np.savez("/tmp/pointcloud.npz", points=pts, colors=cols)   # 保存没有桌面的点云
                     worker = os.path.join(os.path.dirname(__file__), "grasp_worker.py")
-                    _topk_worker = 50
+                    _topk_worker = 50   # 找得分最高的50个候选
                     print(f"[SM] Running grasp_worker (topk={_topk_worker})...", flush=True)
                     res = subprocess.run(
-                        [_sys.executable, worker,
+                        [_sys.executable,   # 同一个python解释器路径/home/mojie/anaconda3/envs/env_isaaclab/bin/python3
+                         worker,
                          "--checkpoint", args.grasp_checkpoint,
                          "--topk", str(_topk_worker)],
-                        timeout=120,
-                    )
+                        timeout=120,   # 父进程（`navigate_to_goal.py`）阻塞等待子进程结束（`timeout=120` 秒超时）
+                    )   # 用子进程获取结果
                     if res.returncode != 0 or not os.path.exists("/tmp/grasp_result.npz"):
                         print("[SM] GraspNet failed — DONE.", flush=True)
                         state = PipelineState.DONE
                     else:
-                        gr = np.load("/tmp/grasp_result.npz")
+                        gr = np.load("/tmp/grasp_result.npz")   # 获取结果
                         if len(gr["scores"]) == 0:
                             print("[SM] No valid grasps — DONE.", flush=True)
                             state = PipelineState.DONE
@@ -1091,40 +1102,40 @@ def main():
                             _best_grasp_idx = 0  # 默认 fallback：最高分
                             try:
                                 import cv2 as _cv2_f
-                                if scan_rgb is not None:
+                                if scan_rgb is not None:   # 这里拿的是完整的rgb图
                                     _hsv_f = _cv2_f.cvtColor(scan_rgb, _cv2_f.COLOR_RGB2HSV)
                                     # H=[20,40] 黄色，S>80，V>80
                                     # 跑完 DIAG-HSV 后根据实际值调整此阈值
                                     _lower_b = np.array([20,  80,  80], dtype=np.uint8)
                                     _upper_b = np.array([40, 255, 255], dtype=np.uint8)
-                                    _banana_px = _cv2_f.inRange(_hsv_f, _lower_b, _upper_b)
-                                    _n_bpx = int(_banana_px.sum() // 255)
+                                    _banana_px = _cv2_f.inRange(_hsv_f, _lower_b, _upper_b)   # 在该hsv范围内的像素认定为香蕉像素
+                                    _n_bpx = int(_banana_px.sum() // 255)   # 香蕉像素数目
                                     print(f"[SM] 香蕉像素 mask: {_n_bpx} px "
                                           f"(H=[{_lower_b[0]},{_upper_b[0]}] "
                                           f"S>={_lower_b[1]} V>={_lower_b[2]})", flush=True)
                                     # RANSAC 后 pts 已缩小，不能再用图像坐标 mask 索引
                                     # 改为直接对 cols (已对应 RANSAC 后 pts) 做 HSV 过滤
-                                    _cols_u8 = (cols * 255).astype(np.uint8).reshape(1, -1, 3)
+                                    _cols_u8 = (cols * 255).astype(np.uint8).reshape(1, -1, 3)   # 这里用的是删去桌面后的rgb图
                                     _hsv_pts = _cv2_f.cvtColor(_cols_u8, _cv2_f.COLOR_RGB2HSV)[0]  # (N,3)
                                     _banana_in_cloud = (
                                         (_hsv_pts[:, 0] >= _lower_b[0]) & (_hsv_pts[:, 0] <= _upper_b[0]) &
                                         (_hsv_pts[:, 1] >= _lower_b[1]) & (_hsv_pts[:, 2] >= _lower_b[2])
                                     )
-                                    _banana_pts_cam  = pts[_banana_in_cloud]
+                                    _banana_pts_cam  = pts[_banana_in_cloud]   # 从删去桌面的点云图中找香蕉点
                                     print(f"[SM] 香蕉点云: {len(_banana_pts_cam)} pts", flush=True)
-                                    if len(_banana_pts_cam) >= 20:
+                                    if len(_banana_pts_cam) >= 20:   # 香蕉点至少20个
                                         from scipy.spatial import cKDTree as _KDTree
                                         _kd = _KDTree(_banana_pts_cam)
-                                        _trans_all = gr["translations"]
-                                        _dists_all, _ = _kd.query(_trans_all, k=1)
-                                        _bmask = _dists_all < 0.05
+                                        _trans_all = gr["translations"]   # 从候选抓取字典 gr 中获取所有抓取点的平移位置（3D 坐标）
+                                        _dists_all, _ = _kd.query(_trans_all, k=1)   # 对每个抓取点查询到香蕉点云中最近点的距离，返回距离数组（忽略最近点索引）
+                                        _bmask = _dists_all < 0.05   # 生成布尔掩码，标记距离小于 0.05 米（5 cm） 的抓取点，认为这些点落在香蕉表面
                                         _n_ok = int(_bmask.sum())
                                         print(f"[SM] 颜色过滤: {_n_ok}/{len(_trans_all)} 个抓取落在香蕉上", flush=True)
-                                        for _gi in range(min(len(_trans_all), 10)):
+                                        for _gi in range(min(len(_trans_all), 10)):  # 打印前 10 个抓取点的分数、最近距离（厘米）和平移坐标
                                             print(f"[SM]   [{_gi}] score={gr['scores'][_gi]:.3f} "
                                                   f"dist={_dists_all[_gi]*100:.1f}cm "
                                                   f"t={np.round(_trans_all[_gi],3)}", flush=True)
-                                        if _n_ok > 0:
+                                        if _n_ok > 0:   # 选择其中 索引最小 的（np.where 返回第一个 True 的索引）作为最佳抓取
                                             _best_grasp_idx = int(np.where(_bmask)[0][0])
                                             print(f"[SM] 颜色过滤选用 [{_best_grasp_idx}] "
                                                   f"score={gr['scores'][_best_grasp_idx]:.3f}", flush=True)
@@ -1141,6 +1152,7 @@ def main():
                             # Use the joint angles saved at SCAN time (j5=+1.2).
                             # PRE_ADJUST has already moved j5 to 0, so reading
                             # current joint_pos here would give wrong camera extrinsics.
+                            # SCAN时狗、机械臂的姿态
                             _q_scan_saved   = _q_scan_at_scan
                             _pos_w_scan_pre  = _pos_w_at_scan.copy()
                             _quat_w_scan_pre = _quat_w_at_scan.copy()
@@ -1156,11 +1168,11 @@ def main():
                                 fk_gripper as _fkg_pre,
                                 _IK_JOINT_LIMITS as _jlims_pre,
                                 compute_desired_ee_rot_in_arm as _cder,
-                            )
+                            )   # 导入逆运动学（IK）和正运动学（FK）所需的函数，用于后续计算机械臂能否到达目标位置
                             # _pos_w_scan_pre and _quat_w_scan_pre already set above
                             # from _pos_w_at_scan / _quat_w_at_scan (SCAN-time values).
-                            _banana_idxs_pre = list(np.where(_bmask)[0]) if '_bmask' in dir() and _bmask is not None else [_best_grasp_idx]
-                            if not _banana_idxs_pre:
+                            _banana_idxs_pre = list(np.where(_bmask)[0]) if '_bmask' in dir() and _bmask is not None else [_best_grasp_idx]   # 找出所有落在香蕉上的抓取位姿索引
+                            if not _banana_idxs_pre:   # 都不在香蕉上，就找一个评分最高的
                                 _banana_idxs_pre = [_best_grasp_idx]
                             # Pre-compute the fixed rotation: world <- arm_base_link <- gripper_base <- camera
                             # R_cam_to_world = R_robot @ R_gb_in_arm @ _CAM_OFFSET_ROT
@@ -1172,15 +1184,16 @@ def main():
                                 fk_gripper  as _fkg_scan,
                                 _CAM_OFFSET_ROT as _COR_scan,
                             )
-                            _R_rob_scan = _q2r_scan(_quat_w_scan_pre)
-                            _R_gb_scan  = _fkg_scan(_q_scan_saved)[:3, :3]
-                            _R_cam2world = _R_rob_scan @ _R_gb_scan @ _COR_scan
+                            _R_rob_scan = _q2r_scan(_quat_w_scan_pre)   # 将机器人root_base的四元数朝向转换为 3×3 旋转矩阵
+                            _R_gb_scan  = _fkg_scan(_q_scan_saved)[:3, :3]   # Arm Base -> Gripper Base 的旋转
+                            _R_cam2world = _R_rob_scan @ _R_gb_scan @ _COR_scan   # 相机坐标系在世界坐标系下的旋转
 
                             _ranked_pre = []  # list of (ik_ok, approach_z_abs, score, idx)
-                            for _ci_pre in _banana_idxs_pre:
-                                _t_ci  = gr["translations"][_ci_pre]
-                                _tw_ci = _ctw_pre(_t_ci, _q_scan_saved, _pos_w_scan_pre, _quat_w_scan_pre)
-                                _ta_ci = _w2a_pre(_tw_ci, _pos_w_scan_pre, _quat_w_scan_pre)
+                            for _ci_pre in _banana_idxs_pre:   # 遍历所有落在香蕉上的候选抓取
+                                # 注意：这里的ik求解只限制了目标位置，没有限制接近方向。所以这里只是预筛选。
+                                _t_ci  = gr["translations"][_ci_pre]   # 获取候选抓取中心点在相机坐标系下的位置
+                                _tw_ci = _ctw_pre(_t_ci, _q_scan_saved, _pos_w_scan_pre, _quat_w_scan_pre)   # 相机坐标系 -> 世界坐标系
+                                _ta_ci = _w2a_pre(_tw_ci, _pos_w_scan_pre, _quat_w_scan_pre)   # 世界坐标系 -> 机械臂基座坐标系
                                 try:
                                     # Use SCAN-time joint angles (j5=+1.2) as IK seed.
                                     # This finds IK solutions near the j5-positive branch,
@@ -1193,15 +1206,15 @@ def main():
                                     # FK err even for reachable targets). j2 > 2.8 rad (within
                                     # 0.34 rad of π) reliably indicates the j2=π singular config.
                                     _j2_val = float(_q_pre[1])  # joint2 angle
-                                    _ik_ok_pre = (_j2_val < 2.8)
+                                    _ik_ok_pre = (_j2_val < 2.8)   # 这里限制j2的突变
                                 except Exception:
                                     _ik_ok_pre = False
                                 # approach 轴在世界坐标系的方向：R_cam[:,0] 是 AnyGrasp approach 轴。
                                 # approach_world[2] 越负 = approach 越朝下 = 越接近从上方垂直抓取。
                                 # 这是排序的核心指标：负值越大越优先。
                                 _R_cam_ci = gr["rotations"][_ci_pre]  # (3,3) rotation matrix
-                                _approach_world_ci = _R_cam2world @ _R_cam_ci[:, 0]
-                                _approach_z_abs_ci = float(abs(_approach_world_ci[2]))  # 保留兼容
+                                _approach_world_ci = _R_cam2world @ _R_cam_ci[:, 0]   # 这些候选解的旋转（世界坐标）
+                                _approach_z_abs_ci = float(abs(_approach_world_ci[2]))  # 向下分量的绝对值
                                 _approach_z_ci = float(_approach_world_ci[2])           # 负值=approach朝下
                                 _ranked_pre.append((_ik_ok_pre, _approach_z_abs_ci, float(gr["scores"][_ci_pre]), _ci_pre, _approach_z_ci))
                             # Sort: IK-feasible first, then by approach_world_z ascending (most
@@ -1210,12 +1223,11 @@ def main():
                             # FIX: previously used R_cam[:,2] (binormal axis) as "fingertip" direction,
                             # which has no physical meaning for top-down grasp selection.
                             # Now correctly use R_cam[:,0] (approach axis) world-z component.
-                            _ranked_pre.sort(key=lambda x: (-int(x[0]), x[4], -x[2]))
-                            _ranked_idxs = [x[3] for x in _ranked_pre]
+                            _ranked_pre.sort(key=lambda x: (-int(x[0]), x[4], -x[2]))   # 排序是按照数值从小到大，所以有的加负号
+                            _ranked_idxs = [x[3] for x in _ranked_pre]   # 竖直优先
                             print(f"[SM] 候选排序({len(_ranked_idxs)}个,IK预筛,按approach朝下优先): "
                                   + " ".join(f"[{r[3]}]{'✓' if r[0] else '✗'}s={r[2]:.2f}az={r[4]:.2f}"
-                                             for r in _ranked_pre[:6]),
-                                  flush=True)
+                                             for r in _ranked_pre[:6]), flush=True)   # 序号，是否ik ok，score，approach轴z分量
                             # DIAG: 打印所有候选的 approach 世界 Z 分量
                             print(f"[DIAG-APPROACH] 所有{len(_ranked_pre)}个香蕉候选的approach_world_z (负值=朝下=从上往下抓):", flush=True)
                             for _r in _ranked_pre:
@@ -1223,8 +1235,8 @@ def main():
                                 print(f"  [{_r[3]}] score={_r[2]:.3f} approach_z={_r[4]:.3f} {_az_label} ik={'✓' if _r[0] else '✗'}", flush=True)
                             # ---- END IK pre-screening ----
 
-                            _best_grasp_idx = _ranked_idxs[0]
-                            _R_desired = _cder(gr["rotations"][_best_grasp_idx], _q_scan_saved)
+                            _best_grasp_idx = _ranked_idxs[0]   # 最优抓取，默认为最竖直的
+                            _R_desired = _cder(gr["rotations"][_best_grasp_idx], _q_scan_saved)   # 目标旋转（arm_base_link下j7）
                             grasp_result = {
                                 "t_cam": gr["translations"][_best_grasp_idx],
                                 "R_cam": gr["rotations"][_best_grasp_idx],
@@ -1256,17 +1268,17 @@ def main():
                                     0, list(_get_arm_ids(robot)[0])].cpu().numpy()
                                 _t_c = grasp_result["t_cam"]
                                 _R_c = grasp_result["R_cam"]
-                                _R_rob = _q2r(quat_w)
+                                _R_rob = _q2r(quat_w)   # robot base link的旋转
                                 # BUG FIX: use q_scan (SCAN-time joints) for cam_to_world
                                 _q_scan_d = grasp_result["q_scan"]
                                 # FIX: use fk_gripper (gripper_base frame) not fk (joint7 frame)
                                 # fk()[:3,:3] is joint7 frame (Rx+90 from gripper_base),
                                 # giving wrong camera world orientation (Frobenius diff=2.0)
                                 _T_fk  = _fkg(_q_scan_d)
-                                _R_cw  = _R_rob @ _T_fk[:3, :3] @ _COR
-                                _app_w = _R_cw @ _R_c[:, 0]
-                                _clo_w = _R_cw @ _R_c[:, 1]
-                                _t_obj_w = _c2w(_t_c, _q_scan_d, pos_w, quat_w)
+                                _R_cw  = _R_rob @ _T_fk[:3, :3] @ _COR   # 相机世界坐标
+                                _app_w = _R_cw @ _R_c[:, 0]   # approach轴的世界坐标方向
+                                _clo_w = _R_cw @ _R_c[:, 1]   # closing轴的世界坐标方向
+                                _t_obj_w = _c2w(_t_c, _q_scan_d, pos_w, quat_w)   # 目标点的世界坐标
                                 print(f"[DIAG] t_cam={np.round(_t_c,4)}  depth={_t_c[2]:.3f}m", flush=True)
                                 print(f"[DIAG] t_obj_world={np.round(_t_obj_w,4)}  z={_t_obj_w[2]:.3f}m"
                                       f" (tabletop expect ~0.70m)", flush=True)
@@ -1320,28 +1332,28 @@ def main():
                             # flip the grasp frame (negate X and Y columns) so the gripper
                             # comes from above. Note: this preserves the closing direction
                             # (Z column) but reverses approach + binormal.
-                            _approach_world_z = float(_app_w[2])
-                            if _approach_world_z > 0.0:
+                            _approach_world_z = float(_app_w[2])   # approach轴z分量
+                            if _approach_world_z > 0.0:   # 往上抓
                                 print(f"[WARN] approach_world[2]={_approach_world_z:.3f} > 0 "
                                       f"(upward approach detected). Flipping grasp frame.",
                                       flush=True)
                                 # Flip columns 0 and 1 of R_cam (approach and binormal),
                                 # keeping column 2 (closing axis) to form a valid right-hand frame.
                                 _R_flipped = grasp_result["R_cam"].copy()
-                                _R_flipped[:, 0] = -_R_flipped[:, 0]
+                                _R_flipped[:, 0] = -_R_flipped[:, 0]   # 强制改为往下抓
                                 _R_flipped[:, 1] = -_R_flipped[:, 1]
                                 # Recompute R_desired with flipped rotation
                                 from arm_ik import compute_desired_ee_rot_in_arm as _cder2
                                 grasp_result["R_cam"] = _R_flipped
                                 grasp_result["R_desired_EE_in_arm"] = _cder2(
                                     _R_flipped, grasp_result["q_scan"]
-                                )
+                                )   # 重新计算j7 in arm_base
                                 # Verify flip resolved the issue
                                 _R_rob_flip = _q2r(quat_w)
                                 # FIX: use fk_gripper (gripper_base frame) for correct camera orientation
                                 _T_fk_flip  = _fkg(grasp_result["q_scan"])
                                 _R_cw_flip  = _R_rob_flip @ _T_fk_flip[:3, :3] @ _COR
-                                _app_w_flip = _R_cw_flip @ _R_flipped[:, 0]
+                                _app_w_flip = _R_cw_flip @ _R_flipped[:, 0]   # 翻转后的approach z轴
                                 print(f"[WARN] After flip: approach_world={np.round(_app_w_flip,3)}"
                                       f" z={_app_w_flip[2]:.3f} (should be < 0)", flush=True)
                             else:
@@ -1355,7 +1367,7 @@ def main():
             elif state == PipelineState.PRE_GRASP:
                 from arm_ik import solve_for_gripper_base as ik_solve_gb, cam_to_world, world_pos_to_arm_frame, _IK_JOINT_LIMITS
                 if state_step == 1:
-                    t_cam = grasp_result["t_cam"]
+                    t_cam = grasp_result["t_cam"]   # 最优解的信息
                     R_cam = grasp_result["R_cam"]
                     width = grasp_result["width"]
                     cur_q = robot.data.joint_pos[
@@ -1368,9 +1380,9 @@ def main():
                     # cur_q (current joints at PRE_GRASP step=1, arm already moving).
                     # DRIFT FIX: use pos_w_scan/quat_w_scan (robot pose at SCAN time).
                     t_world = cam_to_world(t_cam, grasp_result["q_scan"],
-                                           grasp_result["pos_w_scan"], grasp_result["quat_w_scan"])
+                                           grasp_result["pos_w_scan"], grasp_result["quat_w_scan"])   # 抓取点世界坐标
                     _pg_t_world_fixed = t_world.copy()
-                    pre_t = world_pos_to_arm_frame(t_world, pos_w, quat_w)
+                    pre_t = world_pos_to_arm_frame(t_world, pos_w, quat_w)   # 世界坐标 -> arm_base_link坐标
                     # ---- GRIPPER OFFSET CORRECTION ----
                     # AnyGrasp translation = gripper_base WRIST ORIGIN (not finger-tip midpoint).
                     # cam_to_world / world_pos_to_arm_frame converts it to arm frame as pre_t.
@@ -1390,8 +1402,8 @@ def main():
                     #   _CAM_OFFSET_ROT  : 相机系 -> gripper_base 系（物理安装旋转）
                     #   R_cam[:,0]       : AnyGrasp approach 方向（相机系，朝向香蕉）
                     from arm_ik import _CAM_OFFSET_ROT as _COR_ap, fk_gripper as _fkg_ap
-                    _R_gb_scan_ap    = _fkg_ap(grasp_result["q_scan"])[:3, :3]
-                    _approach_arm_pg = _R_gb_scan_ap @ _COR_ap @ grasp_result["R_cam"][:, 0]
+                    _R_gb_scan_ap    = _fkg_ap(grasp_result["q_scan"])[:3, :3]   # gb的旋转矩阵
+                    _approach_arm_pg = _R_gb_scan_ap @ _COR_ap @ grasp_result["R_cam"][:, 0]   # 光轴方向
                     R_desired_EE = grasp_result["R_desired_EE_in_arm"]  # R_j7_desired
                     # FIX: AnyGrasp t = finger root midpoint (joint7/8 origin), 0.1358m along
                     # gripper_base +Z from gripper_base origin (URDF joint7 xyz=(0,0,0.1358)).
@@ -1399,7 +1411,7 @@ def main():
                     # approach axis so that after IK converges, finger root midpoint lands on t.
                     _J7_OFFSET    = 0.16  # gripper_base -> finger root midpoint (URDF joint7 z)
                     _GRASP_CLEARANCE = 0.0  # extra safety margin (m)
-                    pre_t_gb = pre_t - (_J7_OFFSET + _GRASP_CLEARANCE) * _approach_arm_pg
+                    pre_t_gb = pre_t - (_J7_OFFSET + _GRASP_CLEARANCE) * _approach_arm_pg   # PRE_GRASP阶段gb的目标位置
                     _pre_t_dist = float(np.linalg.norm(pre_t_gb))
                     print(f"[INFO] PRE_GRASP t_arm dist={_pre_t_dist*100:.1f}cm "
                           f"(gripper_base target, offset {(_J7_OFFSET+_GRASP_CLEARANCE)*100:.0f}cm back from grasp center)",
@@ -1411,23 +1423,23 @@ def main():
                     # uses j6 alone to analytically correct any closing-axis residual
                     # left by roll_search (e.g. if roll_search picked a ~90-deg-off solution).
                     target_angles_arm = ik_solve_gb(
-                        pre_t_gb,
-                        target_rot_j7=R_desired_EE,
+                        pre_t_gb,   # gb目标位置
+                        target_rot_j7=R_desired_EE,   # R_j7不变
                         initial_angles=grasp_result["q_scan"],
                     )
                     # ---- DIAG: IK quality check ----
                     from arm_ik import fk_gripper as _fk_pg, cam_to_world as _c2w_pg, world_pos_to_arm_frame as _w2a_pg, _IK_JOINT_LIMITS as _jlims_pg
-                    _ik_fail = target_angles_arm is None
-                    if not _ik_fail:
-                        _T_ik = _fk_pg(target_angles_arm)
+                    _ik_fail = target_angles_arm is None   # 最优解没找到ik解
+                    if not _ik_fail:   # 找到ik解
+                        _T_ik = _fk_pg(target_angles_arm)   # fk求gb的旋转
                         _ee_arm_ik = _T_ik[:3, 3]  # gripper_base position from FK
                         # Check against pre_t_gb (gripper_base target), not pre_t (grasp center)
-                        _ik_pos_err = float(np.linalg.norm(_ee_arm_ik - pre_t_gb))
+                        _ik_pos_err = float(np.linalg.norm(_ee_arm_ik - pre_t_gb))   # 位置误差
                         _ik_at_lim = any(
                             abs(float(_qi) - _lo) < 0.01 or abs(float(_qi) - _hi) < 0.01
                             for _qi, (_lo, _hi) in zip(target_angles_arm, _jlims_pg)
-                        )
-                        _ik_status = "✓ OK" if (_ik_pos_err < 0.03 and not _ik_at_lim) else "✗ FAIL"
+                        )   # 目标角度是否几乎限位
+                        _ik_status = "✓ OK" if (_ik_pos_err < 0.03 and not _ik_at_lim) else "✗ FAIL"   # ik成功 条件：位置误差够小且ik不在限位附近
                         _ik_fail = (_ik_status == "✗ FAIL")
                         print(f"[DIAG] PRE_GRASP IK FK check: "
                               f"grasp_center_arm={np.round(pre_t,4)} "
@@ -1441,18 +1453,18 @@ def main():
                                 _tc_data = np.load('/tmp/table_cloud.npz')
                                 _pts_tbl = _tc_data['points'].astype(np.float64)  # 世界坐标系
                                 from arm_ik import fk_gripper as _fk_gb_tb, quat_to_rot as _q2r_tb3
-                                _R_rob_tb3    = _q2r_tb3(grasp_result['quat_w_scan'].astype(np.float64))
-                                _arm_base_tb3 = grasp_result['pos_w_scan'] + _R_rob_tb3 @ np.array([0., 0., 0.0888])
+                                _R_rob_tb3    = _q2r_tb3(grasp_result['quat_w_scan'].astype(np.float64))   # gb在arm_base_link下的旋转
+                                _arm_base_tb3 = grasp_result['pos_w_scan'] + _R_rob_tb3 @ np.array([0., 0., 0.0888])   # arm base世界坐标
                                 # 用 gripper_base 原点做穿桌检测（fk_gripper 返回 gripper_base，比 fk/joint7 更靠近手指端）
                                 _T_gb_tb  = _fk_gb_tb(target_angles_arm.astype(np.float64))
-                                _p_tip_w  = _R_rob_tb3 @ _T_gb_tb[:3, 3] + _arm_base_tb3
+                                _p_tip_w  = _R_rob_tb3 @ _T_gb_tb[:3, 3] + _arm_base_tb3   # gb世界坐标
                                 _RADIUS_TB = 0.03   # XY 邻域半径 3cm
                                 _SAFETY_TB = 0.01   # 安全余量 1cm
-                                _xy_dist_tb = np.linalg.norm(_pts_tbl[:, :2] - _p_tip_w[:2], axis=1)
+                                _xy_dist_tb = np.linalg.norm(_pts_tbl[:, :2] - _p_tip_w[:2], axis=1)   # gb附近的桌面点  
                                 _nearby_tb  = _pts_tbl[_xy_dist_tb < _RADIUS_TB]
                                 if len(_nearby_tb) >= 5:
-                                    _local_tbl_z = float(_nearby_tb[:, 2].max())
-                                    _tip_penetrate = _p_tip_w[2] < _local_tbl_z + _SAFETY_TB
+                                    _local_tbl_z = float(_nearby_tb[:, 2].max())   # 找gb附近桌面点中最高的
+                                    _tip_penetrate = _p_tip_w[2] < _local_tbl_z + _SAFETY_TB   # 穿桌判据：gb比桌面点中的z max + _SAFETY_TB低
                                     print(f'[DIAG] PRE_GRASP 穿桌检测: '
                                           f'tip_z={_p_tip_w[2]:.4f}m '
                                           f'local_table_z={_local_tbl_z:.4f}m '
@@ -1465,15 +1477,15 @@ def main():
                                     print(f'[DIAG] PRE_GRASP 穿桌检测: 邻域内桌面点过少({len(_nearby_tb)} pts)，跳过', flush=True)
                             except Exception as _e_tb:
                                 print(f'[WARN] 穿桌检测异常: {_e_tb}', flush=True)
-                    else:
+                    else:   # 没找到ik解
                         print("[DIAG] PRE_GRASP IK returned None (j2=π singular) -> try next candidate",
                               flush=True)
                     # ---- IK FAIL: switch to next ranked candidate ----
-                    if _ik_fail:
-                        _cand_list = grasp_result.get("ranked_candidate_idxs", [])
+                    if _ik_fail:   # 没找到ik解
+                        _cand_list = grasp_result.get("ranked_candidate_idxs", [])   # 按照竖直程度排序
                         _tried     = grasp_result.get("tried_set", set())
                         _next_ci   = next((i for i in _cand_list if i not in _tried), None)
-                        if _next_ci is None:
+                        if _next_ci is None:   # 所有的候选解都无ik解
                             print("[WARN] PRE_GRASP: all ranked candidates IK-failed -> ARM_INIT",
                                   flush=True)
                             grasp_result = None; depth_accum.clear(); scan_rgb = None
@@ -1492,9 +1504,10 @@ def main():
                               f"score={grasp_result['score']:.3f}", flush=True)
                         state_step = 0; continue  # re-run step=1 with new candidate
                     # IK OK: save and proceed
-                    grasp_result["target_angles_pre"] = target_angles_arm.copy()
-                    grasp_result["pre_t_gb_arm"]      = pre_t_gb.copy()
-                    grasp_result["approach_arm"]      = _approach_arm_pg.copy()
+                    # 保存当前ik解
+                    grasp_result["target_angles_pre"] = target_angles_arm.copy()   # 解得各关节角度
+                    grasp_result["pre_t_gb_arm"]      = pre_t_gb.copy()   # gb目标位置
+                    grasp_result["approach_arm"]      = _approach_arm_pg.copy()   # 光轴方向
                     print(f"[SM] PRE_GRASP t_cam={np.round(t_cam,3)} (direct, no retreat)", flush=True)
                     print(f"[SM] PRE_GRASP t_world={np.round(t_world,3)}", flush=True)
                     print(f"[SM] PRE_GRASP t_arm={np.round(pre_t,3)} IK={np.round(target_angles_arm,3)}", flush=True)
@@ -1503,7 +1516,7 @@ def main():
                     # BUG FIX: use SCAN-time pos_w_scan/quat_w_scan (not current pos_w/quat_w)
                     # to correctly reconstruct where the AnyGrasp point lies in world frame.
                     _t_obj_world_pg = _c2w_pg(t_cam, grasp_result["q_scan"],
-                                              grasp_result["pos_w_scan"], grasp_result["quat_w_scan"])
+                                              grasp_result["pos_w_scan"], grasp_result["quat_w_scan"])   # 目标点世界位置
                     print(f"[DIAG] PRE_GRASP object world pos={np.round(_t_obj_world_pg,4)}"
                           f" (z={_t_obj_world_pg[2]:.3f}m)", flush=True)
                     print(f"[DIAG] PRE_GRASP target world pos={np.round(t_world,4)}"
@@ -1513,8 +1526,8 @@ def main():
                     _R_rob_pg = _q2r_pg(quat_w)
                     # FIX: use fk_gripper (gripper_base frame) for correct camera world rotation
                     _T_fk_pg  = _fk_pg(grasp_result["q_scan"])
-                    _R_cw_pg  = _R_rob_pg @ _T_fk_pg[:3, :3] @ _COR_pg
-                    _app_w_pg = _R_cw_pg @ R_cam[:, 0]
+                    _R_cw_pg  = _R_rob_pg @ _T_fk_pg[:3, :3] @ _COR_pg   # 相机世界旋转
+                    _app_w_pg = _R_cw_pg @ R_cam[:, 0]   # 光轴世界方向
                     print(f"[DIAG] PRE_GRASP approach world={np.round(_app_w_pg,3)}"
                           f" (expect to point FROM cam TOWARD object)", flush=True)
                     print(f"[DIAG] PRE_GRASP retreat world dir={np.round(-_app_w_pg,3)}"
@@ -1526,9 +1539,9 @@ def main():
                     print(f"[DIAG] PRE_GRASP gripper_base IK target world={np.round(_pg_t_gb_world_fixed,4)}"
                           f" (= t_world - 13.58cm along approach)", flush=True)
                     # Record initial joint angles for feed-forward interpolation
-                    _pg_q_init = cur_q.copy()
+                    _pg_q_init = cur_q.copy()   # 现在机械臂各关节角度
                     # Initialise fixed IK target (held constant for all PRE_GRASP steps)
-                    _pg_target_cur = target_angles_arm.copy()
+                    _pg_target_cur = target_angles_arm.copy()   # 目标关节角度
                     # ---- ALL-JOINT RATE-LIMITED COMMAND INTEGRATOR ----
                     # Instead of sending the full IK target every step (DIRECT TARGET),
                     # we ramp each joint command toward the target at a limited rate.
@@ -1560,17 +1573,17 @@ def main():
                 # regardless of where the actual joint ended up (Coriolis disturbance).
                 for _ji in range(6):
                     _pg_cmd[_ji] += float(np.clip(
-                        _pg_target_cur[_ji] - _pg_cmd[_ji],
+                        _pg_target_cur[_ji] - _pg_cmd[_ji],   # 目标关节角度到当前理论角度的差距
                         -_PG_MAX_DELTA[_ji],
                         +_PG_MAX_DELTA[_ji],
-                    ))
+                    ))   # 限制每个step的变化幅度
                 _pg_cmd = np.clip(_pg_cmd,
                                   [lo for lo, hi in _IK_JOINT_LIMITS],
-                                  [hi for lo, hi in _IK_JOINT_LIMITS])
+                                  [hi for lo, hi in _IK_JOINT_LIMITS])   # 位限
                 q6 = _pg_cmd.copy()
-                _arm_step(robot, q6)
-                _gripper_width_step(robot, grasp_result["width"])
-                if state_step % 50 == 0:
+                _arm_step(robot, q6)   # 驱动机械臂，相当于这里的目标角度受限
+                _gripper_width_step(robot, grasp_result["width"])   # 这里把width也考虑进去了，感觉这里可以直接先继续OPEN
+                if state_step % 50 == 0:   # 每50步打印进度
                     _err = np.abs(cur_q - _pg_target_cur)
                     _pg_step_pos_w = robot.data.root_pos_w[0].cpu().numpy()
                     print(f"[SM] PRE_GRASP step {state_step}/{BUDGET[PipelineState.PRE_GRASP]}: "
@@ -1580,7 +1593,7 @@ def main():
                 # waiting the full budget and move directly to REACH.
                 _pg_cur_q_check = robot.data.joint_pos[
                     0, list(_get_arm_ids(robot)[0])].cpu().numpy()
-                _pg_err_check = np.abs(_pg_cur_q_check - _pg_target_cur)
+                _pg_err_check = np.abs(_pg_cur_q_check - _pg_target_cur)   # 基本到达目标，阶段结束
                 _pg_early_exit = (state_step > 150 and _pg_err_check.max() < 0.05)  # 150 min steps for longer direct travel
                 if _pg_early_exit and state_step % 50 != 0:  # avoid double-print
                     _pg_exit_pos_w = robot.data.root_pos_w[0].cpu().numpy()
@@ -1588,7 +1601,7 @@ def main():
                           f"max_err={_pg_err_check.max():.4f} rad < 0.05 -> REACH "
                           f"base_pos_w={np.round(_pg_exit_pos_w,3)}",
                           flush=True)
-                if state_step >= BUDGET[PipelineState.PRE_GRASP] or _pg_early_exit:
+                if state_step >= BUDGET[PipelineState.PRE_GRASP] or _pg_early_exit:   # 阶段结束
                     cur_q_final = robot.data.joint_pos[
                         0, list(_get_arm_ids(robot)[0])].cpu().numpy()
                     _pg_done_pos_w = robot.data.root_pos_w[0].cpu().numpy()
@@ -1687,13 +1700,13 @@ def main():
                 if state_step == 1:
                     cur_q = robot.data.joint_pos[
                         0, list(_get_arm_ids(robot)[0])
-                    ].cpu().numpy()
+                    ].cpu().numpy()   # 当前各关节角度
                     # R_gb_desired: convert joint7-frame target to gripper_base frame
                     R_gb_desired_or = grasp_result["R_desired_EE_in_arm"] @ _RXN90_or
-                    j6_target = extract_j6_angle(cur_q, R_gb_desired_or)
+                    j6_target = extract_j6_angle(cur_q, R_gb_desired_or)   # j6目标角度
                     # Fixed base config: j1-j5 held at PRE_GRASP IK solution (target, not actual)
                     # to avoid drifting from actual position being used as target each step.
-                    _orient_q_fixed = grasp_result["target_angles_pre"].copy()
+                    _orient_q_fixed = grasp_result["target_angles_pre"].copy()   # 目标角度
                     _orient_j6_start = float(cur_q[5])   # j6 actual value at ORIENT entry
                     print(f"[SM] ORIENT j6_target={j6_target:.4f} rad ({math.degrees(j6_target):.1f} deg), "
                           f"j6_start={_orient_j6_start:.4f} rad", flush=True)
@@ -1707,15 +1720,15 @@ def main():
                 ].cpu().numpy()
                 # j1-j5: fixed at PRE_GRASP IK target (prevents drift from using actual pos as target)
                 # j6: linearly interpolated from start to j6_target
-                q_cmd = _orient_q_fixed.copy()
-                q_cmd[5] = j6_target
+                q_cmd = _orient_q_fixed.copy()   # 其他joint保持原命令
+                q_cmd[5] = j6_target   # j6 target单独设置
                 _arm_step(robot, q_cmd)
                 _gripper_width_step(robot, grasp_result["width"])
                 if state_step % 50 == 0:
                     j6_err = abs(cur_q[5] - j6_target)
                     print(f"[SM] ORIENT step {state_step}/{BUDGET[PipelineState.ORIENT]}: "
                           f"j6_err={j6_err:.4f} rad", flush=True)
-                if state_step >= BUDGET[PipelineState.ORIENT]:
+                if state_step >= BUDGET[PipelineState.ORIENT]:   # 仅当步数到达budget时结束本阶段
                     cur_q_final = robot.data.joint_pos[
                         0, list(_get_arm_ids(robot)[0])].cpu().numpy()
                     print(f"[SM] ORIENT done: j6={cur_q_final[5]:.4f} (target={j6_target:.4f}) -> REACH",
@@ -1736,21 +1749,21 @@ def main():
                 if state_step == 1:
                     cur_q = robot.data.joint_pos[
                         0, list(_get_arm_ids(robot)[0])
-                    ].cpu().numpy()
+                    ].cpu().numpy()   # 现在的角度
                     # REACH target: advance 6cm along approach axis from PRE_GRASP gripper_base position.
                     # pre_t_gb_arm is the gripper_base IK target used by PRE_GRASP (arm frame).
                     # approach_arm is the unit approach vector computed at PRE_GRASP time (arm frame).
                     # Both are stored in grasp_result by PRE_GRASP step=1.
-                    REACH_ADVANCE = 0.06   # m: advance along approach toward object
+                    REACH_ADVANCE = 0.06   # m: advance along approach toward object   夹爪继续向前的距离
                     _re_pre_t_gb  = grasp_result["pre_t_gb_arm"]   # (3,) arm frame
                     _re_approach  = grasp_result["approach_arm"]    # (3,) arm frame unit vector
-                    _re_t_gb_arm  = _re_pre_t_gb + REACH_ADVANCE * _re_approach
+                    _re_t_gb_arm  = _re_pre_t_gb + REACH_ADVANCE * _re_approach   # 新目标
                     # Keep the same orientation constraint as PRE_GRASP (closing guard now applied).
                     R_arm = grasp_result["R_desired_EE_in_arm"]
                     # IK: warm-start from PRE_GRASP end config to avoid large joint jumps.
                     target_angles_arm = ik_solve_gb_re(
                         _re_t_gb_arm,
-                        target_rot_j7=R_arm,
+                        target_rot_j7=R_arm,   # 旋转目标依然不变
                         initial_angles=grasp_result["target_angles_pre"],
                     )
                     # Sanity check: reject IK solution if any joint jumped too far from PRE_GRASP end.
@@ -1758,7 +1771,7 @@ def main():
                     # ---- DIAG: jump check ----
                     print(f"[DIAG] REACH jump check: per_joint={np.round(_re_q_jump*57.3,1)} deg"
                           f"  max={_re_q_jump.max()*57.3:.1f}deg  threshold=28.6deg", flush=True)
-                    if _re_q_jump.max() > 0.5:   # > ~28 deg
+                    if _re_q_jump.max() > 0.5:   # > ~28 deg   跳变太大，则目标位置和目标角度依然不变（夹爪不往前伸）
                         print(f"[WARN] REACH IK jump too large ({_re_q_jump.max()*57.3:.1f} deg) "
                               f"-> fallback to PRE_GRASP solution (stay in place)", flush=True)
                         print(f"[DIAG] REACH jump check -> FALLBACK: pre_q={np.round(grasp_result['target_angles_pre'],3)}",
@@ -1770,10 +1783,10 @@ def main():
                     # World-frame target (for DIAG and convergence check).
                     from arm_ik import quat_to_rot as _q2r_re, fk_gripper as _fkg_re
                     _R_rob_re = _q2r_re(quat_w)
-                    _arm_base_re = pos_w + _R_rob_re @ np.array([0., 0., 0.0888])
-                    _re_t_world_fixed = _R_rob_re @ _re_t_gb_arm + _arm_base_re
+                    _arm_base_re = pos_w + _R_rob_re @ np.array([0., 0., 0.0888])   # arm base世界坐标
+                    _re_t_world_fixed = _R_rob_re @ _re_t_gb_arm + _arm_base_re   # 目标的世界坐标
                     # Initialise fixed IK target (held constant for all REACH steps)
-                    _re_target_cur = target_angles_arm.copy()
+                    _re_target_cur = target_angles_arm.copy()     # 各关节目标角度
                     # ---- DIAG: REACH IK quality check ----
                     from arm_ik import _IK_JOINT_LIMITS as _jlims_re
                     _T_re_diag = _fkg_re(target_angles_arm)
@@ -1782,8 +1795,8 @@ def main():
                     _re_at_lim = any(
                         abs(float(_qi) - _lo) < 0.01 or abs(float(_qi) - _hi) < 0.01
                         for _qi, (_lo, _hi) in zip(target_angles_arm, _jlims_re)
-                    )
-                    _re_status = "✓ OK" if (_re_pos_err < 0.03 and not _re_at_lim) else "✗ FAIL"
+                    )   # 限位检测
+                    _re_status = "✓ OK" if (_re_pos_err < 0.03 and not _re_at_lim) else "✗ FAIL"   # 判断ik是否合理
                     print(f"[SM] REACH: advance {REACH_ADVANCE*100:.0f}cm along approach axis", flush=True)
                     print(f"[SM] REACH pre_t_gb(arm)={np.round(_re_pre_t_gb,3)}"
                           f"  target_gb(arm)={np.round(_re_t_gb_arm,3)}", flush=True)
@@ -1818,7 +1831,7 @@ def main():
                 # DIRECT TARGET: send the IK target directly every step (same logic as PRE_GRASP).
                 q6 = np.clip(_re_target_cur.copy(), [lo for lo, hi in _IK_JOINT_LIMITS],
                                                     [hi for lo, hi in _IK_JOINT_LIMITS])
-                _arm_step(robot, q6)
+                _arm_step(robot, q6)   # 驱动机械臂
                 _gripper_width_step(robot, grasp_result["width"])
                 if state_step % 50 == 0:
                     _err = np.abs(cur_q - _re_target_cur)
@@ -1881,9 +1894,9 @@ def main():
             elif state == PipelineState.CLOSE:
                 _close_budget = BUDGET[PipelineState.CLOSE]
                 # Fix1: maintain arm at REACH terminal pose (target_angles_arm = REACH IK solution)
-                _arm_step(robot, target_angles_arm)
+                _arm_step(robot, target_angles_arm)   # j1~j6的target不变
                 # Fix2: full close for the entire budget
-                _gripper_step(robot, close=True)
+                _gripper_step(robot, close=True)   # 关闭夹爪
                 if state_step == 1:
                     _gids = _get_arm_ids(robot)[1]
                     _gj = robot.data.joint_pos[0, list(_gids.values())].cpu().numpy()
@@ -1897,7 +1910,7 @@ def main():
                     state_step = 0
 
             # ---- LIFT: retract arm to ARM_SIDE_ANGLES while keeping gripper closed ----
-            elif state == PipelineState.LIFT:
+            elif state == PipelineState.LIFT:   # 提升机械臂
                 if state_step == 1:
                     print("[SM] LIFT: retracting arm to side pose (ARM_SIDE_ANGLES) with object...",
                           flush=True)
@@ -1906,7 +1919,7 @@ def main():
                 ].cpu().numpy()
                 # Joint-space interpolation to ARM_SIDE_ANGLES — no IK needed,
                 # avoids IK failures when carrying a grasped object.
-                q6 = (1.0 - _alpha(state)) * cur_q + _alpha(state) * ARM_SIDE_ANGLES
+                q6 = (1.0 - _alpha(state)) * cur_q + _alpha(state) * ARM_SIDE_ANGLES   # 这里目标用线性插值
                 _arm_step(robot, q6)
                 _gripper_step(robot, close=True)   # hold grip throughout
                 if state_step % 50 == 0:

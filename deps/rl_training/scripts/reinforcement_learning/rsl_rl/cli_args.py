@@ -26,23 +26,24 @@ def add_rsl_rl_args(parser: argparse.ArgumentParser):
         parser: The parser to add the arguments to.
     """
     # create a new argument group
+    # `add_argument_group()` 是 argparse 提供的参数分组功能，它的唯一作用是让--help的输出更整洁，对参数的解析逻辑没有任何影响。
     arg_group = parser.add_argument_group("rsl_rl", description="Arguments for RSL-RL agent.")
     # -- experiment arguments
     arg_group.add_argument(
         "--experiment_name", type=str, default=None, help="Name of the experiment folder where logs will be stored."
-    )
-    arg_group.add_argument("--run_name", type=str, default=None, help="Run name suffix to the log directory.")
+    )   # 实验目录名 logs/rsl_rl/下一级目录的名称
+    arg_group.add_argument("--run_name", type=str, default=None, help="Run name suffix to the log directory.")   # 运行目录后缀名 experiment_name/下一级目录名称的_后缀
     # -- load arguments
-    arg_group.add_argument("--resume", action="store_true", default=False, help="Whether to resume from a checkpoint.")
-    arg_group.add_argument("--load_run", type=str, default=None, help="Name of the run folder to resume from.")
-    arg_group.add_argument("--checkpoint", type=str, default=None, help="Checkpoint file to resume from.")
+    arg_group.add_argument("--resume", action="store_true", default=False, help="Whether to resume from a checkpoint.")   # 是否从checkpoint继续训练
+    arg_group.add_argument("--load_run", type=str, default=None, help="Name of the run folder to resume from.")   # 要恢复的run目录名。默认是最新的
+    arg_group.add_argument("--checkpoint", type=str, default=None, help="Checkpoint file to resume from.")   # 要恢复的.pt文件名。默认是最新的
     # -- logger arguments
     arg_group.add_argument(
         "--logger", type=str, default=None, choices={"wandb", "tensorboard", "neptune"}, help="Logger module to use."
-    )
+    )   # 日志后端(tensorboard/wandb/neptune)
     arg_group.add_argument(
         "--log_project_name", type=str, default=None, help="Name of the logging project when using wandb or neptune."
-    )
+    )   # wandb/neptune 项目名
 
 
 def parse_rsl_rl_cfg(task_name: str, args_cli: argparse.Namespace) -> RslRlOnPolicyRunnerCfg:

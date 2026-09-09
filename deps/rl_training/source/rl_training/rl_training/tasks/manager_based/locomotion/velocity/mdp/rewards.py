@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 
 
 # Global curriculum scalar in [0, 1], updated from terrain-level mean.
-gait_level: float = 0.0
+gait_level: float = 0.0   # 全局课程难度标量，由curriculum.py每episode更新
 
 def update_gait_level_from_terrain_mean(terrain_level_mean: float | torch.Tensor) -> float:
     """Update global gait_level from mean terrain level.

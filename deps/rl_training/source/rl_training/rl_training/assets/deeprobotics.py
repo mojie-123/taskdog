@@ -66,8 +66,8 @@ DEEPROBOTICS_LITE3_CFG = ArticulationCfg(
 DEEPROBOTICS_M20_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
         usd_path=f"{ISAACLAB_ASSETS_DATA_DIR}/M20/M20_usd/M20.usd",
-        activate_contact_sensors=True,
-        rigid_props=sim_utils.RigidBodyPropertiesCfg(
+        activate_contact_sensors=True,   # 接触力传感器
+        rigid_props=sim_utils.RigidBodyPropertiesCfg(   # 刚体物理属性
             disable_gravity=False,
             retain_accelerations=False,
             linear_damping=0.0,
@@ -76,12 +76,12 @@ DEEPROBOTICS_M20_CFG = ArticulationCfg(
             max_angular_velocity=1000.0,
             max_depenetration_velocity=1.0,
         ),
-        articulation_props=sim_utils.ArticulationRootPropertiesCfg(
+        articulation_props=sim_utils.ArticulationRootPropertiesCfg(   # 关节链求解器属性
             enabled_self_collisions=False, solver_position_iteration_count=4, solver_velocity_iteration_count=1
         ),
     ),
-    init_state=ArticulationCfg.InitialStateCfg(
-        pos=(0.0, 0.0, 0.58),
+    init_state=ArticulationCfg.InitialStateCfg(   # 机器人的初始姿态
+        pos=(0.0, 0.0, 0.58),   # base_link位置
         joint_pos={
             ".*hipx_joint": 0.0,
             "f[l,r]_hipy_joint": -0.3,
@@ -92,12 +92,12 @@ DEEPROBOTICS_M20_CFG = ArticulationCfg(
         },
         joint_vel={".*": 0.0},
     ),
-    soft_joint_pos_limit_factor=0.9,
-    actuators={
-        "joint": DelayedPDActuatorCfg(
+    soft_joint_pos_limit_factor=0.9,   # 软限位系数
+    actuators={   # 执行器模型（控制指令 -> 关节力矩）
+        "joint": DelayedPDActuatorCfg(   # 带延迟的PD控制器：Kp × pos_error + Kd × vel_error
             joint_names_expr=[".*hipx_joint", ".*hipy_joint", ".*knee_joint"],
             effort_limit=76.4,
-            velocity_limit=22.4,
+            velocity_limit=22.4,   # rad/s
             stiffness=80.0,
             damping=2.0,
             friction=0.0,
@@ -109,7 +109,7 @@ DEEPROBOTICS_M20_CFG = ArticulationCfg(
             joint_names_expr=[".*_wheel_joint"],
             effort_limit=21.6,
             velocity_limit=79.3,
-            stiffness=0.0,
+            stiffness=0.0,   # 没有kp -> 不追踪目标角度，速度控制模式
             damping=0.6,
             friction=0.0,
             armature=0.00243216,

@@ -24,6 +24,28 @@ class UniformThresholdVelocityCommand(mdp.UniformVelocityCommand):
     Supports fixed-proportion special-case samples that always use the original (full)
     velocity ranges, preventing catastrophic forgetting of basic skills as the curriculum
     narrows the command range.
+
+    IsaacLab: UniformVelocityCommand  （从均匀分布采样 vx/vy/wz）
+    └── UniformThresholdVelocityCommand  ← 本文件核心类
+
+    ### `UniformThresholdVelocityCommand` 做了什么
+
+    问题背景：课程学习会随着训练进展收窄指令范围（让 agent 先学小速度），但这会导致 agent 遗忘大速度、纯侧移、纯旋转等技能（灾难性遗忘）。
+
+    解决方案：固定比例保留特殊样本，始终从原始全范围采样：
+    1、每次 resample 时，把所有 env 随机分配到 5 个 slot：
+    [0%  ~ 7%]   → 零速度（静止站立），is_standing_env=True
+    [7%  ~14%]   → 仅侧移 vy，vx=wz=0，从全范围采样
+    [14% ~21%]   → 仅前进 vx，vy=wz=0，从全范围采样
+    [21% ~28%]   → 仅旋转 wz（heading模式），vx=vy=0，从全范围采样
+    [28% ~100%]  → 正常联合采样（受课程学习影响）
+    2、小速度归零
+    3、额外metrics（TensorBoard 监控）
+    base_z：机器人重心高度均值，监控机器人有没有趴下
+    knee_pos：膝关节偏离默认位姿的 L2 范数；静止时权重×5，运动时权重×1
+    4、DiscreteCommandController：
+    独立的离散指令控制器（与速度指令无关），用于给 env 分配整数类型的离散动作（如关节模式切换），从 `available_commands` 列表里随机采样整数
+
     """
 
     cfg: mdp.UniformThresholdVelocityCommandCfg
@@ -31,50 +53,52 @@ class UniformThresholdVelocityCommand(mdp.UniformVelocityCommand):
 
     def __init__(self, cfg: mdp.UniformThresholdVelocityCommandCfg, env: ManagerBasedEnv):
         super().__init__(cfg, env)
-        # Additional metrics for TensorBoard.
+
+        # 初始化 TensorBoard 监控指标。Additional metrics for TensorBoard.
         self.metrics["base_z"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["knee_pos"] = torch.zeros(self.num_envs, device=self.device)
-        self._metric_step_counter = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._metric_step_counter = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)   # 步数计数器
 
-        knee_joint_ids = self.robot.find_joints(".*[Kk]nee.*")[0]
+        knee_joint_ids = self.robot.find_joints(".*[Kk]nee.*")[0]   # 用于计算 knee_pos 指标
         self._knee_joint_ids = torch.tensor(knee_joint_ids, dtype=torch.long, device=self.device)
 
         # ---- Store original full ranges for special-case sampling ----
         # These are used by special-case envs so they always sample from the
         # full range regardless of curriculum changes.
+        # 保存完整速度范围
         self._full_ranges_lin_vel_x = tuple(cfg.ranges.lin_vel_x)
         self._full_ranges_lin_vel_y = tuple(cfg.ranges.lin_vel_y)
         self._full_ranges_ang_vel_z = tuple(cfg.ranges.ang_vel_z)
 
     def reset(self, env_ids: Sequence[int] | None = None) -> dict[str, float]:
-        if env_ids is None:
+        if env_ids is None:   # 所有环境
             env_ids = slice(None)
 
-        extras = {}
+        extras = {}   # 上一轮episode的平均指标值
         for metric_name, metric_value in self.metrics.items():
-            if metric_name in {"base_z", "knee_pos"}:
+            if metric_name in {"base_z", "knee_pos"}:   # 累加型指标，要除以步数
                 step_count = torch.clamp(self._metric_step_counter[env_ids].float(), min=1.0)
                 extras[metric_name] = torch.mean(metric_value[env_ids] / step_count).item()
             else:
                 extras[metric_name] = torch.mean(metric_value[env_ids]).item()
-            metric_value[env_ids] = 0.0
+            metric_value[env_ids] = 0.0  # 所有指标清零
 
-        self._metric_step_counter[env_ids] = 0
-        self.command_counter[env_ids] = 0
-        self._resample(env_ids)
+        self._metric_step_counter[env_ids] = 0   # 步数计数器清零
+        self.command_counter[env_ids] = 0   # 命令计数器清零（用于跟踪当前命令已执行了多少步）
+        self._resample(env_ids)  # 重新采样命令
         return extras
 
-    def _update_metrics(self):
+    def _update_metrics(self):   # 每个仿真步被调用
         super()._update_metrics()
 
         # 1) base_z metric: root_pos_w[:, 2]
         base_z = self.robot.data.root_pos_w[:, 2]
 
         # 2) knee_pos metric: same formulation as joint_pos_penalty for knee joints
-        cmd = torch.linalg.norm(self.vel_command_b, dim=1)
-        body_vel = torch.linalg.norm(self.robot.data.root_lin_vel_b[:, :2], dim=1)
+        cmd = torch.linalg.norm(self.vel_command_b, dim=1)   # 速度命令的范数 √(vx² + vy² + wz²)
+        body_vel = torch.linalg.norm(self.robot.data.root_lin_vel_b[:, :2], dim=1)   # 机器人本体系线速度范数 √(vx² + vy²)
 
-        if self._knee_joint_ids.numel() > 0:
+        if self._knee_joint_ids.numel() > 0:   # 膝关节角度偏差
             running_reward = torch.linalg.norm(
                 self.robot.data.joint_pos[:, self._knee_joint_ids]
                 - self.robot.data.default_joint_pos[:, self._knee_joint_ids],
@@ -84,9 +108,9 @@ class UniformThresholdVelocityCommand(mdp.UniformVelocityCommand):
             running_reward = torch.zeros(self.num_envs, device=self.device)
 
         knee_pos = torch.where(
-            torch.logical_or(cmd > 0.1, body_vel > 0.5),
-            running_reward,
-            5.0 * running_reward,
+            torch.logical_or(cmd > 0.1, body_vel > 0.5),   # 运动状态判定：cmd > 0.1 或 body_vel > 0.5
+            running_reward,   # 运动状态下的值
+            5.0 * running_reward,   # 静止状态下的值
         )
 
         self.metrics["base_z"] += base_z
@@ -95,7 +119,7 @@ class UniformThresholdVelocityCommand(mdp.UniformVelocityCommand):
 
     def _resample_command(self, env_ids: Sequence[int]):
         super()._resample_command(env_ids)
-        # set small commands to zero
+        # 过滤小幅度命令（设为零）。set small commands to zero
         self.vel_command_b[env_ids, :2] *= (torch.norm(self.vel_command_b[env_ids, :2], dim=1) > 0.2).unsqueeze(1)
 
         # ---- Fixed-proportion special-case samples ----
@@ -114,7 +138,7 @@ class UniformThresholdVelocityCommand(mdp.UniformVelocityCommand):
         #   [rel_zero_vel+rel_only_lin_y, +rel_only_lin_x      ) -> only lin_x
         #   [...,                        +rel_only_ang_z        ) -> only ang_z
         #   [...,                        1.0                    ) -> normal (no override)
-        slot = r.uniform_(0.0, 1.0)
+        slot = r.uniform_(0.0, 1.0)   # 为每个环境随机分配一个 [0, 1) 区间内的 slot 值，决定速度指令的处理
         cum = 0.0
 
         # --- Zero velocity (standing) ---
@@ -145,9 +169,10 @@ class UniformThresholdVelocityCommand(mdp.UniformVelocityCommand):
         # Apply zero velocity
         if len(ids_zero) > 0:
             self.vel_command_b[ids_zero, :] = 0.0
-            self.is_standing_env[ids_zero] = True
-            self.is_heading_env[ids_zero] = False
+            self.is_standing_env[ids_zero] = True   # 静止站立标志
+            self.is_heading_env[ids_zero] = False   # 该环境是否被分配了纯旋转任务（只有角速度命令，没有线速度）
 
+        # 注意这里都是从原始的速度命令范围中取
         # Apply only-lin_y: vx=0, vy from full range, wz=0
         if len(ids_only_y) > 0:
             r_y = torch.empty(len(ids_only_y), device=self.device)
@@ -173,8 +198,8 @@ class UniformThresholdVelocityCommand(mdp.UniformVelocityCommand):
             self.vel_command_b[ids_only_ang, 1] = 0.0
             self.is_standing_env[ids_only_ang] = False
             self.is_heading_env[ids_only_ang] = True
-            if self.cfg.heading_command:
-                self.heading_target[ids_only_ang] = r_h.uniform_(*self.cfg.ranges.heading)
+            if self.cfg.heading_command:   # 是否使用朝向命令模式（相对的是角速度命令模式；朝向命令模式是给目标角度）
+                self.heading_target[ids_only_ang] = r_h.uniform_(*self.cfg.ranges.heading)   # 为纯旋转环境（ids_only_ang）采样一个目标朝向角度
 
 
 @configclass
@@ -185,7 +210,6 @@ class UniformThresholdVelocityCommandCfg(mdp.UniformVelocityCommandCfg):
 
     rel_zero_vel_envs: float = 0.07
     """Fraction of environments that always receive a zero-velocity command.
-
     These samples prevent forgetting of standing-still behavior and are not
     affected by the command-level curriculum.
     """
@@ -226,6 +250,7 @@ class DiscreteCommandController(CommandTerm):
     def __init__(self, cfg: DiscreteCommandControllerCfg, env: ManagerBasedEnv):
         """
         Initialize the command controller.
+        与之前的连续速度命令不同，这个控制器用于给环境分配离散的整数命令
 
         Args:
             cfg: The configuration of the command controller.
@@ -234,6 +259,7 @@ class DiscreteCommandController(CommandTerm):
         # Initialize the base class
         super().__init__(cfg, env)
 
+        # 至少有一个可用命令，并且命令类型都要是整数。例如：[0, 1, 2, 3] 可能代表 4 种不同的步态模式
         # Validate that available_commands is non-empty
         if not self.cfg.available_commands:
             raise ValueError("The available_commands list cannot be empty.")
@@ -242,7 +268,7 @@ class DiscreteCommandController(CommandTerm):
         if not all(isinstance(cmd, int) for cmd in self.cfg.available_commands):
             raise ValueError("All elements in available_commands must be integers.")
 
-        # Store the available commands
+        # 保存可用命令列表。Store the available commands
         self.available_commands = self.cfg.available_commands
 
         # Create buffers to store the command

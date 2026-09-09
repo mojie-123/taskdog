@@ -26,7 +26,8 @@ def randomize_rigid_body_inertia(
     distribution: Literal["uniform", "log_uniform", "gaussian"] = "uniform",
 ):
     """Randomize the inertia tensors of the bodies by adding, scaling, or setting random values.
-
+    随机化刚体的惯性张量
+    
     This function allows randomizing only the diagonal inertia tensor components (xx, yy, zz) of the bodies.
     The function samples random values from the given distribution parameters and adds, scales, or sets the values
     into the physics simulation based on the operation.
@@ -44,20 +45,19 @@ def randomize_rigid_body_inertia(
     else:
         env_ids = env_ids.cpu()
 
-    # resolve body indices
+    # 确定要随机化哪些body。resolve body indices
     if asset_cfg.body_ids == slice(None):
         body_ids = torch.arange(asset.num_bodies, dtype=torch.int, device="cpu")
     else:
         body_ids = torch.tensor(asset_cfg.body_ids, dtype=torch.int, device="cpu")
 
     # get the current inertia tensors of the bodies (num_assets, num_bodies, 9 for articulations or 9 for rigid objects)
-    inertias = asset.root_physx_view.get_inertias()
-
-    # apply randomization on default values
+    inertias = asset.root_physx_view.get_inertias()   # 从 PhysX 物理引擎获取当前的惯性张量(num_envs, num_bodies, 9)
+    # 将惯性张量重置为默认值。apply randomization on default values
     inertias[env_ids[:, None], body_ids, :] = asset.data.default_inertia[env_ids[:, None], body_ids, :].clone()
 
     # randomize each diagonal element (xx, yy, zz -> indices 0, 4, 8)
-    for idx in [0, 4, 8]:
+    for idx in [0, 4, 8]:   # 随机化对角线元素
         # Extract and randomize the specific diagonal element
         randomized_inertias = _randomize_prop_by_op(
             inertias[:, :, idx],
@@ -70,7 +70,7 @@ def randomize_rigid_body_inertia(
         # Assign the randomized values back to the inertia tensor
         inertias[env_ids[:, None], body_ids, idx] = randomized_inertias
 
-    # set the inertia tensors into the physics simulation
+    # 设置惯性张量。set the inertia tensors into the physics simulation
     asset.root_physx_view.set_inertias(inertias, env_ids)
 
 
@@ -83,6 +83,7 @@ def randomize_com_positions(
     distribution: Literal["uniform", "log_uniform", "gaussian"] = "uniform",
 ):
     """Randomize the center of mass (COM) positions for the rigid bodies.
+    随机化刚体的质心
 
     This function allows randomizing the COM positions of the bodies in the physics simulation. The positions can be
     randomized by adding, scaling, or setting random values sampled from the specified distribution.
@@ -205,7 +206,8 @@ def bad_orientation_2(
     env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot") # type: ignore
 ) -> torch.Tensor:
     """Terminate when the asset's orientation is too far from the desired orientation limits.
-
+    检测机器人的姿态是否异常（翻倒或过度倾斜），通常用作强化学习环境中的终止条件
+    
     This is computed by checking the angle between the projected gravity vector and the z-axis.
     """
     # extract the used quantities (to enable type-hinting)

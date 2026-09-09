@@ -1,4 +1,7 @@
 ``` bash
+# 训练行走策略  在/home/mojie/taskdog/deps/rl_training下运行
+python scripts/reinforcement_learning/rsl_rl/train.py --task=Flat-Deeprobotics-M20-v0 --headless
+
 # 建图
 python custom_envs/scripts/navigation/teleop_mapping.py       --task=Flat-Deeprobotics-M20Pro-Lidar-v0       --policy_task=Flat-Deeprobotics-M20-v0       --load_run=2026-07-18_10-57-32       --checkpoint=model_4999.pt
 
@@ -8,6 +11,9 @@ python scripts/navigation/teleop_mapping.py --task Flat-Deeprobotics-M20Pro-Pipe
 
 # 生成点云地图（可用html查看）
 python scripts/navigation/view_3d.py maps/my_map_cloud.npy --no_ground
+
+# 生成导航用的地图
+python scripts/navigation/viz_map.py maps/my_map.npz 
 
 
 # 导航
