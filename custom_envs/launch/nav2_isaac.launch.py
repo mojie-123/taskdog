@@ -1,9 +1,12 @@
 # Custom Nav2 launch file for Isaac Sim ground-truth localisation.
 # Differences from nav2_bringup/navigation_launch.py:
 #   1. NO /tf -> tf remapping: bridge publishes to absolute /tf and /tf_static
+#      标准 Nav2 中，AMCL 发布 map → odom 变换，而机器人驱动发布 odom → base_link 变换。而这里Isaac Sim 的 ROS 2 Bridge 直接发布完整的坐标变换链：map → odom → base_link
 #   2. Adds map_server (no AMCL): bridge provides ground-truth TF directly
 #   3. controller_server publishes cmd_vel_nav; velocity_smoother reads cmd_vel_nav
 #      and publishes cmd_vel (remapped from cmd_vel_smoothed); bridge subscribes /cmd_vel
+
+# 重映射remapping：将节点默认发布/订阅的话题名称改为另一个名称。
 
 import os
 
@@ -31,10 +34,10 @@ def generate_launch_description():
         'autostart': autostart,
     }
     configured_params = ParameterFile(
-        RewrittenYaml(
-            source_file=params_file,
-            root_key='',
-            param_rewrites=param_substitutions,
+        RewrittenYaml(   # 将命令行传入的 map 路径注入到 map_server 的 yaml_filename 参数中
+            source_file=params_file,   # 读取命令行传入的 nav2_params.yaml 文件
+            root_key='',   # 从 YAML 根节点开始替换
+            param_rewrites=param_substitutions,   # 用字典中的值替换 YAML 中的对应参数
             convert_types=True),
         allow_substs=True)
 
@@ -47,8 +50,9 @@ def generate_launch_description():
         'bt_navigator',
         'waypoint_follower',
         'velocity_smoother',
-    ]
+    ]   # 声明所有需要生命周期管理器统一控制的节点
 
+    # 启动参数声明，DeclareLaunchArgument的这几个参数可以通过命令行传入
     return LaunchDescription([
         SetEnvironmentVariable('RCUTILS_LOGGING_BUFFERED_STREAM', '1'),
 
@@ -63,13 +67,13 @@ def generate_launch_description():
         GroupAction(actions=[
 
             # --- Map server (no AMCL; Isaac bridge provides ground-truth TF) ---
-            Node(
-                package='nav2_map_server',
-                executable='map_server',
-                name='map_server',
-                output='screen',
-                parameters=[configured_params],
-                arguments=['--ros-args', '--log-level', log_level]),
+            Node(   # 启动一个ROS2节点
+                package='nav2_map_server',   # ROS2包名
+                executable='map_server',   # 可执行文件名
+                name='map_server',   # 节点名称
+                output='screen',    # 日志输出方式 screen终端/log日志文件
+                parameters=[configured_params],   # 加载yaml文件
+                arguments=['--ros-args', '--log-level', log_level]),   # 命令行参数
 
             # --- Navigation stack ---
             Node(
@@ -78,7 +82,7 @@ def generate_launch_description():
                 output='screen',
                 parameters=[configured_params],
                 arguments=['--ros-args', '--log-level', log_level],
-                remappings=[('cmd_vel', 'cmd_vel_nav')]),
+                remappings=[('cmd_vel', 'cmd_vel_nav')]),   # 重映射话题列表
             Node(
                 package='nav2_smoother',
                 executable='smoother_server',

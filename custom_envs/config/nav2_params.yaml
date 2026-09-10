@@ -1,17 +1,17 @@
 # Nav2 parameters for M20Pro + Piper integration (Isaac Sim ground-truth localization)
 # ROS 2 Humble / Nav2 1.1.x
 # NOTE: AMCL is intentionally omitted. The Isaac ROS2 Bridge broadcasts ground-truth
-#       /tf (map->odom->base_link), so Nav2 gets perfect localization for free.
+#       /tf (地图坐标系map->里程计坐标系odom->机器人基座坐标系base_link), so Nav2 gets perfect localization for free.
 
 bt_navigator:
   ros__parameters:
-    use_sim_time: false
-    global_frame: map
-    robot_base_frame: base_link
-    odom_topic: /odom
-    bt_loop_duration: 10
+    use_sim_time: false   # 使用系统真实时间
+    global_frame: map   # 全局参考坐标系，通常由 AMCL 或（在本项目中）Isaac Sim 的真实位姿提供 map → odom 的变换
+    robot_base_frame: base_link   # Nav2会计算base_link在map坐标系中的位姿
+    odom_topic: /odom   # 发布 odom → base_link 的坐标变换
+    bt_loop_duration: 10   # 行为树循环周期10ms
     default_server_timeout: 20
-    navigators: ["navigate_to_pose", "navigate_through_poses"]
+    navigators: ["navigate_to_pose", "navigate_through_poses"]   # 声明支持的导航模式列表：导航到单个目标点/一系列航点
     navigate_to_pose:
       plugin: "nav2_bt_navigator::NavigateToPoseNavigator"
     navigate_through_poses:
@@ -19,166 +19,181 @@ bt_navigator:
 
 costmap_common_params:
   ros__parameters:
-    robot_radius: 0.35
-    obstacle_max_range: 2.5
-    obstacle_min_range: 0.0
-    raytrace_max_range: 3.0
-    raytrace_min_range: 0.0
+    robot_radius: 0.35   # 机器人物理半径
+    obstacle_max_range: 2.5   # 障碍物探测的最大距离
+    obstacle_min_range: 0.0   # 障碍物探测的最小距离
+    raytrace_max_range: 3.0   # 清除空闲空间的最大距离
+    raytrace_min_range: 0.0   # 清除空闲空间的最小距离
 
-local_costmap:
+local_costmap:   # 局部代价地图
   local_costmap:
     ros__parameters:
       use_sim_time: false
-      update_frequency: 10.0
-      publish_frequency: 5.0
-      global_frame: odom
-      robot_base_frame: base_link
-      rolling_window: true
-      width: 4
+      update_frequency: 10.0   # 每0.1s刷新一次传感器数据 -> 刷新地图
+      publish_frequency: 5.0   # 每0.2s广播一次现在的地图
+      global_frame: odom   # 参考坐标系：里程计
+      robot_base_frame: base_link  # 地图中心点：机器人基座
+      rolling_window: true   # 滚动窗口模式：只维护机器人周围的一小块地图
+      width: 4   # 地图可视范围：机器人周围2m内的东西
       height: 4
-      resolution: 0.05
-      robot_radius: 0.35
-      plugins: ["inflation_layer"]
+      resolution: 0.05   # 分辨率：5cm/格
+      robot_radius: 0.35   # 机器人半径
+      plugins: ["inflation_layer"]   # 局部地图只加载膨胀层插件
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 3.0
-        inflation_radius: 0.50
-      always_send_full_costmap: true
+        cost_scaling_factor: 3.0   # 代价衰减系数。作用：控制危险程度随距离下降的速度
+        inflation_radius: 0.50   # 危险区半径
+      always_send_full_costmap: true   # 每次发布地图时，发送完整数据，而不是只发送变化的部分
 
-global_costmap:
+global_costmap:   # 全局代价地图。它主要基于预先构建好的静态地图（墙壁、家具位置）
   global_costmap:
     ros__parameters:
       use_sim_time: false
-      update_frequency: 1.0
-      publish_frequency: 1.0
-      global_frame: map
-      robot_base_frame: base_link
+      update_frequency: 1.0   # 更新频率
+      publish_frequency: 1.0   # 发布频率
+      global_frame: map   # 参考系
+      robot_base_frame: base_link   # 地图中心点
       robot_radius: 0.35
       resolution: 0.05
-      track_unknown_space: true
-      plugins: ["static_layer", "inflation_layer"]
+      track_unknown_space: true   # 保留“这个地方没有扫描过”的信息，仅决定代价地图如何"表示"未知区域
+      plugins: ["static_layer", "inflation_layer"]   # 比局部代价地图多一个static_layer（加载建图时的.pgm文件）
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
-        map_subscribe_transient_local: true
+        map_subscribe_transient_local: true   # 确保能拿到地图
         enabled: true
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
         inflation_radius: 0.50
-      always_send_full_costmap: true
+      always_send_full_costmap: true   # 每次发送完整地图数据
 
-map_server:
+map_server:  # 地图服务器。加载预先构建好的静态地图（通常是 .pgm 图像和 .yaml 配置文件），并将其发布为 ROS 2 话题，供全局代价地图（global_costmap）和路径规划器使用。
   ros__parameters:
     use_sim_time: false
-    yaml_filename: ""
-    topic_name: "map"
-    frame_id: "map"
+    yaml_filename: ""   # 指定地图配置文件的绝对或相对路径
+    topic_name: "map"   # map_server 发布地图数据的话题名称
+    frame_id: "map"   # 地图数据所在的坐标系名称
 
-planner_server:
+planner_server:   # 路径规划服务器。在全局代价地图上计算从起点到目标点的最优路径
   ros__parameters:
     use_sim_time: false
-    expected_planner_frequency: 20.0
+    expected_planner_frequency: 20.0   # 期望的路径规划频率
     planner_plugins: ["GridBased"]
     GridBased:
-      plugin: "nav2_navfn_planner/NavfnPlanner"
-      tolerance: 0.5
-      use_astar: true
-      allow_unknown: true
+      plugin: "nav2_navfn_planner/NavfnPlanner"   # 指定 "GridBased" 插件实际使用的规划器类。NavfnPlanner 是 ROS Navigation Stack 1 中的经典规划器，支持 Dijkstra 和 A* 算法
+      tolerance: 0.5   # 目标点容差。如果目标点被标记为"占据"或"未知"，规划器会在目标点周围 0.5 米范围内寻找最近的可达点作为替代目标
+      use_astar: true   # 使用 A* 算法
+      allow_unknown: true   # 允许通过未知区域，决定规划器是否愿意"穿过"未知区域
 
-controller_server:
+controller_server:   # 控制器服务器。跟踪全局路径，实时计算机器人的速度指令（线速度和角速度），并判断导航是否完成。
   ros__parameters:
     use_sim_time: false
-    controller_frequency: 20.0
-    min_x_velocity_threshold: 0.001
-    min_y_velocity_threshold: 0.5
-    min_theta_velocity_threshold: 0.001
-    failure_tolerance: 0.3
-    progress_checker_plugins: ["progress_checker"]
-    goal_checker_plugins: ["general_goal_checker"]
-    controller_plugins: ["FollowPath"]
+    controller_frequency: 20.0   # 每 50ms 计算一次速度指令
+    min_x_velocity_threshold: 0.001   # 如果控制器计算出的 X 方向速度小于 0.001 m/s，则视为 0
+    min_y_velocity_threshold: 0.5   # 设置较高的横向速度指令阈值，抑制横向移动
+    min_theta_velocity_threshold: 0.001   # vyaw最小阈值
+    failure_tolerance: 0.3   # 如果控制器在 0.3 秒内无法生成有效的速度指令（例如路径被完全阻塞），它会报告失败。失败后，Nav2 的行为树会触发恢复行为（如原地旋转、清除代价地图等）
+    progress_checker_plugins: ["progress_checker"]   # 进度检查插件，检测机器人是否在导航过程中被卡住
+    goal_checker_plugins: ["general_goal_checker"]   # 判断机器人是否已经到达目标点
+    controller_plugins: ["FollowPath"]   # 路径跟踪控制器插件（实际计算速度指令的算法）
     progress_checker:
-      plugin: "nav2_controller::SimpleProgressChecker"
-      required_movement_radius: 0.1
+      plugin: "nav2_controller::SimpleProgressChecker"   # 定期检查机器人是否在移动
+      required_movement_radius: 0.1   # 在 movement_time_allowance 时间内，机器人必须移动至少 0.1 米，否则被视为"卡住"
       movement_time_allowance: 60.0
     general_goal_checker:
-      stateful: true
-      plugin: "nav2_controller::SimpleGoalChecker"
-      xy_goal_tolerance: 0.50
-      yaw_goal_tolerance: 3.14159   # do not enforce final yaw — ALIGN_YAW handles it
+      stateful: true   # 是否使用有状态检查。true：一旦判定到达目标，状态会保持，即使机器人稍微偏离也不会重新判定为"未到达"
+      plugin: "nav2_controller::SimpleGoalChecker"   # 简单的目标检查器
+      xy_goal_tolerance: 0.50   # 到达目标点附近0.5m算完成
+      yaw_goal_tolerance: 3.14159   # 不限制最终朝向do not enforce final yaw — ALIGN_YAW handles it
     FollowPath:
-      plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
-      desired_linear_vel: 0.8
-      lookahead_dist: 0.8
-      min_lookahead_dist: 0.4
-      max_lookahead_dist: 1.2
-      lookahead_time: 1.5
-      rotate_to_heading_angular_vel: 1.2
-      transform_tolerance: 0.5
-      use_velocity_scaled_lookahead_dist: false
-      min_approach_linear_velocity: 0.05
-      approach_velocity_scaling_dist: 0.8
-      use_collision_detection: false
-      max_allowed_time_to_collision_up_to_carrot: 1.0
-      use_regulated_linear_velocity_scaling: true
-      use_fixed_curvature_lookahead: false
-      curvature_lookahead_dist: 0.8
-      use_cost_regulated_linear_velocity_scaling: false
-      regulated_linear_scaling_min_radius: 0.9
-      regulated_linear_scaling_min_speed: 0.25
-      use_rotate_to_heading: false
-      allow_reversing: false
-      rotate_to_heading_min_angle: 0.785
-      max_angular_accel: 3.2
-      max_robot_pose_search_dist: 10.0
+      plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"   # 在路径上找一个"前瞻点"，计算机器人转向该点所需的曲率和速度
+      desired_linear_vel: 0.8   # 期望线速度
+      lookahead_dist: 0.8   # 基础前瞻距离
+      min_lookahead_dist: 0.4   # 最小前瞻距离（即使路径曲率很大，前瞻距离也不会小于 0.4 米，防止过度转向）
+      max_lookahead_dist: 1.2   # 最大前瞻距离
+      lookahead_time: 1.5   # 前瞻时间。意味着前瞻点大约在 1.5 秒后到达的位置（前瞻距离 = desired_linear_vel * lookahead_time）。但是这里use_velocity_scaled_lookahead_dist:false所以没用。
+      rotate_to_heading_angular_vel: 1.2   # 转向角速度（当 use_rotate_to_heading: true 时，机器人原地转向的角速度）
+      transform_tolerance: 0.5   # 如果最新的坐标变换（TF）数据超过 0.5 秒未更新，控制器会拒绝执行，防止使用过时的位姿数据
+      use_velocity_scaled_lookahead_dist: false   # 是否使用速度缩放的前瞻距离（true的话：速度越快，前瞻越远）
+      min_approach_linear_velocity: 0.05   # 最小接近速度（机器人接近目标点时的速度）
+      approach_velocity_scaling_dist: 0.8   # 接近速度缩放距离（当机器人距离目标点小于 0.8 米时，开始线性减速，从 desired_linear_vel 降到 min_approach_linear_velocity）
+      use_collision_detection: false   # 是否器用碰撞检测。true：检查从机器人到前瞻点之间是否有障碍物，如果有则减速或停止。
+      max_allowed_time_to_collision_up_to_carrot: 1.0   # 如果预测到与障碍物碰撞的时间小于 1.0 秒，控制器会减速。仅在 use_collision_detection: true 时生效。
+      use_regulated_linear_velocity_scaling: true   # 基于曲率的速度调节，曲率越大，速度越慢
+      use_fixed_curvature_lookahead: false   # 使用动态前瞻距离计算曲率
+      curvature_lookahead_dist: 0.8   # 仅use_fixed_curvature_lookahead: true时生效
+      use_cost_regulated_linear_velocity_scaling: false   # 没有基于代价地图的速度调节
+      regulated_linear_scaling_min_radius: 0.9   # 曲率小于0.9m时开始减速
+      regulated_linear_scaling_min_speed: 0.25   # 最低速度
+      use_rotate_to_heading: false   # 不启用原地转向？
+      allow_reversing: false   # 不允许倒车
+      rotate_to_heading_min_angle: 0.785   # 触发原地转向的最小角度差，单位弧度（≈ 45°）。仅在 use_rotate_to_heading: true 时生效
+      max_angular_accel: 3.2   # 最大角加速度
+      max_robot_pose_search_dist: 10.0   # 最大机器人位姿搜索距离。超过此距离则认为机器人偏离路径太远
 
-velocity_smoother:
+velocity_smoother:   # 速度平滑器。避免速度突变
   ros__parameters:
     use_sim_time: false
-    smoothing_frequency: 20.0
-    scale_velocities: false
-    feedback: "OPEN_LOOP"
-    max_velocity: [0.8, 0.0, 2.0]
+    smoothing_frequency: 20.0   # 平滑器执行频率
+    scale_velocities: false   # 不缩放速度，仅使用max_velocity和min_velocity
+    feedback: "OPEN_LOOP"   # 开环。不依赖里程计反馈，直接根据加速度限制平滑速度。适用于里程计数据不稳定或不可靠的场景
+    max_velocity: [0.8, 0.0, 2.0]   # [v_x, v_y, ω_z]
     min_velocity: [-0.8, 0.0, -2.0]
-    max_accel: [2.5, 0.0, 3.2]
+    max_accel: [2.5, 0.0, 3.2]   # [a_x, a_y, α_z]
     max_decel: [-2.5, 0.0, -3.2]
-    odom_topic: "/odom"
-    odom_duration: 0.1
-    deadband_velocity: [0.0, 0.0, 0.0]
-    velocity_timeout: 1.0
-    input_topic: "cmd_vel_nav"
+    odom_topic: "/odom"   # 里程计。订阅 /odom 话题获取机器人当前速度估计，用于闭环模式或速度超时检测。
+    odom_duration: 0.1   # 使用过去 0.1s 内的里程计数据计算平均速度
+    deadband_velocity: [0.0, 0.0, 0.0]   # 速度死区。死区内的速度指令会被置零，防止微小噪声导致机器人抖动
+    velocity_timeout: 1.0   # 如果 1.0 秒内没有收到新的速度指令，平滑器会输出零速度（安全停止）
+    input_topic: "cmd_vel_nav"   # 订阅 cmd_vel_nav 话题，接收来自 controller_server 的原始速度指令（处理后输出到/cmd_vel话题）
 
-behavior_server:
+behavior_server:   # 行为服务器。提供恢复行为（机器人卡住、路径被阻塞时的行为）
   ros__parameters:
     use_sim_time: false
-    local_costmap_topic: local_costmap/costmap_raw
-    global_costmap_topic: global_costmap/costmap_raw
-    local_footprint_topic: local_costmap/published_footprint
-    global_footprint_topic: global_costmap/published_footprint
-    cycle_frequency: 10.0
+    local_costmap_topic: local_costmap/costmap_raw   # 订阅局部代价地图
+    global_costmap_topic: global_costmap/costmap_raw   # 订阅全局代价地图
+    local_footprint_topic: local_costmap/published_footprint   # 订阅机器人在局部代价地图中的轮廓（footprint），用于碰撞检测
+    global_footprint_topic: global_costmap/published_footprint   # 订阅机器人在全局代价地图中的轮廓
+    cycle_frequency: 10.0   # 服务器执行频率
     behavior_plugins:
       ["spin", "backup", "drive_on_heading", "assisted_teleop", "wait"]
-    spin:
+    spin:   # 原地旋转360度
       plugin: "nav2_behaviors/Spin"
-    backup:
+    backup:   # 后退恢复行为
       plugin: "nav2_behaviors/BackUp"
-    drive_on_heading:
+    drive_on_heading:  # 沿朝向直行（冲撞障碍物）
       plugin: "nav2_behaviors/DriveOnHeading"
-    wait:
+    wait:   # 等待（等障碍物自己移开）
       plugin: "nav2_behaviors/Wait"
-    assisted_teleop:
+    assisted_teleop:   # 辅助遥控恢复行为
       plugin: "nav2_behaviors/AssistedTeleop"
-    global_frame: odom
+    global_frame: odom   # 用odom坐标系作为参考，因为恢复行为通常是短时间的局部操作，不需要绝对地图坐标
     robot_base_frame: base_link
-    transform_tolerance: 0.5
-    simulate_ahead_time: 2.0
-    max_rotational_vel: 1.0
-    min_rotational_vel: 0.4
-    rotational_acc_lim: 3.2
+    transform_tolerance: 0.5   # 如果最新的坐标变换（TF）数据超过 0.5 秒未更新，恢复行为会拒绝执行，防止使用过时的位姿数据
+    simulate_ahead_time: 2.0   # 在执行恢复行为前，模拟未来 2 秒内的运动轨迹，检查是否会与障碍物碰撞。如果预测会碰撞，则拒绝执行或调整行为参数。
+    max_rotational_vel: 1.0   # 最大旋转角速度
+    min_rotational_vel: 0.4   # 最小旋转角速度
+    rotational_acc_lim: 3.2   # 旋转加速度限制
+# 行为树具体逻辑通常位于/opt/ros/humble/share/nav2_bt_navigator/behavior_trees/
+# 常见行为树文件：
+# navigate_to_pose_w_replanning_and_recovery.xml：带恢复行为的标准导航
+# navigate_through_poses_w_replanning_and_recovery.xml：多航点导航
 
-lifecycle_manager:
+# 何时触发恢复行为？
+# progress_checker 检测到卡住或 controller_server 报告失败
+
+# ├── 正常导航（FollowPath）
+# └── 如果失败 → 恢复行为序列
+#     ├── 1. ClearCostmap（清除代价地图）
+#     ├── 2. Spin（原地旋转）
+#     ├── 3. Backup（后退）
+#     ├── 4. Wait（等待）
+#     └── 5. DriveOnHeading（沿朝向直行）
+
+lifecycle_manager:   # 统一管理 Nav2 所有节点的启动、状态转换和生命周期
   ros__parameters:
     use_sim_time: false
-    autostart: true
+    autostart: true   # 是否自启动所有节点
     node_names:
       - map_server
       - controller_server

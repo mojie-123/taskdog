@@ -13,6 +13,8 @@ def world_to_grid(wx: float, wy: float, origin: tuple, resolution: float):
 
     Returns:
         (row, col) int grid index.
+
+    将世界坐标系中的位置（米）转换为 occupancy grid（占据栅格地图）中的网格索引（行、列）
     """
     col = int((wx - origin[0]) / resolution)
     row = int((wy - origin[1]) / resolution)
@@ -20,7 +22,10 @@ def world_to_grid(wx: float, wy: float, origin: tuple, resolution: float):
 
 
 def grid_to_world(row: int, col: int, origin: tuple, resolution: float):
-    """Convert grid indices to world coordinates (cell centre)."""
+    """
+    Convert grid indices to world coordinates (cell centre).
+    将占据栅格地图中的网格索引（行、列）转换为世界坐标系中的物理位置（米）
+    """
     wx = origin[0] + (col + 0.5) * resolution
     wy = origin[1] + (row + 0.5) * resolution
     return (wx, wy)
@@ -35,6 +40,8 @@ def world_to_body(wx: float, wy: float, robot_pos: tuple):
 
     Returns:
         (dx_body, dy_body) in robot local frame.
+
+    世界坐标系->机器人自身坐标系
     """
     rx, ry, ryaw = robot_pos
     dx = wx - rx
@@ -48,6 +55,8 @@ def world_to_body(wx: float, wy: float, robot_pos: tuple):
 
 def smooth_path(path: list, window_size: int = 3):
     """Moving-average smooth a list of (x, y) waypoints.
+    平滑路径点列表，消除路径中的锯齿状抖动
+    使用滑动窗口法
 
     Args:
         path: list of (x, y) waypoints.
@@ -70,13 +79,16 @@ def smooth_path(path: list, window_size: int = 3):
 
 
 def is_goal_reached(robot_pos: tuple, goal_pos: tuple, threshold: float = 0.3):
-    """Check whether robot is within threshold of the goal."""
+    """
+    Check whether robot is within threshold of the goal.
+    判断到达目的地：距离小于阈值
+    """
     dx = robot_pos[0] - goal_pos[0]
     dy = robot_pos[1] - goal_pos[1]
     return (dx * dx + dy * dy) < (threshold * threshold)
 
 
-def euler_from_quat(quat):
+def euler_from_quat(quat):   # 从四元数中提取偏航角yaw
     """Extract yaw from a [w, x, y, z] quaternion (Isaac Sim convention)."""
     w, x, y, z = quat[0], quat[1], quat[2], quat[3]
     siny_cosp = 2.0 * (w * z + x * y)

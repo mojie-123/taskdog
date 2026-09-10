@@ -1,5 +1,6 @@
 #!/usr/bin/env python3.10
 """ROS 2 Bridge subprocess — launched by IsaacROS2Bridge via subprocess.Popen.
+在 Python 3.10 环境中运行 ROS 2 节点，实现 Isaac Sim 与 Nav2 之间的双向通信
 
 This script MUST be executed with /usr/bin/python3.10 so that rclpy
 C-extensions (compiled for CPython 3.10) import correctly.
@@ -31,6 +32,7 @@ import numpy as np
 # Ensure ROS 2 Humble Python packages are findable even when this process
 # is spawned from a conda environment that may not have sourced setup.bash.
 # ---------------------------------------------------------------------------
+# 手动添加 ROS 2 Humble 的 Python 包路径
 for _p in [
     "/opt/ros/humble/local/lib/python3.10/dist-packages",
     "/opt/ros/humble/lib/python3.10/site-packages",
@@ -39,13 +41,13 @@ for _p in [
         sys.path.insert(0, _p)
 
 
-def _emit(obj: dict) -> None:
+def _emit(obj: dict) -> None:   # python字典 -> json，并写入stdout
     """Write one JSON line to stdout (the parent process reads it)."""
     sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
     sys.stdout.flush()
 
 
-def _eprint(*args, **kw) -> None:
+def _eprint(*args, **kw) -> None:   # 在终端打印输出诊断信息（报错）
     """Print a diagnostic message to stderr."""
     print(*args, **kw, file=sys.stderr, flush=True)
 
@@ -72,10 +74,10 @@ def main() -> None:
         return
 
     _eprint("[BridgeProc] imports OK, init rclpy...")
-    rclpy.init()
-    node = Node("isaac_ros2_bridge")
-    tf_bcast     = TransformBroadcaster(node)
-    static_bcast = StaticTransformBroadcaster(node)
+    rclpy.init()   # 初始化ROS2客户端库
+    node = Node("isaac_ros2_bridge")  # 创建节点
+    tf_bcast     = TransformBroadcaster(node)   # 发布坐标变换
+    static_bcast = StaticTransformBroadcaster(node)   # 发布里程计数据
 
     qos = QoSProfile(
         reliability=QoSReliabilityPolicy.RELIABLE,
@@ -84,6 +86,7 @@ def main() -> None:
     odom_pub = node.create_publisher(Odometry, "/odom", qos)
 
     # Static map->odom identity transform (ground-truth localisation)
+    # 发布静态变换，因为 Isaac Sim 提供真实位姿，map 和 odom 坐标系重合。
     stf = TransformStamped()
     stf.header.stamp    = node.get_clock().now().to_msg()
     stf.header.frame_id = "map"
@@ -115,7 +118,7 @@ def main() -> None:
             _vx         = float(msg.linear.x)
             _omega_z    = float(msg.angular.z)
             _last_cmd_t = time.monotonic()
-    node.create_subscription(Twist, "/cmd_vel_nav", _cmd_cb, 10)
+    node.create_subscription(Twist, "/cmd_vel_nav", _cmd_cb, 10)   # 订阅速度指令
 
     # -----------------------------------------------------------------------
     # BasicNavigator — do NOT call waitUntilNav2Active() here because TF
@@ -126,7 +129,7 @@ def main() -> None:
     navigator = BasicNavigator()
     _nav2_ready = threading.Event()
 
-    def _nav2_poller() -> None:
+    def _nav2_poller() -> None:   # 后台线程轮询 bt_navigator 的状态，当 Nav2 完全激活后，向父进程发送 {"ready": true} 信号
         """Poll bt_navigator/get_state until active, then emit ready."""
         import time as _time
         from lifecycle_msgs.srv import GetState
@@ -160,7 +163,7 @@ def main() -> None:
     # -----------------------------------------------------------------------
     # stdin reader thread
     # -----------------------------------------------------------------------
-    def _stdin_reader() -> None:
+    def _stdin_reader() -> None:   # 持续读取父进程通过 stdin 发送的 JSON 消息
         nonlocal _stop
         for raw_line in sys.stdin:
             raw_line = raw_line.strip()
@@ -227,7 +230,7 @@ def main() -> None:
             ps.pose.position.x = gx
             ps.pose.position.y = gy
             ps.pose.orientation.w = 1.0
-            navigator.goToPose(ps)
+            navigator.goToPose(ps)   # 调用 Nav2 的 goToPose 方法，触发路径规划和导航
             with _lock:
                 _nav_done    = False
                 _nav_failed  = False
@@ -248,6 +251,7 @@ def main() -> None:
         ros_now = node.get_clock().now().to_msg()
 
         # Publish TF at 50 Hz
+        # 发布TF变换
         if t_now - last_tf >= TF_PERIOD:
             last_tf = t_now
             tf_msg = TransformStamped()
@@ -276,6 +280,7 @@ def main() -> None:
                         f"stale={_stale_dbg}")
 
         # Publish Odometry at 50 Hz
+        # 发布里程计
         if t_now - last_odom >= ODOM_PERIOD:
             last_odom = t_now
             om = Odometry()
@@ -313,12 +318,12 @@ def main() -> None:
             nav_failed  = _nav_failed
         if task_active and not nav_done and not nav_failed:
             try:
-                if navigator.isTaskComplete():
+                if navigator.isTaskComplete():   # 检查导航完成
                     result = navigator.getResult()
                     nd = (result == TaskResult.SUCCEEDED)
                     nf = not nd
                     _eprint(f"[BridgeProc] task done={nd} fail={nf}")
-                    with _lock:
+                    with _lock:   # 发送状态到父进程
                         _nav_done   = nd
                         _nav_failed = nf
                         nav_done    = nd

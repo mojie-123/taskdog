@@ -1,7 +1,7 @@
-image: my_map_nav2.pgm
-resolution: 0.050000
-origin: [-10.0000, -10.0000, 0.0]
-negate: 0
-occupied_thresh: 0.65
-free_thresh: 0.196
-mode: trinary
+image: my_map_nav2.pgm   # 地图图像路径
+resolution: 0.050000   # 分辨率
+origin: [-10.0000, -10.0000, 0.0]   # 地图原点在 map 坐标系中的位置
+negate: 0   # 是否反转灰度值的含义。像素值越白（接近 255）表示空闲，越黑（接近 0）表示占据
+occupied_thresh: 0.65   # 占据阈值
+free_thresh: 0.196   # 空闲阈值。概率在 0.196 到 0.65 之间的栅格被标记为未知（Unknown，值为 -1）
+mode: trinary   # 地图解析模式。trinary（默认）：三值模式，栅格只有三种状态：空闲（0）、占据（100）、未知（-1）
