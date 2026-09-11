@@ -85,3 +85,14 @@ gym.register(
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:DeeproboticsM20ProFlatPPORunnerCfg",
     },
 )
+
+# Two-table variant: original table stretched in Y + second table at (9, 8).
+gym.register(
+    id="Flat-Deeprobotics-M20Pro-Piper-TwoTables-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.two_tables_env_cfg:DeeproboticsM20ProSinglePiperTwoTablesEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:DeeproboticsM20ProFlatPPORunnerCfg",
+    },
+)

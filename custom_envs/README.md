@@ -31,9 +31,19 @@ python3 custom_envs/scripts/navigation/convert_map.py     --map custom_envs/maps
 source /opt/ros/humble/setup.bash
 cd taskdog
 ros2 launch custom_envs/launch/nav2_isaac.launch.py     params_file:=$(pwd)/custom_envs/config/nav2_params.yaml     map:=$(pwd)/custom_envs/maps/my_map_nav2.yaml
+
+source /opt/ros/humble/setup.bash
+cd taskdog
+ros2 launch custom_envs/launch/nav2_isaac.launch.py     params_file:=$(pwd)/custom_envs/config/nav2_params.yaml     map:=$(pwd)/custom_envs/maps/map_whole_nav2.yaml
+
 # 终端2：
 source /opt/ros/humble/setup.bash
 conda activate env_isaaclab
 cd taskdog
 python custom_envs/scripts/navigation/navigate_to_goal_nav2.py     --task      Flat-Deeprobotics-M20Pro-Piper-Single-v0     --policy_task Flat-Deeprobotics-M20-v0     --load_run  2026-07-18_10-57-32     --checkpoint model_4999.pt     --map       custom_envs/maps/my_map.npz     --goal      4.5 5.0     --grasp_checkpoint /home/mojie/anygrasp_sdk/grasp_detection/log/checkpoint_detection.tar
+
+source /opt/ros/humble/setup.bash
+conda activate env_isaaclab
+cd taskdog
+python custom_envs/scripts/navigation/navigate_to_goal_nav2.py     --task      Flat-Deeprobotics-M20Pro-Piper-TwoTables-v0    --policy_task Flat-Deeprobotics-M20-v0     --load_run  2026-07-18_10-57-32     --checkpoint model_4999.pt     --map       custom_envs/maps/map_whole.npz     --goal      4.5 5.0     --grasp_checkpoint /home/mojie/anygrasp_sdk/grasp_detection/log/checkpoint_detection.tar
 ```

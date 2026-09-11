@@ -79,20 +79,20 @@ def main() -> None:
     tf_bcast     = TransformBroadcaster(node)   # 发布坐标变换
     static_bcast = StaticTransformBroadcaster(node)   # 发布里程计数据
 
-    qos = QoSProfile(
-        reliability=QoSReliabilityPolicy.RELIABLE,
-        durability=QoSDurabilityPolicy.VOLATILE,
-        history=QoSHistoryPolicy.KEEP_LAST, depth=10)
+    qos = QoSProfile(   # 配置 ROS 2 消息传输的服务质量（QoS），并创建一个用于发布里程计数据（/odom）的发布者
+        reliability=QoSReliabilityPolicy.RELIABLE,   # RELIABLE：可靠传输
+        durability=QoSDurabilityPolicy.VOLATILE,   # VOLATILE：瞬态（不缓存）
+        history=QoSHistoryPolicy.KEEP_LAST, depth=10)   # 保留最新10条
     odom_pub = node.create_publisher(Odometry, "/odom", qos)
 
     # Static map->odom identity transform (ground-truth localisation)
-    # 发布静态变换，因为 Isaac Sim 提供真实位姿，map 和 odom 坐标系重合。
-    stf = TransformStamped()
-    stf.header.stamp    = node.get_clock().now().to_msg()
+    # 在 ROS 2 的坐标变换树（TF Tree）中发布静态变换，因为 Isaac Sim 提供真实位姿，map 和 odom 坐标系重合。
+    stf = TransformStamped()   # 创建一个用于存储坐标变换信息的消息对象
+    stf.header.stamp    = node.get_clock().now().to_msg()   # 设置时间戳为当前 ROS 时间
     stf.header.frame_id = "map"
-    stf.child_frame_id  = "odom"
-    stf.transform.rotation.w = 1.0
-    static_bcast.sendTransform(stf)
+    stf.child_frame_id  = "odom"   # 描述的是"odom"相对于"map"的坐标变换
+    stf.transform.rotation.w = 1.0   # 四元数，无旋转。平移量默认为0
+    static_bcast.sendTransform(stf)   # 通过静态变换广播器发布这个变换（永远不变）
 
     # -----------------------------------------------------------------------
     # Shared state
@@ -126,8 +126,8 @@ def main() -> None:
     # Instead, poll bt_navigator/get_state in a background thread AFTER
     # the main loop has already begun broadcasting TF.
     # -----------------------------------------------------------------------
-    navigator = BasicNavigator()
-    _nav2_ready = threading.Event()
+    navigator = BasicNavigator()   # 实例化一个 Nav2 的高级导航控制器对象
+    _nav2_ready = threading.Event()   # 确保在 Nav2 还没完全启动好之前，主程序不会发送无效的导航请求，避免报错或任务丢失
 
     def _nav2_poller() -> None:   # 后台线程轮询 bt_navigator 的状态，当 Nav2 完全激活后，向父进程发送 {"ready": true} 信号
         """Poll bt_navigator/get_state until active, then emit ready."""

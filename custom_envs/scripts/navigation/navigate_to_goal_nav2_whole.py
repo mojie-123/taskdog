@@ -330,6 +330,17 @@ def main():
     _nav2_goal_sent = False
     _nav2_done      = False
 
+    # ---- 预加载 YOLO 分割模型（避免每次 GRASP_PLAN 重复加载）----
+    _yolo_seg = None
+    try:
+        from ultralytics import YOLO as _YOLO_CLS
+        _yolo_model_path = os.path.join(
+            os.path.dirname(__file__), "..", "..", "models", "yolov8m-seg.pt")
+        _yolo_seg = _YOLO_CLS(_yolo_model_path)
+        print(f"[YOLO] 分割模型已加载: {_yolo_model_path}", flush=True)
+    except Exception as _ye:
+        print(f"[YOLO] 模型加载失败，将回退到排除桌面法: {_ye}", flush=True)
+
     raw_env = env.unwrapped
 
     # ---- Send Nav2 goal via bridge subprocess ----
@@ -781,42 +792,89 @@ def main():
                             print("[SM] No valid grasps — DONE.", flush=True)
                             state = PipelineState.DONE
                         else:
-                            # ---- 香蕉颜色过滤 ----
+                            # ---- YOLO 实例分割过滤（回退到排除桌面法）----
                             _best_grasp_idx = 0
                             _bmask = None
                             try:
                                 import cv2 as _cv2_f
                                 if scan_rgb is not None:
-                                    _hsv_f = _cv2_f.cvtColor(scan_rgb, _cv2_f.COLOR_RGB2HSV)
-                                    _lower_b = np.array([20,  80,  80], dtype=np.uint8)
-                                    _upper_b = np.array([40, 255, 255], dtype=np.uint8)
-                                    _banana_px = _cv2_f.inRange(_hsv_f, _lower_b, _upper_b)
-                                    _n_bpx = int(_banana_px.sum() // 255)
-                                    print(f"[SM] 香蕉像素 mask: {_n_bpx} px", flush=True)
-                                    _cols_u8 = (cols * 255).astype(np.uint8).reshape(1, -1, 3)
-                                    _hsv_pts = _cv2_f.cvtColor(_cols_u8, _cv2_f.COLOR_RGB2HSV)[0]
-                                    _banana_in_cloud = (
-                                        (_hsv_pts[:, 0] >= _lower_b[0]) & (_hsv_pts[:, 0] <= _upper_b[0]) &
-                                        (_hsv_pts[:, 1] >= _lower_b[1]) & (_hsv_pts[:, 2] >= _lower_b[2])
-                                    )
-                                    _banana_pts_cam = pts[_banana_in_cloud]
-                                    print(f"[SM] 香蕉点云: {len(_banana_pts_cam)} pts", flush=True)
-                                    if len(_banana_pts_cam) >= 20:
-                                        from scipy.spatial import cKDTree as _KDTree
-                                        _kd = _KDTree(_banana_pts_cam)
-                                        _trans_all = gr["translations"]
-                                        _dists_all, _ = _kd.query(_trans_all, k=1)
-                                        _bmask = _dists_all < 0.05
-                                        _n_ok = int(_bmask.sum())
-                                        print(f"[SM] 颜色过滤: {_n_ok}/{len(_trans_all)} 落在香蕉上", flush=True)
-                                        if _n_ok > 0:
-                                            _best_grasp_idx = int(np.where(_bmask)[0][0])
+                                    if _yolo_seg is not None:
+                                        # ---- YOLO 分割路径 ----
+                                        _bgr_f = _cv2_f.cvtColor(scan_rgb, _cv2_f.COLOR_RGB2BGR)
+                                        _yolo_results = _yolo_seg(_bgr_f, verbose=False)
+                                        _banana_seg_mask = np.zeros(
+                                            (scan_rgb.shape[0], scan_rgb.shape[1]), dtype=bool)
+                                        for _r in _yolo_results:
+                                            if _r.masks is None:
+                                                continue
+                                            _cls_ids = _r.boxes.cls.cpu().numpy().astype(int)
+                                            for _mi, _cls in enumerate(_cls_ids):
+                                                if _cls == 46:  # COCO banana
+                                                    _seg_f = _r.masks.data[_mi].cpu().numpy()
+                                                    _seg_u8 = (_seg_f * 255).astype(np.uint8)
+                                                    _seg_bin = _cv2_f.resize(
+                                                        _seg_u8,
+                                                        (_banana_seg_mask.shape[1],
+                                                         _banana_seg_mask.shape[0]),
+                                                        interpolation=_cv2_f.INTER_NEAREST,
+                                                    ) > 127
+                                                    _banana_seg_mask |= _seg_bin
+                                        _n_bpx = int(_banana_seg_mask.sum())
+                                        print(f"[SM] YOLO 香蕉像素: {_n_bpx} px", flush=True)
+                                        # 保存带识别框的调试图
+                                        try:
+                                            _annotated_bgr = _yolo_results[0].plot()
+                                            _detect_path = "/home/mojie/taskdog/custom_envs/tmp_pictures/detect.png"
+                                            _cv2_f.imwrite(_detect_path, _annotated_bgr)
+                                            print(f"[SM] YOLO 识别图已保存: {_detect_path}", flush=True)
+                                        except Exception as _de:
+                                            print(f"[SM] detect.png 保存失败: {_de}", flush=True)
+                                        # YOLO路径：2D mask → 点云索引 → KDTree 过滤
+                                        _depth_valid_mask = (depth_med > 0.05) & (depth_med < 4.0)
+                                        _banana_in_cloud = _banana_seg_mask[_depth_valid_mask][_keep_mask]
+                                        _banana_pts_cam = pts[_banana_in_cloud]
+                                        print(f"[SM] YOLO 香蕉点云: {len(_banana_pts_cam)} pts", flush=True)
+                                        if len(_banana_pts_cam) >= 20:
+                                            from scipy.spatial import cKDTree as _KDTree
+                                            _kd = _KDTree(_banana_pts_cam)
+                                            _trans_all = gr["translations"]
+                                            _dists_all, _ = _kd.query(_trans_all, k=1)
+                                            _bmask = _dists_all < 0.05
+                                            _n_ok = int(_bmask.sum())
+                                            print(f"[SM] YOLO过滤: {_n_ok}/{len(_trans_all)} 落在香蕉上", flush=True)
+                                            if _n_ok > 0:
+                                                _best_grasp_idx = int(np.where(_bmask)[0][0])
+                                            else:
+                                                print("[SM] 无抓取落在香蕉区域，使用最高分 [0]", flush=True)
                                         else:
-                                            print("[SM] 无抓取落在香蕉区域，使用最高分 [0]", flush=True)
+                                            print(f"[SM] YOLO香蕉点云不足({len(_banana_pts_cam)}pts)，使用最高分 [0]", flush=True)
                                     else:
-                                        print(f"[SM] 香蕉点云不足({len(_banana_pts_cam)}pts)", flush=True)
+                                        # ---- 排除桌面法（YOLO 不可用时回退）----
+                                        # 对 post-RANSAC 点云颜色做 HSV，找灰白色桌面点，排除落在桌面上的候选
+                                        _cols_u8_fb = (cols * 255).astype(np.uint8).reshape(1, -1, 3)
+                                        _hsv_pts_fb = _cv2_f.cvtColor(_cols_u8_fb, _cv2_f.COLOR_RGB2HSV)[0]
+                                        _table_mask_fb = (
+                                            (_hsv_pts_fb[:, 1] < 40) &
+                                            (_hsv_pts_fb[:, 2] > 40) &
+                                            (_hsv_pts_fb[:, 2] < 160)
+                                        )
+                                        _table_pts_fb = pts[_table_mask_fb]
+                                        print(f"[SM] 排桌面回退: 桌面点 {len(_table_pts_fb)} pts", flush=True)
+                                        if len(_table_pts_fb) > 20:
+                                            from scipy.spatial import cKDTree as _KDTree_fb
+                                            _kd_fb = _KDTree_fb(_table_pts_fb)
+                                            _dists_tb, _ = _kd_fb.query(gr["translations"], k=1)
+                                            _bmask = _dists_tb >= 0.03  # 排除桌面上的候选，保留其余
+                                            _n_ok_fb = int(_bmask.sum())
+                                            print(f"[SM] 排桌面: 保留 {_n_ok_fb}/{len(gr['translations'])} 非桌面候选", flush=True)
+                                            if _n_ok_fb > 0:
+                                                _best_grasp_idx = int(np.where(_bmask)[0][0])
+                                            else:
+                                                print("[SM] 无非桌面候选，使用最高分 [0]", flush=True)
+                                        else:
+                                            print("[SM] 桌面点云不足，使用最高分 [0]", flush=True)
                             except Exception as _cfe:
-                                print(f"[SM] 颜色过滤异常: {_cfe}", flush=True)
+                                print(f"[SM] 目标过滤异常: {_cfe}", flush=True)
                             # ---- IK pre-screening + ranking ----
                             _q_scan_saved   = _q_scan_at_scan
                             _pos_w_scan_pre  = _pos_w_at_scan.copy()

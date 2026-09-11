@@ -49,10 +49,12 @@ def main():
     parser.add_argument("--checkpoint", default=None, help="checkpoint filename (default: latest)")
     parser.add_argument("--policy_task", default=None,
                         help="task whose trained model to use (default: same as --task)")
+    # 注入 Isaac Sim 标准参数（含 --enable_cameras, --headless 等）
+    from isaaclab.app import AppLauncher
+    AppLauncher.add_app_launcher_args(parser)
     args, unknown = parser.parse_known_args()
 
     # ---- Isaac Sim launch ----
-    from isaaclab.app import AppLauncher
     app_launcher = AppLauncher(args)
     simulation_app = app_launcher.app
 
@@ -62,7 +64,11 @@ def main():
     # Only the legacy Piper task uses a separate articulation that must be
     # synchronized to the mobile base. The Single task contains Piper in the
     # robot articulation itself and must not install this callback.
-    _dual_piper_mode = "Piper" in args.task and "Piper-Single" not in args.task
+    _dual_piper_mode = (
+        "Piper" in args.task
+        and "Piper-Single" not in args.task
+        and "TwoTables" not in args.task
+    )
     if _dual_piper_mode:
         from custom_envs.tasks.deeprobotics_m20_pro.piper_env_cfg import setup_piper_sync
 

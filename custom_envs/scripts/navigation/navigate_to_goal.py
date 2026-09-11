@@ -93,7 +93,11 @@ def main():
     # callback. Single-v0 embeds Piper inside the robot articulation itself and
     # has no separate 'piper' scene entity — calling setup_piper_sync on it
     # raises a KeyError.
-    _piper_mode = "Piper" in args.task and "Piper-Single" not in args.task
+    _piper_mode = (
+        "Piper" in args.task
+        and "Piper-Single" not in args.task
+        and "TwoTables" not in args.task
+    )
     if _piper_mode:
         from custom_envs.tasks.deeprobotics_m20_pro.piper_env_cfg import setup_piper_sync
 
