@@ -50,6 +50,12 @@ class PipelineState(enum.Enum):
     REACH        = "REACH"
     CLOSE        = "CLOSE"
     LIFT         = "LIFT"
+    PAN_NEG_X    = "PAN_NEG_X"   # 抓物后向世界 -X 平移 0.5m（离开桌边）
+    NAV2_DEST    = "NAV2_DEST"   # 用 Nav2 导航到 --destination 放置目标点
+    ALIGN_YAW_2  = "ALIGN_YAW_2" # 对齐朝向世界 -Y 方向（-π/2）
+    PAN_DES_X    = "PAN_DES_X"   # 精调到 --destination 的 X 坐标（PD控制，容差0.1m）
+    ROTATE       = "ROTATE"      # j1 转到 +π/2，j2~j6 保持 ARM_SIDE_ANGLES
+    PUT_DOWN     = "PUT_DOWN"    # 松夹爪放下物体，等待 100 步后 DONE
     DONE         = "DONE"
 
 
@@ -66,6 +72,11 @@ def main():
     parser.add_argument("--grasp_checkpoint", default=None)
     parser.add_argument("--grasp_topk", type=int, default=1)
     parser.add_argument("--nav2_arrival_radius", type=float, default=0.55)
+    parser.add_argument(
+        "--destination", nargs=2, type=float, default=None,
+        metavar=("X", "Y"),
+        help="放置目标世界坐标 (x y)，抓取成功后 Nav2 导航到此处放下物体。不指定则抓取成功后直接 DONE",
+    )
     parser.add_argument(
         "--object", default="banana",
         choices=["banana", "apple", "bowl"],
@@ -206,7 +217,10 @@ def main():
         PipelineState.ORIENT:     100,
         PipelineState.REACH:      100,
         PipelineState.CLOSE:      100,   # 100
-        PipelineState.LIFT:       300,
+        PipelineState.LIFT:       200,
+        PipelineState.ALIGN_YAW_2: 200,
+        PipelineState.ROTATE:     200,
+        PipelineState.PUT_DOWN:   100,
     }
     PRE_GRASP_MAX_WORLD_ERR = 0.10
     PRE_GRASP_MAX_JOINT_ERR = 0.35
@@ -340,6 +354,11 @@ def main():
     _nav2_goal_sent = False
     _nav2_done      = False
 
+    # 抓取后导航放置相关状态
+    _pan_neg_x_goal   = None   # PAN_NEG_X 目标坐标（抓取成功时由当前位置计算）
+    _dest_goal_sent   = False  # NAV2_DEST 是否已发送 goal
+    _rotate_j_target  = None   # ROTATE 阶段的目标关节角度（缓存）
+
     # ---- 预加载 YOLO 分割模型（避免每次 GRASP_PLAN 重复加载）----
     _yolo_seg = None
     try:
@@ -378,8 +397,8 @@ def main():
             _mat = _UsdShade.Material(_mat_prim)
             # 设置摩擦系数和弹性系数
             _phys_api = _UsdPhysics.MaterialAPI.Apply(_mat_prim)
-            _phys_api.CreateStaticFrictionAttr(2.0)
-            _phys_api.CreateDynamicFrictionAttr(2.0)
+            _phys_api.CreateStaticFrictionAttr(5.0)
+            _phys_api.CreateDynamicFrictionAttr(5.0)
             _phys_api.CreateRestitutionAttr(0.0)
             # 设置 combine mode（需要 PhysxSchema）
             try:
@@ -512,6 +531,35 @@ def main():
                         _v_cap = float(np.clip(2.0 * _err, 0.0, 0.3))
                         p_obs[0, 6] = 0.0
                         p_obs[0, 7] = float(np.clip(-math.copysign(_v_cap, _dx_w), -0.3, 0.3))
+                    p_obs[0, 8] = 0.0
+                elif state == PipelineState.PAN_NEG_X:
+                    # PD 控制：向世界 -X 方向平移，参考 PAN_VY 实现，不依赖 Nav2
+                    _dx_pan = _pan_neg_x_goal[0] - pos_w[0]
+                    _err_pan = abs(_dx_pan)
+                    _v_cap_pan = float(np.clip(2.0 * _err_pan, 0.0, 0.3))
+                    p_obs[0, 6] = 0.0
+                    p_obs[0, 7] = float(np.clip(-math.copysign(_v_cap_pan, _dx_pan), -0.3, 0.3))
+                    p_obs[0, 8] = 0.0
+                elif state == PipelineState.NAV2_DEST:
+                    # 用 Nav2 的 cmd_vel 驱动机器狗移动
+                    _nav_vx, _nav_oz = bridge.get_cmd_vel()
+                    p_obs[0, 6] = _nav_vx
+                    p_obs[0, 7] = 0.0
+                    p_obs[0, 8] = _nav_oz
+                elif state == PipelineState.ALIGN_YAW_2:
+                    # 对齐朝向世界 -Y 方向（目标 yaw = -π/2）
+                    _yaw_err2 = (-math.pi / 2 - yaw + math.pi) % (2 * math.pi) - math.pi
+                    p_obs[0, 6] = 0.0
+                    p_obs[0, 7] = 0.0
+                    p_obs[0, 8] = float(np.clip(100.0 * _yaw_err2, -1.2, 1.2))
+                elif state == PipelineState.PAN_DES_X:
+                    # PD 控制：精调世界 X 坐标到 destination[0]，参考 PAN_VY 实现
+                    # 注意：ALIGN_YAW_2 后机器狗朝向 -Y，机体Y轴对应世界+X，符号与PAN_VY相反
+                    _dx_des = args.destination[0] - pos_w[0]
+                    _err_des = abs(_dx_des)
+                    _v_cap_des = float(np.clip(2.0 * _err_des, 0.0, 0.3))
+                    p_obs[0, 6] = 0.0
+                    p_obs[0, 7] = float(np.clip(math.copysign(_v_cap_des, _dx_des), -0.3, 0.3))
                     p_obs[0, 8] = 0.0
                 else:
                     p_obs[0, 6] = 0.0
@@ -1354,9 +1402,17 @@ def main():
                     except Exception:
                         _obj_z = 0.0
                     if _obj_z > 0.75:
-                        print(f"[SM] LIFT done: {args.object} z={_obj_z:.3f}m > 0.75 -> DONE (SUCCESS)",
+                        print(f"[SM] LIFT done: {args.object} z={_obj_z:.3f}m > 0.75 -> SUCCESS",
                               flush=True)
-                        state = PipelineState.DONE
+                        if args.destination is not None:
+                            # 向世界 -X 方向平移 0.5m 离开桌边（PD控制，不用Nav2）
+                            _pan_neg_x_goal = (pos_w[0] - 0.5, pos_w[1])
+                            print(f"[SM] LIFT -> PAN_NEG_X goal=({_pan_neg_x_goal[0]:.2f}, "
+                                  f"{_pan_neg_x_goal[1]:.2f})", flush=True)
+                            state = PipelineState.PAN_NEG_X
+                            state_step = 0
+                        else:
+                            state = PipelineState.DONE
                     else:
                         print(f"[SM] LIFT done: {args.object} z={_obj_z:.3f}m <= 0.75 -> GRASP FAILED, retry PRE_GRASP",
                               flush=True)
@@ -1368,6 +1424,123 @@ def main():
                         state_step = 0
                         continue
 
+            # ---- PAN_NEG_X: 向世界 -X 方向平移 0.5m 离开桌边（PD控制，不依赖Nav2）----
+            elif state == PipelineState.PAN_NEG_X:
+                if state_step == 1:
+                    print(f"[SM] PAN_NEG_X: moving to ({_pan_neg_x_goal[0]:.2f}, "
+                          f"{_pan_neg_x_goal[1]:.2f}) via PD control ...", flush=True)
+                _arm_step(robot, ARM_SIDE_ANGLES)
+                _gripper_step(robot, close=True)
+                dist_pan = np.hypot(pos_w[0] - _pan_neg_x_goal[0],
+                                    pos_w[1] - _pan_neg_x_goal[1])
+                if dist_pan <= 0.2:
+                    print(f"[SM] PAN_NEG_X done (dist={dist_pan:.3f}m) -> NAV2_DEST",
+                          flush=True)
+                    _dest_goal_sent = False
+                    state = PipelineState.NAV2_DEST
+                    state_step = 0
+                elif state_step % 100 == 0:
+                    _dx_dbg = _pan_neg_x_goal[0] - pos_w[0]
+                    print(f"[SM] PAN_NEG_X step={state_step} dist={dist_pan:.3f}m "
+                          f"dx={_dx_dbg:.3f}m", flush=True)
+
+            # ---- NAV2_DEST: 导航到 --destination 放置目标点 ----
+            elif state == PipelineState.NAV2_DEST:
+                if not _dest_goal_sent:
+                    bridge.send_goal(float(args.destination[0]),
+                                     float(args.destination[1]))
+                    _dest_goal_sent = True
+                    print(f"[SM] NAV2_DEST: goal=({args.destination[0]:.2f}, "
+                          f"{args.destination[1]:.2f})", flush=True)
+                _arm_step(robot, ARM_SIDE_ANGLES)
+                _gripper_step(robot, close=True)
+                _dest_nav_done, _dest_nav_failed = bridge.get_nav_status()
+                if _dest_nav_done or _dest_nav_failed:
+                    dist_dest = np.hypot(pos_w[0] - args.destination[0],
+                                         pos_w[1] - args.destination[1])
+                    if dist_dest <= args.nav2_arrival_radius:
+                        print(f"[SM] NAV2_DEST done (dist={dist_dest:.3f}m) -> ALIGN_YAW_2",
+                              flush=True)
+                        state = PipelineState.ALIGN_YAW_2
+                        state_step = 0
+                    else:
+                        print(f"[SM] NAV2_DEST Nav2 ended but dist={dist_dest:.3f}m > "
+                              f"{args.nav2_arrival_radius}m, resending goal.", flush=True)
+                        bridge.send_goal(float(args.destination[0]),
+                                         float(args.destination[1]))
+                elif state_step % 100 == 0:
+                    dist_dest = np.hypot(pos_w[0] - args.destination[0],
+                                         pos_w[1] - args.destination[1])
+                    _dbg_vx2, _dbg_oz2 = bridge.get_cmd_vel()
+                    print(f"[SM] NAV2_DEST step={state_step} pos=({pos_w[0]:.1f},{pos_w[1]:.1f}) "
+                          f"dist={dist_dest:.2f}m vx={_dbg_vx2:.2f} w={_dbg_oz2:.3f}", flush=True)
+
+            # ---- ALIGN_YAW_2: 对齐朝向世界 -Y 方向（-π/2）----
+            elif state == PipelineState.ALIGN_YAW_2:
+                _yaw_err2 = (-math.pi / 2 - yaw + math.pi) % (2 * math.pi) - math.pi
+                if state_step == 1:
+                    print(f"[SM] ALIGN_YAW_2 start: cur={math.degrees(yaw):.1f}deg "
+                          f"target=-90deg err={math.degrees(_yaw_err2):.1f}deg", flush=True)
+                if state_step % 50 == 0:
+                    print(f"[SM] ALIGN_YAW_2 step {state_step}: "
+                          f"yaw={math.degrees(yaw):.1f}deg "
+                          f"err={math.degrees(_yaw_err2):.1f}deg", flush=True)
+                _arm_step(robot, ARM_SIDE_ANGLES)
+                _gripper_step(robot, close=True)
+                if abs(_yaw_err2) < 0.05 or state_step >= BUDGET[PipelineState.ALIGN_YAW_2]:
+                    print("[SM] ALIGN_YAW_2 done -> PAN_DES_X", flush=True)
+                    state = PipelineState.PAN_DES_X
+                    state_step = 0
+
+            # ---- PAN_DES_X: 精调到 --destination 的 X 坐标（PD控制，容差0.1m）----
+            elif state == PipelineState.PAN_DES_X:
+                _dx_des = args.destination[0] - pos_w[0]
+                if state_step == 1:
+                    print(f"[SM] PAN_DES_X start: target_x={args.destination[0]:.2f} "
+                          f"cur_x={pos_w[0]:.2f} dx={_dx_des:.3f}m", flush=True)
+                _arm_step(robot, ARM_SIDE_ANGLES)
+                _gripper_step(robot, close=True)
+                if abs(_dx_des) <= 0.1:
+                    print(f"[SM] PAN_DES_X done (dx={_dx_des:.3f}m) -> ROTATE", flush=True)
+                    _rotate_j_target = ARM_SIDE_ANGLES.copy()
+                    _rotate_j_target[0] = math.pi / 2
+                    state = PipelineState.ROTATE
+                    state_step = 0
+                elif state_step % 100 == 0:
+                    print(f"[SM] PAN_DES_X step={state_step} cur_x={pos_w[0]:.2f} "
+                          f"target_x={args.destination[0]:.2f} dx={_dx_des:.3f}m", flush=True)
+
+            # ---- ROTATE: j1 直接跳到 +π/2，j2~j6 保持 ARM_SIDE_ANGLES ----
+            elif state == PipelineState.ROTATE:
+                if state_step == 1:
+                    print("[SM] ROTATE: j1 -> +π/2, j2~j6 hold ARM_SIDE_ANGLES",
+                          flush=True)
+                _arm_step(robot, _rotate_j_target)
+                _gripper_step(robot, close=True)
+                if state_step % 50 == 0:
+                    cur_q = robot.data.joint_pos[
+                        0, list(_get_arm_ids(robot)[0])
+                    ].cpu().numpy()
+                    print(f"[SM] ROTATE step={state_step}/{BUDGET[PipelineState.ROTATE]}: "
+                          f"j1={cur_q[0]:.3f} (target={_rotate_j_target[0]:.3f})",
+                          flush=True)
+                if state_step >= BUDGET[PipelineState.ROTATE]:
+                    print("[SM] ROTATE done -> PUT_DOWN", flush=True)
+                    state = PipelineState.PUT_DOWN
+                    state_step = 0
+
+            # ---- PUT_DOWN: 第1步松夹爪，保持关节角，等待 100 步后 DONE ----
+            elif state == PipelineState.PUT_DOWN:
+                if state_step == 1:
+                    print("[SM] PUT_DOWN: opening gripper to release object", flush=True)
+                _arm_step(robot, _rotate_j_target)
+                _gripper_step(robot, close=False)
+                if state_step % 50 == 0:
+                    print(f"[SM] PUT_DOWN step={state_step}/{BUDGET[PipelineState.PUT_DOWN]}",
+                          flush=True)
+                if state_step >= BUDGET[PipelineState.PUT_DOWN]:
+                    print("[SM] PUT_DOWN done -> DONE", flush=True)
+                    state = PipelineState.DONE
 
     except Exception as e:
         print(f"[ERROR] {e}", flush=True)

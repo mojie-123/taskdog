@@ -43,7 +43,9 @@ def log_odds_to_pgm_pixel(log_odds_grid: np.ndarray) -> np.ndarray:
     pgm = np.full(log_odds_grid.shape, 205, dtype=np.uint8)  # default: unknown
     pgm[log_odds_grid < -0.5] = 254  # free -> white
     pgm[log_odds_grid > 0.5] = 0     # occupied -> black
-    return pgm
+    # Nav2 的 PGM 格式 row=0 在图像顶部（世界 Y 最大），
+    # 而 npz grid row=0 对应世界 Y 最小（origin_y），需要垂直翻转修正 Y 轴方向。
+    return np.flipud(pgm)
 
 
 def write_pgm(pgm: np.ndarray, path: str) -> None:
