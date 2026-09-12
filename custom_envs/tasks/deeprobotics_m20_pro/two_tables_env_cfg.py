@@ -33,7 +33,7 @@ APPLE_USD = os.path.join(_OBJ_DIR, "013_apple", "013_apple.usd")
 BOWL_USD  = os.path.join(_OBJ_DIR, "024_bowl",  "024_bowl.usd")
 
 
-def _apple_cfg(pos=(4.9, 4.5, 0.75), rot=(1.0, 0.0, 0.0, 0.0)):
+def _apple_cfg(pos=(4.9, 4.5, 0.73), rot=(1.0, 0.0, 0.0, 0.0)):
     """RigidObject config for the YCB apple (013_apple) on Table 1."""
     return RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/apple",
@@ -57,7 +57,7 @@ def _apple_cfg(pos=(4.9, 4.5, 0.75), rot=(1.0, 0.0, 0.0, 0.0)):
     )
 
 
-def _bowl_cfg(pos=(4.9, 5.5, 0.75), rot=(1.0, 0.0, 0.0, 0.0)):
+def _bowl_cfg(pos=(4.9, 5.5, 0.73), rot=(1.0, 0.0, 0.0, 0.0)):
     """RigidObject config for the YCB bowl (024_bowl) on Table 1."""
     return RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/bowl",

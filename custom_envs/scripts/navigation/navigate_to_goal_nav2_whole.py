@@ -66,6 +66,11 @@ def main():
     parser.add_argument("--grasp_checkpoint", default=None)
     parser.add_argument("--grasp_topk", type=int, default=1)
     parser.add_argument("--nav2_arrival_radius", type=float, default=0.55)
+    parser.add_argument(
+        "--object", default="banana",
+        choices=["banana", "apple", "bowl"],
+        help="抓取目标物体，决定 YOLO 识别的类别 (default: banana)",
+    )
     args, unknown = parser.parse_known_args()
 
     # ---- Isaac Sim launch ----
@@ -88,6 +93,11 @@ def main():
 
     from custom_envs.utils.occupancy_grid import OccupancyGrid
     from custom_envs.utils.nav_utils import euler_from_quat, is_goal_reached
+
+    # ---- 目标物体 → COCO class id 映射 ----
+    _OBJECT_CLASS_ID = {"banana": 46, "apple": 47, "bowl": 51}
+    _target_cls_id = _OBJECT_CLASS_ID[args.object]
+    print(f"[INFO] 抓取目标: {args.object} (COCO class {_target_cls_id})", flush=True)
 
     grid = OccupancyGrid.load(args.map)
     goal_world = (args.goal[0], args.goal[1])
@@ -179,7 +189,7 @@ def main():
         "hr_hipx_joint", "hr_hipy_joint", "hr_knee_joint",
     ]
     GRIPPER_OPEN_POS  = [ 0.035, -0.035]
-    GRIPPER_CLOSE_POS = [-0.035,  0.035]
+    GRIPPER_CLOSE_POS = [0.,  0.]
     PRE_GRASP_RETREAT = 0.1
     REACH_RETREAT     = 0.0
     ARM_HOME_ANGLES   = np.array([0.0, 0.5, -1.0, 0.0, 0.5, 0.0], dtype=np.float32)
@@ -190,12 +200,12 @@ def main():
     TARGET_YAW        = math.pi / 2
 
     BUDGET = {
-        PipelineState.ARM_INIT:   600,
+        PipelineState.ARM_INIT:   300,   # 600
         PipelineState.PRE_ADJUST: 0,
-        PipelineState.PRE_GRASP:  500,
-        PipelineState.ORIENT:     300,
-        PipelineState.REACH:      250,
-        PipelineState.CLOSE:      200,
+        PipelineState.PRE_GRASP:  200,   # 500
+        PipelineState.ORIENT:     100,
+        PipelineState.REACH:      100,
+        PipelineState.CLOSE:      100,   # 100
         PipelineState.LIFT:       300,
     }
     PRE_GRASP_MAX_WORLD_ERR = 0.10
@@ -342,6 +352,54 @@ def main():
         print(f"[YOLO] 模型加载失败，将回退到排除桌面法: {_ye}", flush=True)
 
     raw_env = env.unwrapped
+
+    # === 动态设置抓取目标物体的摩擦系数 ===
+    # UsdFileCfg 不支持 physics_material 参数，需在 env 初始化后通过 USD API 动态绑定。
+    # PhysX 两个接触面摩擦系数用 multiply 模式合并：
+    #   夹爪手指（无显式材质，默认 0.5） × 物体（设为 2.0） = 1.0
+    # restitution=0.0 + combine min：消除弹性，防止夹住瞬间物体弹飞。
+    try:
+        import omni.usd as _omni_usd
+        from pxr import UsdShade as _UsdShade, UsdPhysics as _UsdPhysics
+        _stage = _omni_usd.get_context().get_stage()
+        _friction_targets = {
+            "banana": "/World/envs/env_0/banana",
+            "apple":  "/World/envs/env_0/apple",
+            "bowl":   "/World/envs/env_0/bowl",
+        }
+        for _obj_name, _prim_path in _friction_targets.items():
+            _prim = _stage.GetPrimAtPath(_prim_path)
+            if not _prim.IsValid():
+                print(f"[FRICTION] prim not found: {_prim_path}, skipping", flush=True)
+                continue
+            # 在物体根 prim 下创建物理材质
+            _mat_path = f"{_prim_path}/frictionMaterial"
+            _mat_prim = _stage.DefinePrim(_mat_path, "Material")
+            _mat = _UsdShade.Material(_mat_prim)
+            # 设置摩擦系数和弹性系数
+            _phys_api = _UsdPhysics.MaterialAPI.Apply(_mat_prim)
+            _phys_api.CreateStaticFrictionAttr(2.0)
+            _phys_api.CreateDynamicFrictionAttr(2.0)
+            _phys_api.CreateRestitutionAttr(0.0)
+            # 设置 combine mode（需要 PhysxSchema）
+            try:
+                from pxr import PhysxSchema as _PhysxSchema
+                _physx_api = _PhysxSchema.PhysxMaterialAPI.Apply(_mat_prim)
+                _physx_api.CreateFrictionCombineModeAttr("multiply")
+                _physx_api.CreateRestitutionCombineModeAttr("min")
+            except Exception:
+                pass  # PhysxSchema 不可用时跳过，PhysX 默认用 average 合并
+            # 绑定到根 prim（继承到所有子碰撞 prim）
+            _binding_api = _UsdShade.MaterialBindingAPI.Apply(_prim)
+            _binding_api.Bind(
+                _mat,
+                bindingStrength=_UsdShade.Tokens.weakerThanDescendants,
+                materialPurpose="physics"
+            )
+            print(f"[FRICTION] static/dynamic=2.0 restitution=0.0 applied to {_obj_name}", flush=True)
+    except Exception as _fe:
+        print(f"[WARN] Failed to apply friction materials: {_fe}", flush=True)
+    # === 摩擦系数设置完毕 ===
 
     # ---- Send Nav2 goal via bridge subprocess ----
     print(f"[NAV2] Sending goal: x={goal_world[0]:.2f} y={goal_world[1]:.2f}",
@@ -792,87 +850,103 @@ def main():
                             print("[SM] No valid grasps — DONE.", flush=True)
                             state = PipelineState.DONE
                         else:
-                            # ---- YOLO 实例分割过滤（回退到排除桌面法）----
+                            # ---- 目标过滤：YOLO(classes限制) → 非灰色点云 fallback ----
                             _best_grasp_idx = 0
                             _bmask = None
                             try:
                                 import cv2 as _cv2_f
-                                if scan_rgb is not None:
-                                    if _yolo_seg is not None:
-                                        # ---- YOLO 分割路径 ----
-                                        _bgr_f = _cv2_f.cvtColor(scan_rgb, _cv2_f.COLOR_RGB2BGR)
-                                        _yolo_results = _yolo_seg(_bgr_f, verbose=False)
-                                        _banana_seg_mask = np.zeros(
-                                            (scan_rgb.shape[0], scan_rgb.shape[1]), dtype=bool)
-                                        for _r in _yolo_results:
-                                            if _r.masks is None:
-                                                continue
-                                            _cls_ids = _r.boxes.cls.cpu().numpy().astype(int)
-                                            for _mi, _cls in enumerate(_cls_ids):
-                                                if _cls == 46:  # COCO banana
-                                                    _seg_f = _r.masks.data[_mi].cpu().numpy()
-                                                    _seg_u8 = (_seg_f * 255).astype(np.uint8)
-                                                    _seg_bin = _cv2_f.resize(
-                                                        _seg_u8,
-                                                        (_banana_seg_mask.shape[1],
-                                                         _banana_seg_mask.shape[0]),
-                                                        interpolation=_cv2_f.INTER_NEAREST,
-                                                    ) > 127
-                                                    _banana_seg_mask |= _seg_bin
-                                        _n_bpx = int(_banana_seg_mask.sum())
-                                        print(f"[SM] YOLO 香蕉像素: {_n_bpx} px", flush=True)
-                                        # 保存带识别框的调试图
-                                        try:
-                                            _annotated_bgr = _yolo_results[0].plot()
-                                            _detect_path = "/home/mojie/taskdog/custom_envs/tmp_pictures/detect.png"
-                                            _cv2_f.imwrite(_detect_path, _annotated_bgr)
-                                            print(f"[SM] YOLO 识别图已保存: {_detect_path}", flush=True)
-                                        except Exception as _de:
-                                            print(f"[SM] detect.png 保存失败: {_de}", flush=True)
-                                        # YOLO路径：2D mask → 点云索引 → KDTree 过滤
-                                        _depth_valid_mask = (depth_med > 0.05) & (depth_med < 4.0)
-                                        _banana_in_cloud = _banana_seg_mask[_depth_valid_mask][_keep_mask]
-                                        _banana_pts_cam = pts[_banana_in_cloud]
-                                        print(f"[SM] YOLO 香蕉点云: {len(_banana_pts_cam)} pts", flush=True)
-                                        if len(_banana_pts_cam) >= 20:
-                                            from scipy.spatial import cKDTree as _KDTree
-                                            _kd = _KDTree(_banana_pts_cam)
-                                            _trans_all = gr["translations"]
-                                            _dists_all, _ = _kd.query(_trans_all, k=1)
-                                            _bmask = _dists_all < 0.05
-                                            _n_ok = int(_bmask.sum())
-                                            print(f"[SM] YOLO过滤: {_n_ok}/{len(_trans_all)} 落在香蕉上", flush=True)
-                                            if _n_ok > 0:
-                                                _best_grasp_idx = int(np.where(_bmask)[0][0])
-                                            else:
-                                                print("[SM] 无抓取落在香蕉区域，使用最高分 [0]", flush=True)
+                                from scipy.spatial import cKDTree as _KDTree_f
+                                _yolo_ok = False
+                                if scan_rgb is not None and _yolo_seg is not None:
+                                    # ---- YOLO 分割（限定 banana/apple/bowl）----
+                                    _bgr_f = _cv2_f.cvtColor(scan_rgb, _cv2_f.COLOR_RGB2BGR)
+                                    _yolo_results = _yolo_seg(
+                                        _bgr_f, verbose=False,
+                                        classes=[46, 47, 51])  # banana=46,apple=47,bowl=51
+                                    _banana_seg_mask = np.zeros(
+                                        (scan_rgb.shape[0], scan_rgb.shape[1]), dtype=bool)
+                                    for _r in _yolo_results:
+                                        if _r.masks is None:
+                                            continue
+                                        _cls_ids = _r.boxes.cls.cpu().numpy().astype(int)
+                                        for _mi, _cls in enumerate(_cls_ids):
+                                            if _cls == _target_cls_id:
+                                                _seg_f = _r.masks.data[_mi].cpu().numpy()
+                                                _seg_u8 = (_seg_f * 255).astype(np.uint8)
+                                                _seg_bin = _cv2_f.resize(
+                                                    _seg_u8,
+                                                    (_banana_seg_mask.shape[1],
+                                                     _banana_seg_mask.shape[0]),
+                                                    interpolation=_cv2_f.INTER_NEAREST,
+                                                ) > 127
+                                                _banana_seg_mask |= _seg_bin
+                                    _n_bpx = int(_banana_seg_mask.sum())
+                                    print(f"[SM] YOLO 目标像素: {_n_bpx} px", flush=True)
+                                    # 保存带识别框的调试图
+                                    try:
+                                        _annotated_bgr = _yolo_results[0].plot()
+                                        _detect_path = "/home/mojie/taskdog/custom_envs/tmp_pictures/detect.png"
+                                        _cv2_f.imwrite(_detect_path, _annotated_bgr)
+                                        print(f"[SM] YOLO 识别图已保存: {_detect_path}", flush=True)
+                                    except Exception as _de:
+                                        print(f"[SM] detect.png 保存失败: {_de}", flush=True)
+                                    # 2D mask → 点云索引 → KDTree 过滤
+                                    _depth_valid_mask = (depth_med > 0.05) & (depth_med < 4.0)
+                                    _banana_in_cloud = _banana_seg_mask[_depth_valid_mask][_keep_mask]
+                                    _banana_pts_cam = pts[_banana_in_cloud]
+                                    print(f"[SM] YOLO 目标点云: {len(_banana_pts_cam)} pts", flush=True)
+                                    if len(_banana_pts_cam) >= 20:
+                                        _kd = _KDTree_f(_banana_pts_cam)
+                                        _dists_all, _ = _kd.query(gr["translations"], k=1)
+                                        _bmask_yolo = _dists_all < 0.05
+                                        _n_ok = int(_bmask_yolo.sum())
+                                        print(f"[SM] YOLO过滤: {_n_ok}/{len(gr['translations'])} 落在目标上", flush=True)
+                                        if _n_ok > 0:
+                                            _bmask = _bmask_yolo
+                                            _best_grasp_idx = int(np.where(_bmask)[0][0])
+                                            _yolo_ok = True
                                         else:
-                                            print(f"[SM] YOLO香蕉点云不足({len(_banana_pts_cam)}pts)，使用最高分 [0]", flush=True)
+                                            print("[SM] YOLO: 无候选落在目标区域 -> 非灰色过滤", flush=True)
                                     else:
-                                        # ---- 排除桌面法（YOLO 不可用时回退）----
-                                        # 对 post-RANSAC 点云颜色做 HSV，找灰白色桌面点，排除落在桌面上的候选
-                                        _cols_u8_fb = (cols * 255).astype(np.uint8).reshape(1, -1, 3)
-                                        _hsv_pts_fb = _cv2_f.cvtColor(_cols_u8_fb, _cv2_f.COLOR_RGB2HSV)[0]
-                                        _table_mask_fb = (
-                                            (_hsv_pts_fb[:, 1] < 40) &
-                                            (_hsv_pts_fb[:, 2] > 40) &
-                                            (_hsv_pts_fb[:, 2] < 160)
-                                        )
-                                        _table_pts_fb = pts[_table_mask_fb]
-                                        print(f"[SM] 排桌面回退: 桌面点 {len(_table_pts_fb)} pts", flush=True)
-                                        if len(_table_pts_fb) > 20:
-                                            from scipy.spatial import cKDTree as _KDTree_fb
-                                            _kd_fb = _KDTree_fb(_table_pts_fb)
-                                            _dists_tb, _ = _kd_fb.query(gr["translations"], k=1)
-                                            _bmask = _dists_tb >= 0.03  # 排除桌面上的候选，保留其余
-                                            _n_ok_fb = int(_bmask.sum())
-                                            print(f"[SM] 排桌面: 保留 {_n_ok_fb}/{len(gr['translations'])} 非桌面候选", flush=True)
-                                            if _n_ok_fb > 0:
-                                                _best_grasp_idx = int(np.where(_bmask)[0][0])
-                                            else:
-                                                print("[SM] 无非桌面候选，使用最高分 [0]", flush=True)
+                                        print(f"[SM] YOLO目标点云不足({len(_banana_pts_cam)}pts) -> 非灰色过滤", flush=True)
+                                # ---- 高饱和过滤 S>=80（YOLO失败时fallback）----
+                                if not _yolo_ok:
+                                    _cols_u8_ng = (cols * 255).astype(np.uint8).reshape(1, -1, 3)
+                                    _hsv_ng = _cv2_f.cvtColor(_cols_u8_ng, _cv2_f.COLOR_RGB2HSV)[0]
+                                    _vivid_mask = (_hsv_ng[:, 1] >= 80)  # 只保留高饱和度鲜艳点
+                                    _vivid_pts = pts[_vivid_mask]
+                                    print(f"[SM] 高饱和过滤(S>=80): {len(_vivid_pts)} 鲜艳点", flush=True)
+                                    # ---- 生成 filter.png ----
+                                    try:
+                                        if scan_rgb is not None:
+                                            _mask_flat = mask.ravel()                # 307200维 bool
+                                            _valid_idx_flat = np.where(_mask_flat)[0] # 有效深度点flat索引
+                                            _filter_img = scan_rgb.copy()
+                                            _filter_flat = _filter_img.reshape(-1, 3)
+                                            _filter_flat[~_mask_flat] = 0             # 类A:无效深度变黑
+                                            _filter_flat[_valid_idx_flat[~_keep_mask]] = 0  # 类B:RANSAC桌面点变黑
+                                            _filter_flat[_valid_idx_flat[_keep_mask][~_vivid_mask]] = 0  # 类C:S<80变黑
+                                            _filter_bgr = _cv2_f.cvtColor(
+                                                _filter_flat.reshape(H, W, 3), _cv2_f.COLOR_RGB2BGR)
+                                            _filter_path = "/home/mojie/taskdog/custom_envs/tmp_pictures/filter.png"
+                                            os.makedirs("/home/mojie/taskdog/custom_envs/tmp_pictures", exist_ok=True)
+                                            _cv2_f.imwrite(_filter_path, _filter_bgr)
+                                            print(f"[SM] filter.png 已保存: {_filter_path}", flush=True)
+                                    except Exception as _fe:
+                                        print(f"[SM] filter.png 保存失败: {_fe}", flush=True)
+                                    if len(_vivid_pts) >= 20:
+                                        _kd_ng = _KDTree_f(_vivid_pts)
+                                        _dists_ng, _ = _kd_ng.query(gr["translations"], k=1)
+                                        _bmask_ng = _dists_ng < 0.05
+                                        _n_ok_ng = int(_bmask_ng.sum())
+                                        print(f"[SM] 高饱和过滤: {_n_ok_ng}/{len(gr['translations'])} 候选近鲜艳点", flush=True)
+                                        if _n_ok_ng > 0:
+                                            _bmask = _bmask_ng
+                                            _best_grasp_idx = int(np.where(_bmask)[0][0])
                                         else:
-                                            print("[SM] 桌面点云不足，使用最高分 [0]", flush=True)
+                                            print("[SM] 高饱和过滤无候选 -> 全部候选进排序", flush=True)
+                                    else:
+                                        print("[SM] 高饱和点不足 -> 全部候选进排序", flush=True)
                             except Exception as _cfe:
                                 print(f"[SM] 目标过滤异常: {_cfe}", flush=True)
                             # ---- IK pre-screening + ranking ----
@@ -891,9 +965,10 @@ def main():
                             _R_rob_scan  = _q2r_scan(_quat_w_scan_pre)
                             _R_gb_scan   = _fkg_scan(_q_scan_saved)[:3, :3]
                             _R_cam2world = _R_rob_scan @ _R_gb_scan @ _COR_scan
-                            _banana_idxs_pre = list(np.where(_bmask)[0]) if _bmask is not None else [_best_grasp_idx]
+                            # _bmask=None 时让全部候选进 IK ranking，不再只用 [0]
+                            _banana_idxs_pre = list(np.where(_bmask)[0]) if _bmask is not None else list(range(len(gr["scores"])))
                             if not _banana_idxs_pre:
-                                _banana_idxs_pre = [_best_grasp_idx]
+                                _banana_idxs_pre = list(range(len(gr["scores"])))
                             _ranked_pre = []
                             for _ci_pre in _banana_idxs_pre:
                                 _t_ci  = gr["translations"][_ci_pre]
@@ -1036,6 +1111,37 @@ def main():
                     _pg_t_gb_world_fixed = _R_rob_pg @ pre_t_gb + _arm_base_w_pg
                     print(f"[SM] PRE_GRASP IK={np.round(target_angles_arm,3)}", flush=True)
                     print(f"[DIAG] PRE_GRASP gripper_base IK target world={np.round(_pg_t_gb_world_fixed,4)}", flush=True)
+                    # ---- 保存 choice.png：在 scan_rgb 上标记最终执行的抓取点和 closing 轴 ----
+                    try:
+                        import cv2 as _cv2_ch
+                        if scan_rgb is not None:
+                            _ch_img = _cv2_ch.cvtColor(scan_rgb, _cv2_ch.COLOR_RGB2BGR).copy()
+                        else:
+                            _ch_img = np.zeros((480, 640, 3), dtype=np.uint8)
+                        _H_ch, _W_ch = _ch_img.shape[:2]
+                        _fx_ch, _fy_ch = 616.0, 616.0
+                        _cx_ch, _cy_ch = _W_ch / 2.0, _H_ch / 2.0
+                        _t_sel = grasp_result["t_cam"]   # [X,Y,Z] 相机坐标系，最终执行的候选
+                        _R_sel = grasp_result["R_cam"]   # 3×3，[:,1]=closing轴
+                        # 抓取点投影到像素
+                        _u0 = int(_t_sel[0] / _t_sel[2] * _fx_ch + _cx_ch)
+                        _v0 = int(_t_sel[1] / _t_sel[2] * _fy_ch + _cy_ch)
+                        # closing 轴端点（沿 closing 轴延伸 0.05m 后投影）
+                        _closing_end = _t_sel + _R_sel[:, 1] * 0.05
+                        _u1 = int(_closing_end[0] / _closing_end[2] * _fx_ch + _cx_ch)
+                        _v1 = int(_closing_end[1] / _closing_end[2] * _fy_ch + _cy_ch)
+                        # 画红点（抓取点）
+                        _cv2_ch.circle(_ch_img, (_u0, _v0), 6, (0, 0, 255), -1)
+                        # 画绿色箭头（closing 轴方向）
+                        _cv2_ch.arrowedLine(_ch_img, (_u0, _v0), (_u1, _v1),
+                                            (0, 255, 0), 2, tipLength=0.3)
+                        os.makedirs("/home/mojie/taskdog/custom_envs/tmp_pictures", exist_ok=True)
+                        _choice_path = "/home/mojie/taskdog/custom_envs/tmp_pictures/choice.png"
+                        _cv2_ch.imwrite(_choice_path, _ch_img)
+                        print(f"[SM] choice.png 已保存: {_choice_path}  "
+                              f"grasp_pt=({_u0},{_v0}) closing=({_u1},{_v1})", flush=True)
+                    except Exception as _che:
+                        print(f"[SM] choice.png 保存失败: {_che}", flush=True)
                     _pg_cmd = cur_q.copy()
                     _pg_target_cur = target_angles_arm.copy()
                 cur_q = robot.data.joint_pos[
@@ -1048,7 +1154,7 @@ def main():
                                   [lo for lo, hi in _IK_JOINT_LIMITS],
                                   [hi for lo, hi in _IK_JOINT_LIMITS])
                 _arm_step(robot, _pg_cmd)
-                _gripper_width_step(robot, grasp_result["width"])
+                _gripper_step(robot, close=False)  # PRE_GRASP 阶段夹爪全开
                 if state_step % 50 == 0:
                     _err = np.abs(cur_q - _pg_target_cur)
                     _pg_step_pos_w = robot.data.root_pos_w[0].cpu().numpy()
@@ -1126,7 +1232,7 @@ def main():
                 q_cmd = _orient_q_fixed.copy()
                 q_cmd[5] = j6_target
                 _arm_step(robot, q_cmd)
-                _gripper_width_step(robot, grasp_result["width"])
+                _gripper_step(robot, close=False)  # ORIENT 阶段夹爪全开
                 if state_step % 50 == 0:
                     j6_err = abs(cur_q[5] - j6_target)
                     print(f"[SM] ORIENT step {state_step}/{BUDGET[PipelineState.ORIENT]}: "
@@ -1158,6 +1264,10 @@ def main():
                     target_angles_arm = ik_solve_gb_re(
                         _re_t_gb_arm, target_rot_j7=R_arm,
                         initial_angles=grasp_result["target_angles_pre"])
+                    if target_angles_arm is None:
+                        print("[WARN] REACH IK returned None -> fallback to pre-grasp angles", flush=True)
+                        target_angles_arm = grasp_result["target_angles_pre"].copy()
+                        _re_t_gb_arm = _re_pre_t_gb.copy()
                     _re_q_jump = np.abs(target_angles_arm - grasp_result["target_angles_pre"])
                     print(f"[DIAG] REACH jump check: max={_re_q_jump.max()*57.3:.1f}deg threshold=28.6deg", flush=True)
                     if _re_q_jump.max() > 0.5:
@@ -1179,7 +1289,7 @@ def main():
                 q6 = np.clip(_re_target_cur.copy(), [lo for lo, hi in _IK_JOINT_LIMITS],
                                                     [hi for lo, hi in _IK_JOINT_LIMITS])
                 _arm_step(robot, q6)
-                _gripper_width_step(robot, grasp_result["width"])
+                _gripper_step(robot, close=False)  # REACH 阶段夹爪全开
                 if state_step % 50 == 0:
                     _err = np.abs(cur_q - _re_target_cur)
                     _ee_now_arm = _fkg_re(cur_q)[:3, 3]
@@ -1239,16 +1349,16 @@ def main():
                           f"max_err={_err.max():.3f}", flush=True)
                 if state_step >= BUDGET[PipelineState.LIFT]:
                     try:
-                        _banana_pos = raw_env.scene["banana"].data.root_pos_w[0].cpu().numpy()
-                        _banana_z = float(_banana_pos[2])
+                        _obj_pos = raw_env.scene[args.object].data.root_pos_w[0].cpu().numpy()
+                        _obj_z = float(_obj_pos[2])
                     except Exception:
-                        _banana_z = 0.0
-                    if _banana_z > 0.75:
-                        print(f"[SM] LIFT done: banana z={_banana_z:.3f}m > 0.75 -> DONE (SUCCESS)",
+                        _obj_z = 0.0
+                    if _obj_z > 0.75:
+                        print(f"[SM] LIFT done: {args.object} z={_obj_z:.3f}m > 0.75 -> DONE (SUCCESS)",
                               flush=True)
                         state = PipelineState.DONE
                     else:
-                        print(f"[SM] LIFT done: banana z={_banana_z:.3f}m <= 0.75 -> GRASP FAILED, retry PRE_GRASP",
+                        print(f"[SM] LIFT done: {args.object} z={_obj_z:.3f}m <= 0.75 -> GRASP FAILED, retry PRE_GRASP",
                               flush=True)
                         grasp_result = None
                         depth_accum.clear()
