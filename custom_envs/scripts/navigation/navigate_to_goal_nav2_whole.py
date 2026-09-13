@@ -217,7 +217,7 @@ def main():
         PipelineState.ORIENT:     100,
         PipelineState.REACH:      100,
         PipelineState.CLOSE:      100,   # 100
-        PipelineState.LIFT:       200,
+        PipelineState.LIFT:       150,
         PipelineState.ALIGN_YAW_2: 200,
         PipelineState.ROTATE:     200,
         PipelineState.PUT_DOWN:   100,
@@ -357,7 +357,10 @@ def main():
     # 抓取后导航放置相关状态
     _pan_neg_x_goal   = None   # PAN_NEG_X 目标坐标（抓取成功时由当前位置计算）
     _dest_goal_sent   = False  # NAV2_DEST 是否已发送 goal
-    _rotate_j_target  = None   # ROTATE 阶段的目标关节角度（缓存）
+    _rotate_j_target  = None   # ROTATE 阶段的目标关节角度（最终值，PUT_DOWN 用）
+    _rotate_j1_start  = None   # ROTATE 阶段 j1 起始实际角度（用于线性插值）
+    _rotate_j2_start  = None   # ROTATE 阶段 j2 起始实际角度（用于线性插值）
+    _rotate_j3_start  = None   # ROTATE 阶段 j3 起始实际角度（用于线性插值）
 
     # ---- 预加载 YOLO 分割模型（避免每次 GRASP_PLAN 重复加载）----
     _yolo_seg = None
@@ -372,50 +375,77 @@ def main():
 
     raw_env = env.unwrapped
 
-    # === 动态设置抓取目标物体的摩擦系数 ===
-    # UsdFileCfg 不支持 physics_material 参数，需在 env 初始化后通过 USD API 动态绑定。
-    # PhysX 两个接触面摩擦系数用 multiply 模式合并：
-    #   夹爪手指（无显式材质，默认 0.5） × 物体（设为 2.0） = 1.0
-    # restitution=0.0 + combine min：消除弹性，防止夹住瞬间物体弹飞。
+    # === 动态设置摩擦系数（直接绑定到碰撞 prim，绕开层级继承歧义）===
+    # 修复说明：
+    #   旧方案用 weakerThanDescendants 在根 prim 绑定，banana 子 prim 自带材质会覆盖，
+    #   导致 friction=5.0 对 banana 完全无效；夹爪侧也无材质，依赖 PhysX 默认 0.5。
+    #   新方案：遍历子树找到所有 CollisionAPI prim 直接绑定；根 prim 同时用
+    #   strongerThanDescendants 兜底。combine 改 max：max(5.0,5.0)=5.0。
     try:
         import omni.usd as _omni_usd
-        from pxr import UsdShade as _UsdShade, UsdPhysics as _UsdPhysics
+        from pxr import Usd as _Usd, UsdShade as _UsdShade, UsdPhysics as _UsdPhysics
         _stage = _omni_usd.get_context().get_stage()
-        _friction_targets = {
-            "banana": "/World/envs/env_0/banana",
-            "apple":  "/World/envs/env_0/apple",
-            "bowl":   "/World/envs/env_0/bowl",
-        }
-        for _obj_name, _prim_path in _friction_targets.items():
-            _prim = _stage.GetPrimAtPath(_prim_path)
-            if not _prim.IsValid():
-                print(f"[FRICTION] prim not found: {_prim_path}, skipping", flush=True)
-                continue
-            # 在物体根 prim 下创建物理材质
-            _mat_path = f"{_prim_path}/frictionMaterial"
-            _mat_prim = _stage.DefinePrim(_mat_path, "Material")
-            _mat = _UsdShade.Material(_mat_prim)
-            # 设置摩擦系数和弹性系数
-            _phys_api = _UsdPhysics.MaterialAPI.Apply(_mat_prim)
-            _phys_api.CreateStaticFrictionAttr(5.0)
-            _phys_api.CreateDynamicFrictionAttr(5.0)
-            _phys_api.CreateRestitutionAttr(0.0)
-            # 设置 combine mode（需要 PhysxSchema）
+
+        def _make_friction_mat(stage, mat_path, friction=5.0):
+            _mp = stage.DefinePrim(mat_path, "Material")
+            _m  = _UsdShade.Material(_mp)
+            _pa = _UsdPhysics.MaterialAPI.Apply(_mp)
+            _pa.CreateStaticFrictionAttr(friction)
+            _pa.CreateDynamicFrictionAttr(friction)
+            _pa.CreateRestitutionAttr(0.0)
             try:
-                from pxr import PhysxSchema as _PhysxSchema
-                _physx_api = _PhysxSchema.PhysxMaterialAPI.Apply(_mat_prim)
-                _physx_api.CreateFrictionCombineModeAttr("multiply")
-                _physx_api.CreateRestitutionCombineModeAttr("min")
+                from pxr import PhysxSchema as _Px
+                _pxa = _Px.PhysxMaterialAPI.Apply(_mp)
+                _pxa.CreateFrictionCombineModeAttr("max")
+                _pxa.CreateRestitutionCombineModeAttr("min")
             except Exception:
-                pass  # PhysxSchema 不可用时跳过，PhysX 默认用 average 合并
-            # 绑定到根 prim（继承到所有子碰撞 prim）
-            _binding_api = _UsdShade.MaterialBindingAPI.Apply(_prim)
-            _binding_api.Bind(
-                _mat,
-                bindingStrength=_UsdShade.Tokens.weakerThanDescendants,
-                materialPurpose="physics"
-            )
-            print(f"[FRICTION] static/dynamic=2.0 restitution=0.0 applied to {_obj_name}", flush=True)
+                pass
+            return _m
+
+        def _bind_to_collision_prims(stage, root_path, mat):
+            root = stage.GetPrimAtPath(root_path)
+            if not root.IsValid():
+                print(f"[FRICTION] root not found: {root_path}", flush=True)
+                return 0
+            # 根 prim 用 strongerThanDescendants 兜底
+            _rb = _UsdShade.MaterialBindingAPI.Apply(root)
+            _rb.Bind(mat,
+                     bindingStrength=_UsdShade.Tokens.strongerThanDescendants,
+                     materialPurpose="physics")
+            count = 0
+            for prim in _Usd.PrimRange(root):
+                if prim.HasAPI(_UsdPhysics.CollisionAPI):
+                    _b = _UsdShade.MaterialBindingAPI.Apply(prim)
+                    _b.Bind(mat, materialPurpose="physics")
+                    count += 1
+            print(f"[FRICTION] bound {count} collision prim(s) under {root_path}", flush=True)
+            return count
+
+        # 物体侧 friction=5.0
+        _obj_mat = _make_friction_mat(_stage, "/World/envs/env_0/frictionMat_obj", 5.0)
+        for _oname in ["banana", "apple", "bowl"]:
+            _bind_to_collision_prims(_stage, f"/World/envs/env_0/{_oname}", _obj_mat)
+
+        # 夹爪侧 friction=5.0
+        # 机器人用 make_instanceable=True，link7/link8/gripper_base 的碰撞 prim
+        # 在运行时 Stage 中是 Instance Proxy，无法通过 env_0/Robot/... 路径访问。
+        # 改为遍历整个 Stage，对所有路径含 link7/link8/gripper_base 的 CollisionAPI prim
+        # 直接绑定材质，这样无论 Prototype 路径如何都能命中。
+        _grip_mat = _make_friction_mat(_stage, "/World/envs/env_0/frictionMat_gripper", 5.0)
+        _grip_keywords = ("link7", "link8", "gripper_base")
+        _grip_count = 0
+        for _prim in _Usd.PrimRange(_stage.GetPseudoRoot()):
+            if not _prim.HasAPI(_UsdPhysics.CollisionAPI):
+                continue
+            _ps = str(_prim.GetPath())
+            if any(_kw in _ps for _kw in _grip_keywords):
+                _b = _UsdShade.MaterialBindingAPI.Apply(_prim)
+                _b.Bind(_grip_mat, materialPurpose="physics")
+                _grip_count += 1
+        print(f"[FRICTION] gripper: bound {_grip_count} collision prim(s) via global traverse",
+              flush=True)
+
+        print("[FRICTION] done: obj=5.0 gripper=5.0 combine=max", flush=True)
     except Exception as _fe:
         print(f"[WARN] Failed to apply friction materials: {_fe}", flush=True)
     # === 摩擦系数设置完毕 ===
@@ -1504,25 +1534,49 @@ def main():
                     print(f"[SM] PAN_DES_X done (dx={_dx_des:.3f}m) -> ROTATE", flush=True)
                     _rotate_j_target = ARM_SIDE_ANGLES.copy()
                     _rotate_j_target[0] = math.pi / 2
+                    _rotate_j_target[1] = 1.9
+                    _rotate_j_target[2] = -1.8
                     state = PipelineState.ROTATE
                     state_step = 0
                 elif state_step % 100 == 0:
                     print(f"[SM] PAN_DES_X step={state_step} cur_x={pos_w[0]:.2f} "
                           f"target_x={args.destination[0]:.2f} dx={_dx_des:.3f}m", flush=True)
 
-            # ---- ROTATE: j1 直接跳到 +π/2，j2~j6 保持 ARM_SIDE_ANGLES ----
+            # ---- ROTATE: j1 线性插值到 +π/2，j2~j6 保持 ARM_SIDE_ANGLES ----
             elif state == PipelineState.ROTATE:
                 if state_step == 1:
-                    print("[SM] ROTATE: j1 -> +π/2, j2~j6 hold ARM_SIDE_ANGLES",
+                    # 记录 j1/j2/j3 起始实际角度，用于线性插值
+                    _cur_q_rot = robot.data.joint_pos[
+                        0, list(_get_arm_ids(robot)[0])
+                    ].cpu().numpy()
+                    _rotate_j1_start = float(_cur_q_rot[0])
+                    _rotate_j2_start = float(_cur_q_rot[1])
+                    _rotate_j3_start = float(_cur_q_rot[2])
+                    print(f"[SM] ROTATE: j1 {_rotate_j1_start:.3f}->+π/2, "
+                          f"j2 {_rotate_j2_start:.3f}->1.8, "
+                          f"j3 {_rotate_j3_start:.3f}->-1.8 "
+                          f"(linear interp over {BUDGET[PipelineState.ROTATE]} steps)",
                           flush=True)
-                _arm_step(robot, _rotate_j_target)
+                # 线性插值：alpha 从 0 线性增加到 1
+                _alpha = min(state_step / BUDGET[PipelineState.ROTATE], 1.0)
+                _j1_interp = _rotate_j1_start + _alpha * (_rotate_j_target[0] - _rotate_j1_start)
+                _j2_interp = _rotate_j2_start + _alpha * (_rotate_j_target[1] - _rotate_j2_start)
+                _j3_interp = _rotate_j3_start + _alpha * (_rotate_j_target[2] - _rotate_j3_start)
+                _rotate_cmd = ARM_SIDE_ANGLES.copy()
+                _rotate_cmd[0] = _j1_interp
+                _rotate_cmd[1] = _j2_interp
+                _rotate_cmd[2] = _j3_interp
+                _arm_step(robot, _rotate_cmd)
                 _gripper_step(robot, close=True)
                 if state_step % 50 == 0:
                     cur_q = robot.data.joint_pos[
                         0, list(_get_arm_ids(robot)[0])
                     ].cpu().numpy()
                     print(f"[SM] ROTATE step={state_step}/{BUDGET[PipelineState.ROTATE]}: "
-                          f"j1={cur_q[0]:.3f} (target={_rotate_j_target[0]:.3f})",
+                          f"j1={cur_q[0]:.3f} interp={_j1_interp:.3f} "
+                          f"j2={cur_q[1]:.3f} interp={_j2_interp:.3f} "
+                          f"j3={cur_q[2]:.3f} interp={_j3_interp:.3f} "
+                          f"alpha={_alpha:.2f}",
                           flush=True)
                 if state_step >= BUDGET[PipelineState.ROTATE]:
                     print("[SM] ROTATE done -> PUT_DOWN", flush=True)

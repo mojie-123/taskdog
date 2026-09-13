@@ -304,7 +304,8 @@ def solve_for_gripper_base(target_gb_pos, target_rot_j7=None, initial_angles=Non
         for _qi, (_lo, _hi) in zip(best_q, _IK_JOINT_LIMITS)
     )   # 检查 best_q 是否有关节在限位
     _jump_lims_fb = np.full(6, math.pi / 2)   # 检查跳变是否超限
-    _jump_lims_fb[4] = math.pi
+    _jump_lims_fb[4] = math.pi        # j5 放宽：末端翻转时 j5 可能需要大幅旋转
+    _jump_lims_fb[5] = math.pi * 2   # j6 不限跳变：j6 为末端旋转轴，任意旋转均可接受
     _per_joint_jumps_best = np.abs(best_q - q0)
     _max_jump_best = float(np.max(_per_joint_jumps_best))
     _jump_exceeded = not np.all(_per_joint_jumps_best < _jump_lims_fb)

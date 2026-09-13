@@ -115,7 +115,7 @@ DEEPROBOTICS_M20_PIPER_SINGLE_CFG = ArticulationCfg(
         ),
         "gripper": ImplicitActuatorCfg(
             joint_names_expr=GRIPPER_JOINT_NAMES,
-            effort_limit=100.0,
+            effort_limit=1000.0,
             velocity_limit=1.0,
             stiffness=30000.0,
             damping=20.0,
