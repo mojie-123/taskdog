@@ -4,11 +4,17 @@
 Protocol:
   INPUT  : /tmp/pointcloud.npz  {points: (N,3) float32, colors: (N,3) float32}
   OUTPUT : /tmp/grasp_result.npz {
-               translations: (K,3) float32,
+               translations: (K,3) float32,   # 掌心位置（≠指尖！见下）
                rotations:    (K,3,3) float32,
                widths:       (K,) float32,
                scores:       (K,) float32,
+               depths:       (K,) float32,    # 每个抓取的手指长度
            }
+
+Note:
+  AnyGrasp 约定（SDK USAGE.md Note 1）：translation 是**掌心**，指尖 =
+      translation + depth * rotation_matrix[:3,0]
+  depth 逐抓取不同（5mm~80mm），必须透传给管线，不能当常数。
 
 Note:
   gsnet.so 在加载 License 时会在当前工作目录下找 license/ 文件夹，
@@ -102,7 +108,8 @@ def main():
                  translations=np.zeros((0, 3), dtype=np.float32),
                  rotations=np.zeros((0, 3, 3), dtype=np.float32),
                  widths=np.zeros(0, dtype=np.float32),
-                 scores=np.zeros(0, dtype=np.float32))
+                 scores=np.zeros(0, dtype=np.float32),
+                 depths=np.zeros(0, dtype=np.float32))
         return
 
     # ── NMS + 排序 ────────────────────────────────────────────────────────────
@@ -119,28 +126,32 @@ def main():
                  translations=np.zeros((0, 3), dtype=np.float32),
                  rotations=np.zeros((0, 3, 3), dtype=np.float32),
                  widths=np.zeros(0, dtype=np.float32),
-                 scores=np.zeros(0, dtype=np.float32))
+                 scores=np.zeros(0, dtype=np.float32),
+                 depths=np.zeros(0, dtype=np.float32))
         return
 
     gg = gg[:topk]
 
     # ── 提取结果并保存 ────────────────────────────────────────────────────────
     # GraspGroup 属性：translations (K,3), rotation_matrices (K,3,3),
-    #                  widths (K,), scores (K,)
-    translations = gg.translations.astype(np.float32)       # (K, 3)
+    #                  widths (K,), scores (K,), depths (K,)
+    translations = gg.translations.astype(np.float32)       # (K, 3) 掌心
     rotations    = gg.rotation_matrices.astype(np.float32)  # (K, 3, 3)
     widths       = gg.widths.astype(np.float32)             # (K,)
     scores       = gg.scores.astype(np.float32)             # (K,)
+    depths       = gg.depths.astype(np.float32)             # (K,) 指尖 = 掌心 + depth*a
 
     np.savez(OUTPUT_PATH,
              translations=translations,
              rotations=rotations,
              widths=widths,
-             scores=scores)
+             scores=scores,
+             depths=depths)
 
     print(f"[grasp_worker] 保存 {topk} 个抓取到 {OUTPUT_PATH}")
     for i in range(topk):
-        print(f"  [{i}] score={scores[i]:.3f}  t={np.round(translations[i], 3)}  w={widths[i]:.3f}")
+        print(f"  [{i}] score={scores[i]:.3f}  t={np.round(translations[i], 3)}"
+              f"  w={widths[i]:.3f}  d={depths[i]:.3f}")
 
 
 if __name__ == "__main__":

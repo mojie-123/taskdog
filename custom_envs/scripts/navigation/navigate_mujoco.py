@@ -301,15 +301,15 @@ def main():
         b = BUDGET.get(s_state, 1)
         return min(step / max(b, 1), 1.0)
 
-    def _ransac_remove_plane(pts, n_iter=150, dist_thresh=0.008, min_inlier_ratio=0.15):
-        """RANSAC 平面去除。找到内点最多的主平面（桌面），返回 True=保留(非桌面)。
-        若最大平面内点数 < 总点数的 min_inlier_ratio，认为场景无显著平面，保留所有点。"""
+    def _ransac_fit_plane(pts, n_iter=150, dist_thresh=0.008):
+        """RANSAC 拟合内点最多的主平面。返回 (nv, dv, inlier_mask)；点数过少时 nv=None。
+        不做内点比率判定，由调用方决定用途（去除平面 / 保留平面内点）。"""
         N = len(pts)
         if N < 10:
-            return np.ones(N, dtype=bool)
+            return None, None, np.zeros(N, dtype=bool)
         best_n    = 0
-        best_mask = np.ones(N, dtype=bool)
-        best_info = [None, None]
+        best_mask = np.zeros(N, dtype=bool)
+        best_nv, best_dv = None, None
         rng = np.random.default_rng(42)
         for _ in range(n_iter):
             idx = rng.choice(N, 3, replace=False)
@@ -325,15 +325,59 @@ def main():
             if ni > best_n:
                 best_n    = ni
                 best_mask = inlier
-                best_info = [nv, dv]
-        if best_n < int(N * min_inlier_ratio):
+                best_nv, best_dv = nv, dv
+        return best_nv, best_dv, best_mask
+
+    def _ransac_remove_plane(pts, n_iter=150, dist_thresh=0.008, min_inlier_ratio=0.15):
+        """RANSAC 平面去除。找到内点最多的主平面（桌面），返回 True=保留(非桌面)。
+        若最大平面内点数 < 总点数的 min_inlier_ratio，认为场景无显著平面，保留所有点。"""
+        N = len(pts)
+        nv, dv, mask = _ransac_fit_plane(pts, n_iter, dist_thresh)
+        best_n = int(mask.sum())
+        if nv is None or best_n < int(N * min_inlier_ratio):
             print(f"[SM] RANSAC: no dominant plane (best={best_n}/{N}), keeping all.", flush=True)
             return np.ones(N, dtype=bool)
-        keep = ~best_mask
+        keep = ~mask
         pct  = best_n * 100 // N
         print(f"[SM] RANSAC plane={best_n} pts ({pct}%), object pts={int(keep.sum())}, "
-              f"normal={np.round(best_info[0], 3)} d={best_info[1]:.3f}", flush=True)
+              f"normal={np.round(nv, 3)} d={dv:.3f}", flush=True)
         return keep
+
+    def _dls_gb_step(q_start, gb_cmd_arm, n_iter=6, lam=1e-4):
+        """局部关节增量：数值雅可比 + 阻尼最小二乘(DLS)，把 gripper_base 从
+        fk(q_start) 挪到 gb_cmd_arm。纯平移、不重建朝向 → 与 IK 种子/滚动角无关。
+
+        为什么不用全局 IK：带朝向的 solve_for_gripper_base 在 REACH 位形附近对
+        目标极敏感（同一个位置目标，实机那次能解出、离线却几乎全被拒绝——实测
+        含管线同款种子在内 23 个种子 0 成功，见 /tmp/probe28.py、probe30.py）；
+        而"当前位置附近走一个小平移"只需各关节动 2° 量级（同 probe28 [3] 实测），
+        用数值雅可比 DLS 即可，不依赖种子也不会跳到另一分支。
+
+        j6(索引 5)：绕 gripper_base 自身 +Z 旋转、不改变其位置（见 REACH j6 钉死
+        注释），故不进雅可比、保持 q_start 原值不动。
+        返回 (q, 位置残差 m, 最大单关节增量 rad)。"""
+        from arm_ik_mujoco import fk_gripper as _fk_dls, _IK_JOINT_LIMITS as _lim_dls
+        _lo = np.array([lo for lo, _ in _lim_dls], dtype=np.float64)
+        _hi = np.array([hi for _, hi in _lim_dls], dtype=np.float64)
+        q   = np.clip(np.asarray(q_start, dtype=np.float64).copy(), _lo, _hi)
+        q0  = q.copy()
+        tgt = np.asarray(gb_cmd_arm, dtype=np.float64)
+        eps = 1e-6
+        for _ in range(n_iter):
+            p   = _fk_dls(q)[:3, 3]
+            err = tgt - p
+            if float(np.linalg.norm(err)) < 5e-4:      # 0.5mm 以内即收敛
+                break
+            J = np.zeros((3, 5))
+            for i in range(5):                          # j1..j5；j6 不影响 gb 位置
+                qq = q.copy()
+                qq[i] += eps
+                J[:, i] = (_fk_dls(qq)[:3, 3] - p) / eps
+            q[:5] = np.clip(q[:5] + J.T @ np.linalg.solve(J @ J.T + lam * np.eye(3), err),
+                            _lo[:5], _hi[:5])
+        return (q,
+                float(np.linalg.norm(_fk_dls(q)[:3, 3] - tgt)),
+                float(np.abs(q - q0).max()))
 
     # ── 主循环 ──
     print("[MJ] Starting main loop, state=", state)
@@ -590,10 +634,22 @@ def main():
                             _T_fk_pg   = _fk_pg(grasp_result["q_scan"])
                             _R_cw_pg   = _R_rob_pg @ _T_fk_pg[:3, :3] @ _COR_pg
                             _approach_arm_pg = _R_rob_pg.T @ (_R_cw_pg @ grasp_result["R_cam"][:, 0])
-                            # ── pre-grasp 目标：沿 approach 退 0.16 m ──
-                            _J7_OFFSET = 0.18
-                            _pre_t_gb  = _pre_t_a - _J7_OFFSET * _approach_arm_pg
-                            print(f"[DIAG] _pre_t_a(arm)={np.round(_pre_t_a,4)} _pre_t_gb(arm)={np.round(_pre_t_gb,4)} approach_arm={np.round(_approach_arm_pg,4)}", flush=True)
+                            # ── pre-grasp 目标：沿 approach 退到指尖落在抓取点 ──
+                            # AnyGrasp 约定（USAGE.md Note 1）：translation 是**掌心**，
+                            #   指尖 = 掌心 + depth·a（depth = 该抓取的手指长度，逐候选不同）。
+                            # 目标链: 指尖 = 掌心 + d·a + s（s = REACH_ADVANCE − 0.1358
+                            #   = 显式下探量，见 REACH 块；指尖越过抓取中心 s 才夹得深）
+                            #   REACH gb = 指尖 − 0.1358·a = 掌心 − (0.1358 − d + s)·a
+                            #   PRE   gb = REACH gb − REACH_ADVANCE·a = 掌心 − (0.2458 − d)·a
+                            # 旧代码用固定 0.18 = 0.2458 − 0.0658（隐含 d=0.0658），
+                            # 对苹果侥幸成立，对香蕉/碗导致指尖停在物体上方 → 抓空。
+                            _d_g = float(grasp_result.get("depth", 0.0658))
+                            if not (0.0 <= _d_g <= 0.09):
+                                print(f"[WARN] PRE_GRASP: grasp depth={_d_g:.4f} 越界, clamp 到 [0,0.09]",
+                                      flush=True)
+                                _d_g = float(np.clip(_d_g, 0.0, 0.09))
+                            _pre_t_gb  = _pre_t_a - (0.2458 - _d_g) * _approach_arm_pg
+                            print(f"[DIAG] _pre_t_a(arm)={np.round(_pre_t_a,4)} _pre_t_gb(arm)={np.round(_pre_t_gb,4)} approach_arm={np.round(_approach_arm_pg,4)} d={_d_g:.4f}", flush=True)
                             # ── IK 求解 ──
                             _pgq = _sfgb(_pre_t_gb,
                                          target_rot_j7=_R_desired_EE,
@@ -623,6 +679,7 @@ def main():
                                     grasp_result["R_cam"]     = grasp_result["gr_rotations"][_next_ci].copy()
                                     grasp_result["score"]     = float(grasp_result["gr_scores"][_next_ci])
                                     grasp_result["width"]     = float(grasp_result["gr_widths"][_next_ci])
+                                    grasp_result["depth"]     = float(grasp_result["gr_depths"][_next_ci])
                                     # 重新计算 R_desired_EE_in_arm（对齐原版逻辑）
                                     try:
                                         from arm_ik_mujoco import compute_desired_ee_rot_in_arm as _cder_pg
@@ -653,7 +710,11 @@ def main():
                                     _apw_pg    = _R_rob_pgf @ _approach_arm_pg
                                     _ctr_w_pg  = _R_rob_pgf @ _pre_t_a + _arm_base_w_pgf
                                     _j7_w_pg   = _pg_t_gb_world_fixed + 0.1358 * _apw_pg
-                                    print(f"[DIAG] PRE grasp_center_world  = {np.round(_ctr_w_pg,4)}", flush=True)
+                                    # AnyGrasp 的 translation 是掌心（指尖=掌心+depth·a）：
+                                    # 真实抓取中心 = 掌心 + depth·a，d=0 时两者重合
+                                    _gc_w_pg   = _ctr_w_pg + _d_g * _apw_pg
+                                    print(f"[DIAG] PRE palm_world(掌心)    = {np.round(_ctr_w_pg,4)}", flush=True)
+                                    print(f"[DIAG] PRE grasp_center_world  = {np.round(_gc_w_pg,4)}  (掌心+{_d_g:.4f}·a)", flush=True)
                                     print(f"[DIAG] PRE approach_world      = {np.round(_apw_pg,4)}  ← 应指向物体", flush=True)
                                     print(f"[DIAG] PRE gb_target_world     = {np.round(_pg_t_gb_world_fixed,4)}", flush=True)
                                     print(f"[DIAG] PRE j7_target_world     = {np.round(_j7_w_pg,4)}", flush=True)
@@ -847,11 +908,69 @@ def main():
                                 solve_for_gripper_base as _sfgb_re,
                                 _IK_JOINT_LIMITS as _re_lims,
                             )
-                            REACH_ADVANCE = 0.11
+                            # advance 0.11 → 0.125：0.11 时指尖恰好停在抓取中心 C 上
+                            # （0.1358 − 0.1358 = 0），而指板只从指尖往掌心方向长 76.5mm，
+                            # 抓取深度 = C 上方物体的高度 → 三物体系统性偏浅（苹果只碰到
+                            # 顶、碗只到沿下 14mm）。多出的 0.015 是显式下探量 s：
+                            # 指尖 = C + 0.015·a，向下多夹 15mm 材料；桌面 clip 照旧兜底。
+                            REACH_ADVANCE   = 0.125
+                            TABLE_CLEARANCE = 0.008   # 指尖/指板最低点距桌面的最小高度(m)
                             _re_pre_t_gb = grasp_result["pre_t_gb_arm"]
                             _re_approach = grasp_result["approach_arm"]
                             _re_t_gb_arm = (_re_pre_t_gb
                                             + REACH_ADVANCE * _re_approach)
+                            # ── 闭环纠偏状态（REACH 结束时用 gb 实测误差反推命令，见 done 分支）──
+                            _re_t_gb_arm0 = _re_t_gb_arm.copy()  # 原始(clip 后)命令目标，纠偏基准
+                            _re_corr_iter = 0                    # 已纠偏次数
+                            _re_corr_w    = np.zeros(3)          # 世界系累积修正量
+                            _re_prev_e    = None                 # 上一次纠偏时的 |实测误差|（判断是否跟随）
+                            _re_prev_q    = None                 # 上一次纠偏前的目标关节角（不跟随时的回退点）
+                            _tc_h    = None                      # 桌面高度（世界 z）
+                            _tc_need = None                      # 指尖最低允许高度（clip 量）
+                            # ── 桌面 clip: 手不得插进桌面（沿 approach 自动收缩前进量）──
+                            # 指尖目标 = 掌心 + (depth + s)·a：depth < 0.1358 时指尖会落到
+                            # 掌心之下较浅处，若物体矮（苹果）则该目标可能低于桌面 → 手指压桌、
+                            # 机器狗对抗、抓空。这里按桌面高度收缩 advance 兜底。
+                            # 桌面高度取 GRASP_PLAN 阶段保存的 /tmp/table_cloud.npz（世界系，
+                            # 白/灰颜色筛出的桌面点），用指尖 XY 邻域点 z 的**中位数**估计
+                            # （邻域里可能混有物体表面点，max 会被抬高，中位数对物体/离群点鲁棒）；
+                            # 邻域点不足时逐级放大半径；仍无数据或 approach 非向下则不 clip（fail-open）。
+                            # 指尖不是最低点：指板沿 approach 长 76.5mm、内侧半宽 35.1mm，
+                            # approach 倾斜时指板外角比指尖低 35.1mm×sin(倾角)，一并计入。
+                            try:
+                                from arm_ik_mujoco import quat_to_rot as _q2r_tc
+                                _tc_R_rob  = _q2r_tc(grasp_result["quat_w_scan"])
+                                _tc_apw    = _tc_R_rob @ _re_approach
+                                _tc_base_w = (grasp_result["pos_w_scan"]
+                                              + _tc_R_rob @ np.array([0., 0., 0.0888]))
+                                # advance=0 时指尖（j7 原点）的世界位置
+                                _tc_tip_w = (_tc_R_rob @ (_re_pre_t_gb + 0.1358 * _re_approach)
+                                             + _tc_base_w)
+                                if _tc_apw[2] < -0.05 and os.path.exists('/tmp/table_cloud.npz'):
+                                    _tc_pts  = np.load('/tmp/table_cloud.npz')['points'].astype(np.float64)
+                                    _tc_dxy  = np.linalg.norm(_tc_pts[:, :2] - _tc_tip_w[:2], axis=1)
+                                    for _tc_r in (0.03, 0.05, 0.10):
+                                        if int((_tc_dxy < _tc_r).sum()) >= 20:
+                                            _tc_h = float(np.median(_tc_pts[_tc_dxy < _tc_r, 2]))
+                                            break
+                                if _tc_h is None:
+                                    print("[WARN] 桌面 clip: 桌面点云不足或 approach 非向下 -> 不 clip",
+                                          flush=True)
+                                else:
+                                    # 指尖需停在 need_eff 以上；指板外角再低 35.1mm×sin(倾角)
+                                    _tc_need = (_tc_h + TABLE_CLEARANCE
+                                                + 0.0351 * float(np.hypot(_tc_apw[0], _tc_apw[1])))
+                                    _tc_dmax = ((_tc_tip_w[2] - _tc_need) / (-_tc_apw[2]))
+                                    if 0.0 < _tc_dmax < REACH_ADVANCE:
+                                        print(f"[SM] REACH clip: 桌面z={_tc_h:.4f} "
+                                              f"指尖停在z>={_tc_need:.4f} advance "
+                                              f"{REACH_ADVANCE:.3f}->{_tc_dmax:.3f}m", flush=True)
+                                        _re_t_gb_arm = _re_pre_t_gb + _tc_dmax * _re_approach
+                                    elif _tc_dmax <= 0.0:
+                                        print(f"[WARN] REACH clip: PRE 指尖已在桌面下 "
+                                              f"(tip_z={_tc_tip_w[2]:.4f} < {_tc_need:.4f})", flush=True)
+                            except Exception as _tc_e:
+                                print(f"[WARN] 桌面 clip 计算失败: {_tc_e}", flush=True)
                             _R_arm_re = grasp_result["R_desired_EE_in_arm"]
                             # IK 种子用 PRE_GRASP 角度（与原版一致）；j6 会在解完后
                             # 被钉回 ORIENT 结束值，不受求解器影响
@@ -911,6 +1030,8 @@ def main():
                                 print(f"[DIAG] REACH approach_world    = {np.round(_apw_re,4)}  ← 应指向物体", flush=True)
                                 print(f"[DIAG] REACH gb_analytic_world = {np.round(_re_gb_analytic,4)}  (IK 输入)", flush=True)
                                 print(f"[DIAG] REACH j7_analytic_world = {np.round(_re_j7_analytic,4)}  (j7 解析目标)", flush=True)
+                                print(f"[DIAG] REACH anygrasp depth    = {float(grasp_result.get('depth', 0.0658)):.4f} m"
+                                      f"  (掌心->指尖; 0.1358-d={0.1358-float(grasp_result.get('depth', 0.0658)):.4f})", flush=True)
                                 print(f"[DIAG] REACH gb_fk_world       = {np.round(_re_gb_world,4)}  (FK验算IK解)", flush=True)
                                 print(f"[DIAG] REACH j7_fk_world       = {np.round(_re_j7_world,4)}  (j7 FK验算)", flush=True)
                                 try:
@@ -950,37 +1071,142 @@ def main():
                                   f"max_err={_re_err.max():.4f}", flush=True)
                         state_step += 1
                         if state_step >= BUDGET[PipelineState.REACH]:
-                            print(f"[SM] REACH done (step={state_step}) -> CLOSE",
-                                  flush=True)
-                            try:
-                                import mujoco as _mj_rd
-                                _gb_bid_rd = _mj_rd.mj_name2id(env._model, _mj_rd.mjtObj.mjOBJ_BODY, "gripper_base")
-                                _gb_actual_rd = env._data.xpos[_gb_bid_rd].copy()
-                                _j7_bid_rd = _mj_rd.mj_name2id(env._model, _mj_rd.mjtObj.mjOBJ_BODY, "link7")
-                                _j7_actual_rd = env._data.xpos[_j7_bid_rd].copy() if _j7_bid_rd >= 0 else None
-                                print(f"[DIAG] REACH done gb_actual_world  = {np.round(_gb_actual_rd,4)}  ← MuJoCo实际", flush=True)
-                                if _j7_actual_rd is not None:
-                                    print(f"[DIAG] REACH done j7_actual_world  = {np.round(_j7_actual_rd,4)}  ← MuJoCo实际", flush=True)
-                            except Exception as _rd_e:
-                                print(f"[DIAG] REACH done xpos read err: {_rd_e}", flush=True)
-                            try:
-                                _real_obj_reach_done = env.get_object_pos(args.object)
-                                print(f"[DIAG] REACH done object real world={np.round(_real_obj_reach_done,4)}",
+                            # ── 闭环纠偏：臂部静差（PD 平衡误差）让实际落点比命令偏高/偏侧 ──
+                            # 静差近姿态不变 → 命令' = 命令 − (实际 − 解析)，1 次迭代即收敛
+                            # （累积式：每次按"实测 − 原始解析目标"修正，避免把已补偿量又减回去）。
+                            # 补偿量用局部 DLS 关节增量施加（_dls_gb_step），不重跑全局 IK。
+                            # 只改目标位置（不碰 PD/gravcomp/夹爪参数）。
+                            # 两道保护：误差不在 5~50mm 区间视为异常/已够好，不追；
+                            # 纠偏后误差没实质减小（实际没跟随 → 硬顶物体/到限位）则回退并停止。
+                            _re_corr_done = False
+                            if _re_corr_iter < 3:
+                                try:
+                                    import mujoco as _mj_cc
+                                    from arm_ik_mujoco import quat_to_rot as _q2r_cc
+                                    _cc_bid   = _mj_cc.mj_name2id(env._model, _mj_cc.mjtObj.mjOBJ_BODY,
+                                                                  "gripper_base")
+                                    _cc_fing  = {_mj_cc.mj_name2id(env._model, _mj_cc.mjtObj.mjOBJ_BODY,
+                                                                   _n)
+                                                 for _n in ("link7", "link8")}
+                                    _cc_obj   = _mj_cc.mj_name2id(env._model, _mj_cc.mjtObj.mjOBJ_BODY,
+                                                                  args.object)
+                                    _gb_act_c = env._data.xpos[_cc_bid].astype(np.float64).copy()
+                                    _cc_R     = _q2r_cc(np.asarray(grasp_result["quat_w_scan"],
+                                                                   dtype=np.float64))
+                                    _cc_base  = (np.asarray(grasp_result["pos_w_scan"],
+                                                            dtype=np.float64)
+                                                 + _cc_R @ np.array([0., 0., 0.0888]))
+                                    _cc_gb_ana  = _cc_R @ _re_t_gb_arm0 + _cc_base
+                                    _cc_tip_ana = _cc_gb_ana + 0.1358 * (_cc_R @ _re_approach)
+                                    _cc_e_w     = _gb_act_c - _cc_gb_ana   # 实测 − 解析(原始基准)
+                                    _cc_en      = float(np.linalg.norm(_cc_e_w))
+                                    # ── 接触急停：指板已碰到物体 → 停止纠偏（苹果骑肩
+                                    # 楔入会把物体推走；碗深下探可能压壁）。检测到接触
+                                    # 就直接进 CLOSE，不再往下压。
+                                    _cc_touch = False
+                                    try:
+                                        for _cc_ci in range(int(env._data.ncon)):
+                                            _cc_ct  = env._data.contact[_cc_ci]
+                                            _cc_b1  = int(env._model.geom_bodyid[int(_cc_ct.geom1)])
+                                            _cc_b2  = int(env._model.geom_bodyid[int(_cc_ct.geom2)])
+                                            _cc_has = ((_cc_b1 in _cc_fing) ^
+                                                       (_cc_b2 in _cc_fing))
+                                            if _cc_has and (_cc_obj in (_cc_b1, _cc_b2)):
+                                                _cc_touch = True
+                                                break
+                                    except Exception:
+                                        pass
+                                    if _cc_touch:
+                                        print(f"[SM] REACH corr 接触急停: 指板已接触 "
+                                              f"{args.object} (|e|={_cc_en * 1000:.1f}mm) -> "
+                                              f"停止纠偏, 直接 CLOSE", flush=True)
+                                        _re_corr_iter = 3   # 之后不再纠偏
+                                    elif _re_prev_e is not None and _cc_en > 0.7 * _re_prev_e:
+                                        # 实际没跟随命令（硬顶物体/到限位）：再纠只会把
+                                        # 纠正量越积越大、持续加压 → 回退到纠偏前的目标并停止
+                                        print(f"[WARN] REACH corr: 实际未跟随命令 "
+                                              f"(|e| {_re_prev_e * 1000:.1f} -> {_cc_en * 1000:.1f}mm)"
+                                              f" -> 回退并停止纠偏", flush=True)
+                                        _re_corr_iter = 3
+                                        if _re_prev_q is not None:
+                                            target_angles_arm = _re_prev_q
+                                            _re_target_cur    = _re_prev_q.copy()
+                                            state_step        = 0
+                                            _re_corr_done     = True
+                                    elif 0.005 < _cc_en < 0.05:
+                                        _cc_corr    = _re_corr_w - _cc_e_w
+                                        _cc_tip_cmd = _cc_tip_ana + _cc_R @ _cc_corr
+                                        _cc_floor   = float(_cc_tip_ana[2]) - 0.03
+                                        if _tc_need is not None:
+                                            # 静差近姿态不变 → 命令后的实际指尖 ≈ 命令 + e_z，
+                                            # 地板须约束"预测实际"而非命令本身：否则 tip_ana
+                                            # 恰落在 need 上时（第二轮香蕉 0.6769 == need）
+                                            # 向下纠偏被整体钳回原值，静差永远纠不掉。
+                                            _cc_floor = max(_cc_floor,
+                                                            float(_tc_need) - float(_cc_e_w[2]))
+                                        if _cc_tip_cmd[2] < _cc_floor:   # z 保护：抬回 floor
+                                            _cc_corr = _cc_corr + _cc_R.T @ np.array(
+                                                [0., 0., _cc_floor - _cc_tip_cmd[2]])
+                                        _cc_gb_cmd_arm = _re_t_gb_arm0 + _cc_R.T @ _cc_corr
+                                        _cc_cur_q = _get_arm_q(jpos).copy()
+                                        # 局部增量（纯平移，j6 不动）：不重建朝向，
+                                        # 因此不依赖 IK 种子/滚动角，也不会跳到另一分支
+                                        _cc_q, _cc_res, _cc_dq = _dls_gb_step(_cc_cur_q,
+                                                                              _cc_gb_cmd_arm)
+                                        if _cc_res > 0.010 or _cc_dq > 0.35:
+                                            print(f"[WARN] REACH corr: 局部增量不可用 "
+                                                  f"(残差 {_cc_res * 1000:.1f}mm, 单关节 "
+                                                  f"{np.degrees(_cc_dq):.1f}deg) -> 放弃纠偏",
+                                                  flush=True)
+                                        else:
+                                            _re_prev_q        = _re_target_cur.copy()  # 回退点
+                                            _re_corr_iter    += 1
+                                            _re_prev_e        = _cc_en
+                                            _re_corr_w        = _cc_corr
+                                            target_angles_arm = _cc_q
+                                            _re_target_cur    = _cc_q.copy()
+                                            state_step        = 0
+                                            _re_corr_done     = True
+                                            print(f"[SM] REACH corr iter={_re_corr_iter} "
+                                                  f"err={np.round(_cc_e_w * 1000, 1)}mm "
+                                                  f"|err|={_cc_en * 1000:.1f}mm "
+                                                  f"-> 新命令 gb={np.round(_cc_gb_cmd_arm, 4)} (arm)"
+                                                  f" DLS 残差={_cc_res * 1000:.1f}mm "
+                                                  f"单关节Δ={np.degrees(_cc_dq):.1f}deg", flush=True)
+                                except Exception as _cc_e:
+                                    print(f"[WARN] REACH corr 失败: {_cc_e}", flush=True)
+                            if not _re_corr_done:
+                                print(f"[SM] REACH done (step={state_step}) -> CLOSE",
                                       flush=True)
-                            except Exception:
-                                pass
-                            # 打印各关节实际角度 vs IK目标，诊断未收敛原因
-                            try:
-                                _cur_q_rd = _get_arm_q(jpos)
-                                _tgt_q_rd = _re_target_cur
-                                _err_q_rd  = _cur_q_rd - _tgt_q_rd
-                                print(f"[DIAG] REACH done joint_actual = {np.round(_cur_q_rd,4)}", flush=True)
-                                print(f"[DIAG] REACH done joint_target = {np.round(_tgt_q_rd,4)}", flush=True)
-                                print(f"[DIAG] REACH done joint_err    = {np.round(_err_q_rd,4)}  (deg={np.round(np.degrees(_err_q_rd),2)})", flush=True)
-                            except Exception as _qe_rd:
-                                print(f"[DIAG] REACH done joint read err: {_qe_rd}", flush=True)
-                            state = PipelineState.CLOSE
-                            state_step = 0
+                                try:
+                                    import mujoco as _mj_rd
+                                    _gb_bid_rd = _mj_rd.mj_name2id(env._model, _mj_rd.mjtObj.mjOBJ_BODY, "gripper_base")
+                                    _gb_actual_rd = env._data.xpos[_gb_bid_rd].copy()
+                                    _j7_bid_rd = _mj_rd.mj_name2id(env._model, _mj_rd.mjtObj.mjOBJ_BODY, "link7")
+                                    _j7_actual_rd = env._data.xpos[_j7_bid_rd].copy() if _j7_bid_rd >= 0 else None
+                                    print(f"[DIAG] REACH done gb_actual_world  = {np.round(_gb_actual_rd,4)}  ← MuJoCo实际", flush=True)
+                                    if _j7_actual_rd is not None:
+                                        print(f"[DIAG] REACH done j7_actual_world  = {np.round(_j7_actual_rd,4)}  ← MuJoCo实际", flush=True)
+                                except Exception as _rd_e:
+                                    print(f"[DIAG] REACH done xpos read err: {_rd_e}", flush=True)
+                                try:
+                                    _real_obj_reach_done = env.get_object_pos(args.object)
+                                    print(f"[DIAG] REACH done object real world={np.round(_real_obj_reach_done,4)}",
+                                          flush=True)
+                                except Exception:
+                                    pass
+                                # 打印各关节实际角度 vs IK目标，诊断未收敛原因
+                                try:
+                                    _cur_q_rd = _get_arm_q(jpos)
+                                    _tgt_q_rd = _re_target_cur
+                                    _err_q_rd  = _cur_q_rd - _tgt_q_rd
+                                    print(f"[DIAG] REACH done joint_actual = {np.round(_cur_q_rd,4)}", flush=True)
+                                    print(f"[DIAG] REACH done joint_target = {np.round(_tgt_q_rd,4)}", flush=True)
+                                    print(f"[DIAG] REACH done joint_err    = {np.round(_err_q_rd,4)}  (deg={np.round(np.degrees(_err_q_rd),2)})", flush=True)
+                                except Exception as _qe_rd:
+                                    print(f"[DIAG] REACH done joint read err: {_qe_rd}", flush=True)
+                                state = PipelineState.CLOSE
+                                state_step = 0
 
             elif state == PipelineState.CLOSE:
                 # 夹爪闭合 100 步
@@ -1209,6 +1435,32 @@ def main():
                         # 点云是光学系（x右 y下 z前），_R_c2w_tc 已是光学系->世界，无需翻转
                         _pts_table_cam_c = _pts_table_cam.astype(np.float64).copy()
                         _pts_table_world = (_pts_table_cam_c @ _R_c2w_tc.T) + _t_cam_tc
+                        # ── 平面过滤：颜色滤波会把白/灰色物体表面也筛进来（如白碗壁、
+                        # 苹果顶高光），它们高于桌面 → clip 取邻域 z 中位数时会误判桌面高度
+                        # （碗场景实测 h=0.7143=碗壁，导致下探提前截断、抓空）。
+                        # 这里只保留主平面（桌面）附近的点；主平面接近水平才采信，否则保留原样。
+                        try:
+                            _tb_nv, _tb_dv, _tb_inl = _ransac_fit_plane(
+                                _pts_table_world.astype(np.float64))
+                            if _tb_nv is None:
+                                print(f'[SM] 桌面点云平面拟合: 点太少({len(_pts_table_world)})，保留原样',
+                                      flush=True)
+                            elif abs(float(_tb_nv[2])) < 0.9:
+                                print(f'[SM] WARN: 桌面点云主平面非水平 '
+                                      f'(normal={np.round(_tb_nv, 3)})，保留原样', flush=True)
+                            else:
+                                _tb_keep = np.abs(_pts_table_world @ _tb_nv - _tb_dv) < 0.010
+                                if int(_tb_keep.sum()) < 50:
+                                    print(f'[SM] WARN: 桌面点云平面过滤后仅 '
+                                          f'{int(_tb_keep.sum())} pts，保留原样', flush=True)
+                                else:
+                                    print(f'[SM] 桌面点云平面过滤: {len(_pts_table_world)} -> '
+                                          f'{int(_tb_keep.sum())} pts '
+                                          f'(z中位={np.median(_pts_table_world[_tb_keep, 2]):.4f})，'
+                                          f'剔除物体表面点', flush=True)
+                                    _pts_table_world = _pts_table_world[_tb_keep]
+                        except Exception as _tb_pf_e:
+                            print(f'[SM] 桌面点云平面过滤失败: {_tb_pf_e}', flush=True)
                         np.savez('/tmp/table_cloud.npz', points=_pts_table_world.astype(np.float32))
                         print(f'[SM] 桌面点云已保存 /tmp/table_cloud.npz（{len(_pts_table_world)} pts）', flush=True)
                     else:
@@ -1376,7 +1628,11 @@ def main():
                                     _gr["rotations"][_best_gi], _q_scan_saved)
                             except Exception:
                                 _R_des_best = None
-                            print(f"[DIAG] best grasp R_cam approach(col0)={np.round(_gr['rotations'][_best_gi][:,0],4)}", flush=True)
+                            # ── 每抓取 depth（AnyGrasp 约定：指尖 = 掌心 + depth·a）──
+                            # 旧版 npz 无 depths key → 回退 0.0658（= 旧行为），不崩
+                            _gr_depths = _gr["depths"] if "depths" in _gr else \
+                                np.full(len(_gr["scores"]), 0.0658, dtype=np.float32)
+                            print(f"[DIAG] best grasp R_cam approach(col0)={np.round(_gr['rotations'][_best_gi][:,0],4)} depth={float(_gr_depths[_best_gi]):.4f}", flush=True)
                             # GraspNet 原始输出即光学系（x右 y下 z前），直接使用
                             _R_cam_best = _gr["rotations"][_best_gi].copy()
                             grasp_result = {
@@ -1384,11 +1640,13 @@ def main():
                                 "R_cam":   _R_cam_best,
                                 "width":   float(_gr["widths"][_best_gi]),
                                 "score":   float(_gr["scores"][_best_gi]),
+                                "depth":   float(_gr_depths[_best_gi]),
                                 "R_desired_EE_in_arm": _R_des_best,
                                 "gr_translations": _gr["translations"],
                                 "gr_rotations":    _gr["rotations"],
                                 "gr_widths":       _gr["widths"],
                                 "gr_scores":       _gr["scores"],
+                                "gr_depths":       _gr_depths,
                                 "q_scan":      _q_scan_saved,
                                 "pos_w_scan":  _pos_w_scan_pre,
                                 "quat_w_scan": _quat_w_scan_pre,

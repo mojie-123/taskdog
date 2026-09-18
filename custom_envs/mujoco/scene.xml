@@ -69,7 +69,15 @@
     <!-- object meshes (absolute paths, scale=1 -> unit=meters) -->
     <mesh name="banana_collision" file="/home/mojie/taskdog/custom_envs/mujoco/meshes/banana/collision.obj" scale="1 1 1" />
     <mesh name="banana_visual"    file="/home/mojie/taskdog/custom_envs/mujoco/meshes/banana/textured.obj"  scale="1 1 1" />
-    <mesh name="apple_collision"  file="/home/mojie/taskdog/custom_envs/mujoco/meshes/apple/collision.obj"  scale="0.9 0.9 0.9" />
+    <!-- collision 单独缩到 0.80：射线实测（场景系、绕凸包质心的最宽方向）
+         scale=0.9 时碰撞凸包宽 70.24mm > 夹爪最大张开 70.0mm（q7=0.035），
+         名义上就顶住；0.85 后 66.21mm、单侧最大半径 33.90mm、余量 1.10mm，
+         但臂部静差横向远超 1.10mm → 指板骑上苹果肩部（第二轮 |e|=78mm 案例）。
+         0.80 后约 62.3mm、单侧 ~31.9mm、余量 ~3.1mm（静差量级仍可能超过它，
+         由管线侧"纠偏接触急停"兜底）。
+         visual 保持 0.9（外观不变，宽 69.22mm），代价是夹住时指板会视觉上
+         压进苹果外表面更多（物理上不穿透碰撞体）。 -->
+    <mesh name="apple_collision"  file="/home/mojie/taskdog/custom_envs/mujoco/meshes/apple/collision.obj"  scale="0.8 0.8 0.8" />
     <mesh name="apple_visual"     file="/home/mojie/taskdog/custom_envs/mujoco/meshes/apple/textured.obj"   scale="0.9 0.9 0.9" />
     <mesh name="bowl_collision"   file="/home/mojie/taskdog/custom_envs/mujoco/meshes/bowl/collision.obj"   scale="1 1 1" />
     <mesh name="bowl_visual"      file="/home/mojie/taskdog/custom_envs/mujoco/meshes/bowl/textured.obj"    scale="1 1 1" />
@@ -328,8 +336,10 @@
             rgba="1.0 0 0 1" />
     </body>
 
-    <!-- apple on table1: body z = table_surface(0.6613) + mesh_z_min_abs(0.001) = 0.6623 -->
-    <body name="apple" pos="4.9 4.5 0.6623">
+    <!-- apple on table1: 桌面碰撞面 z=0.6613；自由落地实测 stable body z=0.6616
+         （collision 0.85 的凸包，2500 步后末 500 步零波动）。原值 0.6623 是
+         "0.6613+未缩放网格 z_min(0.001)" 估出来的，会开局下落 ~0.7mm。 -->
+    <body name="apple" pos="4.9 4.5 0.6616">
       <freejoint name="apple_freejoint" />
       <!-- visual mesh (no collision) -->
       <geom name="apple_visual" type="mesh" mesh="apple_visual"
@@ -346,11 +356,61 @@
       <!-- visual mesh (no collision) -->
       <geom name="bowl_visual" type="mesh" mesh="bowl_visual"
             contype="0" conaffinity="0" group="1" material="bowl_mat" />
-      <!-- collision mesh -->
-      <geom name="bowl_geom" type="mesh" mesh="bowl_collision"
-            mass="0.5" friction="5.0 0.5 0.5"
-            solref="0.004 1" solimp="0.99 0.999 0.001"
-            rgba="0.9 0.85 0.7 1" group="3" />
+      <!-- collision: 凸块拼装（自动生成，勿手改；重跑 scripts/generate_bowl_collision.py 覆盖本块）
+           为什么不用 mesh：实测 MuJoCo 的 mesh 碰撞几何 = 该 mesh 的凸包（射线才用真面），
+           空腔会被填实（probe44：薄板停在"不存在的盖"上）→ 内侧指板插不进腔、碗夹不住。
+           改用与机器狗本体同款做法（group=3 + box/cylinder 凸块，见 worldbody 里的腿/轮）。
+           原碗 collision.obj（坏面，编译成 40×30mm 薄片）保留在 meshes/bowl/ 不再引用。 -->
+      <!-- BOWL_COLLISION_BEGIN -->
+      <geom name="bowl_foot" type="cylinder" size="0.04621 0.00200" pos="0 0 -0.02550"
+            mass="0.3000" friction="5.0 0.5 0.5" solref="0.004 1"
+            solimp="0.99 0.999 0.001" rgba="0.9 0.85 0.7 1" group="3" contype="1" conaffinity="1" />
+      <replicate count="16" euler="0 0 22.50000000">
+        <geom type="box" size="0.00400 0.01216 0.00545" pos="0.04988 0 -0.01682"
+              quat="0.925047 0 0.379853 0" mass="0.00139" friction="5.0 0.5 0.5"
+              solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.9 0.85 0.7 1" group="3" contype="1" conaffinity="1" />
+      </replicate>
+      <replicate count="16" euler="0 0 22.50000000">
+        <geom type="box" size="0.00400 0.01369 0.00483" pos="0.05616 0 -0.00949"
+              quat="0.949327 0 0.314289 0" mass="0.00139" friction="5.0 0.5 0.5"
+              solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.9 0.85 0.7 1" group="3" contype="1" conaffinity="1" />
+      </replicate>
+      <replicate count="16" euler="0 0 22.50000000">
+        <geom type="box" size="0.00400 0.01483 0.00441" pos="0.06080 0 -0.00222"
+              quat="0.969075 0 0.246766 0" mass="0.00139" friction="5.0 0.5 0.5"
+              solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.9 0.85 0.7 1" group="3" contype="1" conaffinity="1" />
+      </replicate>
+      <replicate count="16" euler="0 0 22.50000000">
+        <geom type="box" size="0.00400 0.01571 0.00424" pos="0.06444 0 0.00524"
+              quat="0.978445 0 0.206509 0" mass="0.00139" friction="5.0 0.5 0.5"
+              solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.9 0.85 0.7 1" group="3" contype="1" conaffinity="1" />
+      </replicate>
+      <replicate count="16" euler="0 0 22.50000000">
+        <geom type="box" size="0.00400 0.01631 0.00400" pos="0.06690 0 0.01236"
+              quat="0.992216 0 0.124526 0" mass="0.00139" friction="5.0 0.5 0.5"
+              solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.9 0.85 0.7 1" group="3" contype="1" conaffinity="1" />
+      </replicate>
+      <replicate count="16" euler="0 0 22.50000000">
+        <geom type="box" size="0.00400 0.01667 0.00280" pos="0.06836 0 0.01876"
+              quat="0.995389 0 0.095925 0" mass="0.00139" friction="5.0 0.5 0.5"
+              solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.9 0.85 0.7 1" group="3" contype="1" conaffinity="1" />
+      </replicate>
+      <replicate count="16" euler="0 0 22.50000000">
+        <geom type="box" size="0.00400 0.01836 0.00375" pos="0.07529 0 0.02560"
+              quat="0.795932 0 0.605386 0" mass="0.00139" friction="5.0 0.5 0.5"
+              solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.9 0.85 0.7 1" group="3" contype="1" conaffinity="1" />
+      </replicate>
+      <replicate count="16" euler="0 0 22.50000000">
+        <geom type="box" size="0.00400 0.01849 0.00176" pos="0.07584 0 0.02417"
+              quat="0.999186 0 -0.040333 0" mass="0.00139" friction="5.0 0.5 0.5"
+              solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.9 0.85 0.7 1" group="3" contype="1" conaffinity="1" />
+      </replicate>
+      <replicate count="16" euler="0 0 22.50000000">
+        <geom type="box" size="0.00400 0.01853 0.00076" pos="0.07597 0 0.02457"
+              quat="0.953576 0 -0.301153 0" mass="0.00139" friction="5.0 0.5 0.5"
+              solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.9 0.85 0.7 1" group="3" contype="1" conaffinity="1" />
+      </replicate>
+      <!-- BOWL_COLLISION_END -->
     </body>
   </worldbody>
   <actuator>
