@@ -395,29 +395,24 @@ _RX_POS90 = np.array([[1,  0,  0],
                        [0,  1,  0]], dtype=np.float64)   # Rx(+pi/2)
 _J7_ORIGIN_IN_GB = np.array([0.0, 0.0, 0.1358])         # joint7 origin in gripper_base
 
-# AnyGrasp 约定: 旋转矩阵第 0 列(X轴)是 approach 方向。
+# AnyGrasp 约定: 旋转矩阵第 0 列(X轴)是 approach 方向、第 1 列(Y轴)是 closing 方向。
 # Piper gripper_base 约定: Z 轴是 approach 方向（夹爪伸出方向）。
-# 相机安装: 相机+Z 对齐 gripper_base +Z（夹爪伸出方向），_CAM_OFFSET_ROT = Rz(-90°)。
+# 相机安装: 光学系 +Z（深度正方向）对齐 gripper_base +Z，
+#           _CAM_OFFSET_ROT = Rz(-90°)（光学系 -> gb，见下方定义处注释）。
 #
-# 修正思路：
-#   AnyGrasp 用相机+X 表示 approach，但夹爪实际伸出方向是相机+Z。
-#   需要在相机系内先把 AnyGrasp 的 X 轴转到 +Z 轴，即右乘 Ry(-90°)：
-#     Ry(-90°) @ [1,0,0] = [0,0,1]  =>  相机X -> 相机+Z ✓
-#     (注意: Ry(+90°) @ [1,0,0] = [0,0,-1]，方向相反，是错误的)
-#   再用 _CAM_OFFSET_ROT 把相机系变换到 gripper_base 系。
-#   最终：R_gb_desired = R_gb_in_arm @ _CAM_OFFSET_ROT @ R_cam_grasp @ _RY_NEG90
-#
-# 验证（R_gb_in_arm=I, R_cam_grasp=I）：
-#   R_gb_desired = _CAM_OFFSET_ROT @ _RY_NEG90
-#   R_gb_desired[:,2] = _CAM_OFFSET_ROT @ [1,0,0] = [0,-1,0]（gb +Z 对齐 approach）
-#   但注意 _CAM_OFFSET_ROT @ [1,0,0] = [0,-1,0]，即 gb -Y = approach，
-#   这实际上是 SCAN 时夹爪朝下时 gb +Z 朝向，符合从上方抓取的约定 ✓
+# 列置换思路（右乘 _RY_POS90 做列置换，把 X 轴搬到 Z 轴）：
+#   _RY_POS90[:,2] = [1,0,0]  =>  结果[:,2] = A @ [1,0,0] = A[:,0]
+#   于是 R_gb_desired[:,2] = (_CAM_OFFSET_ROT @ R_cam_grasp)[:,0]
+#                          = _CAM_OFFSET_ROT @ approach_cam
+#                          = approach 在 gb 系  =>  gb +Z 对齐 approach ✓
+#   注意: 不要改成 _RY_NEG90（_RY_NEG90[:,2] = [-1,0,0] =>
+#         结果[:,2] = -approach，方向相反 ✗）
 _RY_POS90 = np.array([[ 0.,  0.,  1.],
                        [ 0.,  1.,  0.],
                        [-1.,  0.,  0.]], dtype=np.float64)  # Ry(+90°)  [kept for reference]
 _RY_NEG90 = np.array([[ 0.,  0., -1.],
                        [ 0.,  1.,  0.],
-                       [ 1.,  0.,  0.]], dtype=np.float64)  # Ry(-90°): X->[0,0,1]=+Z ✓
+                       [ 1.,  0.,  0.]], dtype=np.float64)  # Ry(-90°): X->[0,0,1]=+Z
 
 
 def fk_gripper(joint_angles):   # 返回gripper_base在arm_base_link下的转移矩阵
@@ -460,19 +455,24 @@ def quat_to_rot(quat_wxyz):   # 四元数 -> 3*3旋转矩阵
 #   pos = (-0.05, 0.0, 0.06) in gripper_base frame
 #   rot = (w=0.7071, x=0, y=0, z=-0.7071)  [Rz(-90deg), ROS convention]
 # This is the transform T_gripper_camera: takes a point in camera frame to gripper_base frame.
+#
+# 【重要】本文件所有"相机系"量（t_cam / R_cam / 点云）都是 GraspNet/AnyGrasp 的
+#   **光学系**：x 向右、y 向下、z 向前（z = 正的深度值）。
+#   光学系 -> gripper_base（Rz(-90°)）：
+#     光学 +X (图像右) -> gb -Y
+#     光学 +Y (图像下) -> gb +X
+#     光学 +Z (深度正方向 = 物体方向) -> gb +Z（= 夹爪伸出方向 approach ✓）
+#   与 Isaac 原版 utils/arm_ik.py 的 _CAM_OFFSET_ROT 一致（勿再改动符号）。
+#
+#   参考（数值已验证）：MuJoCo 相机 body 系（x右 y上 z后）-> gb 的旋转是
+#     _CAM_OFFSET_ROT @ diag(1,-1,-1) = [[0,-1,0],[-1,0,0],[0,0,-1]]
+#   渲染与反投影均在光学系下进行，代码里不需要 body 矩阵。
 _CAM_OFFSET_POS = np.array([-0.05, 0.0, 0.06], dtype=np.float64)
-# MuJoCo wrist_cam 实际安装旋转（与 Isaac Lab 版不同）：
-#   相机 +X -> gripper_base -Y
-#   相机 +Y -> gripper_base -X
-#   相机 +Z -> gripper_base +Z  (正深度方向 = 物体方向 = gripper_base approach 方向)
-# 对应 scene.xml 中 wrist_cam quat="0 0.7071068 -0.7071068 0" (Rx180·Rz90)
-# 旋转矩阵 R 满足：p_gripper = R @ p_cam + pos
-# 注意：点云 Z 用正 depth 值（与 AnyGrasp「Z 正 = 前方」约定一致）
 _CAM_OFFSET_ROT = np.array([
-    [ 0.0, -1.0,  0.0],
+    [ 0.0,  1.0,  0.0],
     [-1.0,  0.0,  0.0],
-    [ 0.0,  0.0, -1.0],
-], dtype=np.float64)  # cam+X->gb-Y, cam+Y->gb-X, cam+Z->gb-Z（approach 方向对齐）
+    [ 0.0,  0.0,  1.0],
+], dtype=np.float64)  # Rz(-90°): 光学+X->gb-Y, 光学+Y->gb+X, 光学+Z->gb+Z（approach 方向对齐）
 
 
 def cam_to_world(t_cam, joint_angles, robot_pos_w, robot_quat_w):   # 算香蕉世界坐标
@@ -495,11 +495,10 @@ def cam_to_world(t_cam, joint_angles, robot_pos_w, robot_quat_w):   # 算香蕉�
     -------
     t_world : (3,) position in world frame
     """
-    # Step 1: camera frame -> gripper_base frame
-    # GraspNet/MuJoCo 深度图约定 Z正=光轴正方向，但相机光轴是-Z，
-    # 需翻转Z使点坐标与 _CAM_OFFSET_ROT 的旋转约定一致。
+    # Step 1: 光学系 -> gripper_base frame
+    # t_cam 是 GraspNet 光学系点（x右 y下 z前，z=正深度），_CAM_OFFSET_ROT
+    # 本身就是光学系->gb 映射，直接相乘即可，不需要翻转任何分量。
     t_cam = np.asarray(t_cam, dtype=np.float64).copy()
-    t_cam[2] *= -1
     t_gripper = _CAM_OFFSET_ROT @ t_cam + _CAM_OFFSET_POS
 
     # Step 2: gripper_base frame -> arm_base_link frame via FK
@@ -526,8 +525,8 @@ def compute_desired_ee_rot_in_arm(R_cam_grasp, q_scan):   # 目标旋转（arm_b
 
     Background
     ----------
-    The GraspNet rotation R_cam_grasp is expressed in the wrist camera frame at
-    SCAN time.  The camera frame at SCAN is:
+    The GraspNet rotation R_cam_grasp is expressed in the wrist camera 光学系
+    (x右 y下 z前) at SCAN time.  The camera frame at SCAN is:
 
         R_cam_in_arm = R_gb_scan @ _CAM_OFFSET_ROT
 
@@ -566,7 +565,7 @@ def compute_desired_ee_rot_in_arm(R_cam_grasp, q_scan):   # 目标旋转（arm_b
     if np.linalg.det(R_cam_grasp) < 0:
         R_cam_grasp[:, 2] *= -1
     print(f"[IK-DIAG] R_cam_grasp approach_cam={np.round(R_cam_grasp[:,0],4)} "
-          f"(should point toward object, cam -Z = gb +Z direction)", flush=True)
+          f"(should point toward object; 光学系 +Z -> gb +Z)", flush=True)
     # desired gripper_base orientation that aligns the gripper +Z (approach) with AnyGrasp approach.
     # 变换链：R_gb_desired = R_gb_in_arm @ _CAM_OFFSET_ROT @ R_cam_grasp @ _RY_POS90
     #   _CAM_OFFSET_ROT : 相机系 -> gripper_base 系（物理安装旋转）

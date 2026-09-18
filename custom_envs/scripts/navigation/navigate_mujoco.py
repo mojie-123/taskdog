@@ -619,9 +619,8 @@ def main():
                                     _tried.add(_next_ci)
                                     grasp_result["tried_set"] = _tried
                                     grasp_result["t_cam"]     = grasp_result["gr_translations"][_next_ci]
-                                    _R_cam_next = grasp_result["gr_rotations"][_next_ci].copy()
-                                    _R_cam_next[:, 0] *= -1   # GraspNet approach在+Z光轴系下，转为相机系需取反
-                                    grasp_result["R_cam"]     = _R_cam_next
+                                    # GraspNet 原始输出即光学系（x右 y下 z前），直接使用
+                                    grasp_result["R_cam"]     = grasp_result["gr_rotations"][_next_ci].copy()
                                     grasp_result["score"]     = float(grasp_result["gr_scores"][_next_ci])
                                     grasp_result["width"]     = float(grasp_result["gr_widths"][_next_ci])
                                     # 重新计算 R_desired_EE_in_arm（对齐原版逻辑）
@@ -1207,8 +1206,8 @@ def main():
                         _T_gb_tc     = _fk_gb_tc(_q_scan_at_scan.astype(np.float64))
                         _R_c2w_tc    = _R_rob_tc @ _T_gb_tc[:3, :3] @ _cor_tc
                         _t_cam_tc    = _R_rob_tc @ (_T_gb_tc[:3, :3] @ _cop_tc + _T_gb_tc[:3, 3]) + _arm_base_tc
+                        # 点云是光学系（x右 y下 z前），_R_c2w_tc 已是光学系->世界，无需翻转
                         _pts_table_cam_c = _pts_table_cam.astype(np.float64).copy()
-                        _pts_table_cam_c[:, 2] *= -1
                         _pts_table_world = (_pts_table_cam_c @ _R_c2w_tc.T) + _t_cam_tc
                         np.savez('/tmp/table_cloud.npz', points=_pts_table_world.astype(np.float32))
                         print(f'[SM] 桌面点云已保存 /tmp/table_cloud.npz（{len(_pts_table_world)} pts）', flush=True)
@@ -1345,7 +1344,7 @@ def main():
                                     except Exception:
                                         _ik_ok_pre = False
                                     _R_cam_ci      = _gr["rotations"][_ci]
-                                    _app_world_ci  = _R_cam2world @ (-_R_cam_ci[:, 0])
+                                    _app_world_ci  = _R_cam2world @ _R_cam_ci[:, 0]
                                     _approach_z_ci = float(_app_world_ci[2])
                                     _ranked_pre.append((
                                         _ik_ok_pre,
@@ -1378,8 +1377,8 @@ def main():
                             except Exception:
                                 _R_des_best = None
                             print(f"[DIAG] best grasp R_cam approach(col0)={np.round(_gr['rotations'][_best_gi][:,0],4)}", flush=True)
+                            # GraspNet 原始输出即光学系（x右 y下 z前），直接使用
                             _R_cam_best = _gr["rotations"][_best_gi].copy()
-                            _R_cam_best[:, 0] *= -1   # GraspNet approach在+Z光轴系下，转为相机系需取反
                             grasp_result = {
                                 "t_cam":   _gr["translations"][_best_gi],
                                 "R_cam":   _R_cam_best,

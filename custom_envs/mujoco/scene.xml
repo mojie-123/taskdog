@@ -240,10 +240,14 @@
                                so the camera looks DOWN at the table during SCAN.
                                Image +X (right) = gripper_base -Y, Image +Y (down) = gripper_base -X
                                Previous Rz(-90) was WRONG: it made body -Z = gripper_base -Z (camera looked UP). -->
+                          <!-- fovy 是【垂直】视场角：42.57 = 2*atan(240/616) => fy=616 @480px，
+                               与管线里 fx=fy=616 的反投影/投影完全一致。
+                               注意：Isaac 原设计的 54.9 是【水平】FOV（VFOV≈42.6），
+                               当初误填进 fovy 会让真实 fy≈462，点云横向被缩小 0.75x。 -->
                           <camera name="wrist_cam"
                                   pos="-0.05 0 0.06"
                                   quat="0 0.7071068 -0.7071068 0"
-                                  fovy="54.9" />
+                                  fovy="42.57" />
                           <body name="link7" pos="0 0 0.1358" quat="0.7071055 0.7071081 0 0" gravcomp="1">
                             <joint name="joint7" type="slide" axis="0 0 1" limited="true" range="0 0.035" damping="0.5" frictionloss="0"/>
                             <inertial pos="0.0006512 -0.049193 0.0097226" mass="0.025" fullinertia="0.00007371 0.00000781 0.0000747 -0.00000113 0.00000021 -0.00001372"/>
