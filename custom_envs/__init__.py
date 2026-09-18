@@ -5,4 +5,7 @@ It inherits from the official rl_training Deeprobotics M20 configurations,
 allowing customization without modifying upstream code.
 """
 
-from . import tasks  # noqa: F401
+try:
+    from . import tasks  # noqa: F401
+except (ModuleNotFoundError, ImportError):
+    pass  # MuJoCo 运行环境下无 isaaclab_tasks，忽略

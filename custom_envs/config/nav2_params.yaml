@@ -107,8 +107,8 @@ controller_server:   # 控制器服务器。跟踪全局路径，实时计算机
       yaw_goal_tolerance: 3.14159   # 不限制最终朝向do not enforce final yaw — ALIGN_YAW handles it
     FollowPath:
       plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"   # 在路径上找一个"前瞻点"，计算机器人转向该点所需的曲率和速度
-      desired_linear_vel: 0.8   # 期望线速度
-      lookahead_dist: 0.8   # 基础前瞻距离
+      desired_linear_vel: 0.5   # 期望线速度0.8
+      lookahead_dist: 1.5   # 基础前瞻距离0.8
       min_lookahead_dist: 0.4   # 最小前瞻距离（即使路径曲率很大，前瞻距离也不会小于 0.4 米，防止过度转向）
       max_lookahead_dist: 1.2   # 最大前瞻距离
       lookahead_time: 1.5   # 前瞻时间。意味着前瞻点大约在 1.5 秒后到达的位置（前瞻距离 = desired_linear_vel * lookahead_time）。但是这里use_velocity_scaled_lookahead_dist:false所以没用。
@@ -137,8 +137,8 @@ velocity_smoother:   # 速度平滑器。避免速度突变
     smoothing_frequency: 20.0   # 平滑器执行频率
     scale_velocities: false   # 不缩放速度，仅使用max_velocity和min_velocity
     feedback: "OPEN_LOOP"   # 开环。不依赖里程计反馈，直接根据加速度限制平滑速度。适用于里程计数据不稳定或不可靠的场景
-    max_velocity: [0.8, 0.0, 2.0]   # [v_x, v_y, ω_z]
-    min_velocity: [-0.8, 0.0, -2.0]
+    max_velocity: [0.8, 0.0, 1.0]    # [v_x, v_y, ω_z][0.8, 0.0, 2.0]
+    min_velocity: [-0.8, 0.0, -1.0]
     max_accel: [2.5, 0.0, 3.2]   # [a_x, a_y, α_z]
     max_decel: [-2.5, 0.0, -3.2]
     odom_topic: "/odom"   # 里程计。订阅 /odom 话题获取机器人当前速度估计，用于闭环模式或速度超时检测。

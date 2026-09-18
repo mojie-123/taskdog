@@ -181,6 +181,31 @@ def main():
     policy = runner.get_inference_policy(device="cuda:0")
     print("[INFO] Policy loaded")
 
+    # ---- 打印 default joint pos 和 obs 维度（用于 MuJoCo 迁移）----
+    _mj_robot = env.unwrapped.scene["robot"]
+    _mj_default_jpos = _mj_robot.data.default_joint_pos[0].cpu().numpy()
+    _mj_jnames = list(_mj_robot.joint_names)
+    print("[MJ_MIGRATE] ===== MuJoCo 迁移信息 =====", flush=True)
+    print(f"[MJ_MIGRATE] obs['policy'].shape = {obs['policy'].shape}", flush=True)
+    print(f"[MJ_MIGRATE] action_space.shape  = {env.action_space.shape}", flush=True)
+    print(f"[MJ_MIGRATE] 关节总数: {len(_mj_jnames)}", flush=True)
+    print("[MJ_MIGRATE] default_joint_pos（joint_pos_rel 的 offset）:", flush=True)
+    for _n, _v in zip(_mj_jnames, _mj_default_jpos):
+        print(f"[MJ_MIGRATE]   {_n}: {_v:.6f}", flush=True)
+    print("[MJ_MIGRATE] 关节顺序（obs joint_pos/vel 和 action 的顺序）:", flush=True)
+    for _i, _n in enumerate(_mj_jnames):
+        print(f"[MJ_MIGRATE]   [{_i:2d}] {_n}", flush=True)
+    # ---- joint_pos obs 成分确认：对比 obs[9:25] 和各关节 actual-default ----
+    _mj_jpos_act = _mj_robot.data.joint_pos[0].cpu().numpy()
+    _mj_jpos_obs = obs['policy'][0, 9:25].cpu().numpy()
+    print("[MJ_MIGRATE] joint_pos obs 成分确认（obs[9:25] vs actual-default）:", flush=True)
+    _diffs = _mj_jpos_act - _mj_default_jpos
+    for _i, (_n, _d) in enumerate(zip(_mj_jnames, _diffs)):
+        print(f"[MJ_MIGRATE]   [{_i:2d}] {_n:20s}  actual-default={_d:8.4f}", flush=True)
+    print(f"[MJ_MIGRATE] obs[9:25] = {np.round(_mj_jpos_obs, 4)}", flush=True)
+    print("[MJ_MIGRATE] ================================", flush=True)
+    # ---- 迁移信息打印完毕 ----
+
     sys.path.insert(
         0, os.path.join(os.path.dirname(__file__), "..", "..", "utils"))
 
