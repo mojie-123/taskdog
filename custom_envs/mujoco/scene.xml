@@ -97,12 +97,8 @@
          ~5mm/侧（物理上不穿透碰撞体）。 -->
     <mesh name="apple_collision"  file="/home/mojie/taskdog/custom_envs/mujoco/meshes/apple/collision_flat.obj"  scale="0.8 0.8 0.8" />
     <mesh name="apple_visual"     file="/home/mojie/taskdog/custom_envs/mujoco/meshes/apple/textured.obj"   scale="0.9 0.9 0.9" />
-    <mesh name="bowl_collision"   file="/home/mojie/taskdog/custom_envs/mujoco/meshes/bowl/collision.obj"   scale="1 1 1" />
-    <mesh name="bowl_visual"      file="/home/mojie/taskdog/custom_envs/mujoco/meshes/bowl/textured.obj"    scale="1 1 1" />
     <material name="banana_mat" rgba="1.0 0.85 0.1 1" />
     <material name="apple_mat"  rgba="0.9 0.1  0.1 1" />
-    <texture name="bowl_tex" type="2d" file="../objects/024_bowl/texture_map.png" />
-    <material name="bowl_mat" texture="bowl_tex" />
   </asset>
   <worldbody>
     <light name="main_light" pos="5 5 5" dir="0 0 -1" diffuse="0.8 0.8 0.8" />
@@ -111,6 +107,10 @@
     <!-- M20_Piper robot (FIRST so freejoint gets index 0) -->
     <body name="base_link" pos="0 0 0">
           <freejoint name="robot_freejoint" />
+          <!-- Dynamic base lock: welded to a mocap anchor only during CLOSE/LIFT.
+               Site is exactly at the free-root body frame, so the lock can capture the current pose. -->
+          <site name="base_lock_site" pos="0 0 0" quat="1 0 0 0"
+                size="0.002" rgba="0 0 0 0" />
           <inertial pos="0.0035511 0.0016508 -0.0034646" mass="15.882" fullinertia="0.0880787 0.533816 0.563915 0.001396 0.000111 0.000519"/>
           <geom pos="0 0 0" group="1" contype="0" conaffinity="0" material="base_link_mat" type="mesh" mesh="base_link" />
           <geom pos="0 0 0" rgba="0.9373 0.2667 0.2667 1" group="3" contype="1" conaffinity="1" type="box" size="0.375 0.045 0.07" />
@@ -320,6 +320,15 @@
             </body>
           </body>
         </body>
+
+    <!-- World-fixed runtime anchor for CLOSE/LIFT base locking.
+         Python moves this mocap body to base_link's current pose immediately before
+         activating base_lock_weld; while active, the weld is solved every physics step. -->
+    <body name="base_lock_anchor" mocap="true" pos="0 0 0">
+      <site name="base_lock_anchor_site" pos="0 0 0" quat="1 0 0 0"
+            size="0.002" rgba="0 0 0 0" />
+    </body>
+
     <!-- table1: center(5,5), matches IsaacLab Shop_Table scale=(0.008,0.024,0.008) -->
     <!-- USD extent x:80.85cm y:113.56cm z:82.66cm => actual x=0.6468m y=2.7255m z(top)=0.6613m -->
     <body name="table1" pos="5.0 5.0 0.0">
@@ -464,38 +473,20 @@
             solref="0.004 1" solimp="0.99 0.999 0.001"
             rgba="0.9 0.1 0.1 1" />
     </body>
-    <!-- bowl on table1: body z = table_surface(0.6613) + mesh_z_min_abs(0.0278) = 0.6891 -->
-    <body name="bowl" pos="4.9 5.5 0.6891">
+    <!-- cylinder on table1（原 bowl 已换为圆柱 r=2.5cm h=6cm，竖放）:
+         body z = table_surface(0.6613) + 圆柱半高 0.03 = 0.6913。
+         单 geom 身兼视觉+碰撞（group 默认 0 → 相机可见，AnyGrasp 靠它出抓取）。
+         不再需要凸块拼装：圆柱是凸几何原语，不像 mesh（碰撞=凸包）会把空腔填实。
+         圆盘面大、平底不滚 → condim 默认 3 即可（无需苹果那样的滚动摩擦）。
+         橙色高饱和（vivid 过滤要 S≥80），区别于苹果红 0.9 0.1 0.1 与香蕉/方块黄 1 1 0。 -->
+    <body name="bowl" pos="4.9 5.5 0.6913">
       <freejoint name="bowl_freejoint" />
-      <!-- visual mesh (no collision) -->
-      <geom name="bowl_visual" type="mesh" mesh="bowl_visual"
-            contype="0" conaffinity="0" group="1" material="bowl_mat" />
-      <!-- collision: 凸块拼装（自动生成，勿手改；重跑 scripts/generate_bowl_collision.py 覆盖本块）
-           为什么不用 mesh：实测 MuJoCo 的 mesh 碰撞几何 = 该 mesh 的凸包（射线才用真面），
-           空腔会被填实（probe44：薄板停在"不存在的盖"上）→ 内侧指板插不进腔、碗夹不住。
-           改用与机器狗本体同款做法（group=3 + box/cylinder 凸块，见 worldbody 里的腿/轮）。
-           原碗 collision.obj（坏面，编译成 40×30mm 薄片）保留在 meshes/bowl/ 不再引用。 -->
-      <!-- BOWL_COLLISION_BEGIN -->
-      <!-- 生成命令（可原样重跑还原本块; 参数前补回双横线）: python generate_bowl_collision.py collar-r 0.0777 collar-thick 0.0069 collar-from 0.008 bore-r 0.0708 -->
-      <geom name="bowl_foot" type="box" size="0.04621 0.04621 0.00200" pos="0 0 -0.02550"
-            mass="0.3000" friction="5.0 0.01 0.01" solref="0.004 1"
-            solimp="0.99 0.999 0.001" rgba="0.9 0.85 0.7 1" group="3" contype="1" conaffinity="1" />
-      <replicate count="16" euler="0 0 22.50000000">
-        <geom type="box" size="0.00345 0.01792 0.00388" pos="0.07349 0 0.01262"
-              quat="1.000000 0 0.000000 0" mass="0.00417" friction="5.0 0.01 0.01"
-              solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.9 0.85 0.7 1" group="3" contype="1" conaffinity="1" />
-      </replicate>
-      <replicate count="16" euler="0 0 22.50000000">
-        <geom type="box" size="0.00345 0.01792 0.00388" pos="0.07349 0 0.02037"
-              quat="1.000000 0 0.000000 0" mass="0.00417" friction="5.0 0.01 0.01"
-              solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.9 0.85 0.7 1" group="3" contype="1" conaffinity="1" />
-      </replicate>
-      <replicate count="16" euler="0 0 22.50000000">
-        <geom type="box" size="0.00345 0.01792 0.00163" pos="0.07349 0 0.02587"
-              quat="1.000000 0 0.000000 0" mass="0.00417" friction="5.0 0.01 0.01"
-              solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.9 0.85 0.7 1" group="3" contype="1" conaffinity="1" />
-      </replicate>
-      <!-- BOWL_COLLISION_END -->
+      <geom name="bowl_geom" type="cylinder" size="0.025 0.03"
+            mass="0.3" friction="5.0 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001"
+            rgba="1 0.55 0 1" />
+      <!-- 原 BOWL_COLLISION_BEGIN..END 凸块拼装块（50 个 box geom）已随 bowl→圆柱替换删除：
+           圆柱是凸几何原语，不像 mesh（碰撞=凸包）会把空腔填实，无需拼装。
+           仍可用 scripts/generate_bowl_collision.py 重新生成（若要还原旧碗）。 -->
     </body>
     <!-- test cube on table1: body z = table_surface(0.6613) + 半边长 0.02 = 0.6813
          4cm 立方体做 CLOSE 阶段专用测试物：两夹持面严格平行 → 两指同刻接触，
@@ -510,6 +501,17 @@
             rgba="1 1 0 1" />
     </body>
   </worldbody>
+
+  <!-- Runtime base lock.  Inactive by default so NAV/REACH are unchanged.
+       site-based weld aligns the live base frame to a mocap anchor placed at the
+       current pose; solref/solimp make it a stiff physical constraint, not teleportation. -->
+  <equality>
+    <weld name="base_lock_weld"
+          site1="base_lock_site" site2="base_lock_anchor_site"
+          active="false"
+          solref="0.005 1" solimp="0.99 0.999 0.001" />
+  </equality>
+
   <actuator>
 
     <motor name="fl_hipx_joint_motor" joint="fl_hipx_joint" gear="1" ctrllimited="true" ctrlrange="-76.4 76.4" />

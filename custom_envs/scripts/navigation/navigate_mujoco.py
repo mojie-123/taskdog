@@ -303,6 +303,76 @@ def main():
     _lift_best_err      = None
     _lift_diverge_count = 0
 
+    # ── CLOSE/LIFT 底盘物理锁定（MuJoCo equality weld） ──
+    # 与旧的每 policy step set_root_pose() 不同：weld 在每个 physics substep 内由
+    # MuJoCo 约束求解器持续施加约束反力，因此不会产生 20ms 一次的根节点“瞬移”。
+    import mujoco as _mj_lock
+    _base_lock_bid = _mj_lock.mj_name2id(
+        env._model, _mj_lock.mjtObj.mjOBJ_BODY, "base_link")
+    _base_lock_anchor_bid = _mj_lock.mj_name2id(
+        env._model, _mj_lock.mjtObj.mjOBJ_BODY, "base_lock_anchor")
+    _base_lock_eqid = _mj_lock.mj_name2id(
+        env._model, _mj_lock.mjtObj.mjOBJ_EQUALITY, "base_lock_weld")
+
+    if _base_lock_bid < 0 or _base_lock_anchor_bid < 0 or _base_lock_eqid < 0:
+        raise RuntimeError(
+            "scene.xml 缺少 base_lock_site/base_lock_anchor/base_lock_weld；"
+            "请使用配套的 weld 版 scene.xml")
+
+    _base_lock_mocapid = int(env._model.body_mocapid[_base_lock_anchor_bid])
+    if _base_lock_mocapid < 0:
+        raise RuntimeError("base_lock_anchor 必须是 mocap=true body")
+
+    _base_lock = dict(
+        active=False,
+        ref_pos=None,
+        ref_quat=None,
+    )
+
+    def _set_base_physical_lock(enable):
+        """CLOSE/LIFT 物理底盘锁：mocap anchor + site weld；只在状态切换时动作一次。"""
+        _enable = bool(enable)
+        if _enable == bool(_base_lock["active"]):
+            return
+
+        if _enable:
+            # 把世界锚点放到此刻 base_link 的实际世界位姿；两个 site 初始完全重合，
+            # 因此启用 weld 不会把机器人拉回 XML 初始位姿。
+            _p = env._data.xpos[_base_lock_bid].astype(np.float64).copy()
+            _q = env._data.xquat[_base_lock_bid].astype(np.float64).copy()
+            env._data.mocap_pos[_base_lock_mocapid] = _p
+            env._data.mocap_quat[_base_lock_mocapid] = _q
+            env._data.eq_active[_base_lock_eqid] = 1
+            _mj_lock.mj_forward(env._model, env._data)
+
+            _base_lock["active"] = True
+            _base_lock["ref_pos"] = _p
+            _base_lock["ref_quat"] = _q
+            print(
+                f"[BASE_LOCK] ON physical weld at pos={np.round(_p,6)} "
+                f"quat={np.round(_q,6)}",
+                flush=True)
+        else:
+            env._data.eq_active[_base_lock_eqid] = 0
+            _mj_lock.mj_forward(env._model, env._data)
+            _base_lock["active"] = False
+            print("[BASE_LOCK] OFF physical weld", flush=True)
+
+    def _print_base_lock_diag(tag="BASE_LOCK"):
+        """只读诊断：显示 weld active 时 base_link 相对锁定瞬间的残余漂移。"""
+        if not _base_lock["active"] or _base_lock["ref_pos"] is None:
+            return
+        _p = env._data.xpos[_base_lock_bid].astype(np.float64).copy()
+        _q = env._data.xquat[_base_lock_bid].astype(np.float64).copy()
+        _dp_mm = (_p - _base_lock["ref_pos"]) * 1000.0
+        _q0 = np.asarray(_base_lock["ref_quat"], dtype=np.float64)
+        _dot = float(np.clip(abs(np.dot(_q0, _q)), 0.0, 1.0))
+        _dang_deg = math.degrees(2.0 * math.acos(_dot))
+        print(
+            f"[{tag}] drift_mm={np.round(_dp_mm,4)} "
+            f"drift_rot={_dang_deg:.5f}deg",
+            flush=True)
+
     # ── arm / gripper 在 joint_pos(ALL_JOINT_NAMES) 中的索引 ──
     # 不再硬编码下标，直接复用 env 按关节名建立的映射，避免 obs_builder 顺序变化。
     _ARM_IDX = np.asarray(env._arm_all_idx, dtype=np.int32).copy()
@@ -2443,7 +2513,7 @@ def main():
                 if _pan_neg_x_goal is None:
                     _pan_neg_x_goal = _px_goal
                 _px_err = abs(pos_w[0] - _pan_neg_x_goal)
-                _pxv = float(np.clip(-2.0 * (pos_w[0] - _pan_neg_x_goal), -0.3, 0.3))
+                _pxv = float(np.clip(2.0 * (pos_w[0] - _pan_neg_x_goal), -0.3, 0.3))
                 cmd_vx = 0.0; cmd_vy = _pxv; cmd_wz = 0.0
                 _gripper_step(close=True)
                 if state_step % 50 == 0:
@@ -2490,7 +2560,7 @@ def main():
                 # 精调 X 位置到目标放置坐标的 X 方向
                 _pdx_err = float(args.destination[0]) - float(pos_w[0])
                 _pdx_abs = abs(_pdx_err)
-                _pdxv = float(np.clip(-2.0 * _pdx_err, -0.3, 0.3))
+                _pdxv = float(np.clip(2.0 * _pdx_err, -0.3, 0.3))
                 cmd_vx = 0.0; cmd_vy = _pdxv; cmd_wz = 0.0
                 _gripper_step(close=True)
                 if state_step % 50 == 0:
@@ -2572,6 +2642,14 @@ def main():
                 action_np = np.zeros(16, dtype=np.float32)
             last_action = action_np.copy()
 
+            # ── CLOSE/LIFT：用 MuJoCo 物理 weld 固定底盘 ──
+            # 在 env.step 前同步状态，保证约束参与本轮每一个 physics substep。
+            # CLOSE -> LIFT 时保持同一个 weld/anchor，不重新捕获位姿；
+            # 一旦离开 LIFT（含失败回 ARM_INIT）则在下一次 physics step 前解除。
+            _set_base_physical_lock(
+                state in {PipelineState.CLOSE, PipelineState.LIFT}
+            )
+
             # ── 执行 env.step ──
             env.step(action_np)
 
@@ -2596,17 +2674,21 @@ def main():
                     print(f"[CPOST] diagnostic error: {_de_post}", flush=True)
                 _cl_deep_post_pending = None
 
+            # 物理锁定残余漂移：CLOSE/LIFT 每 10 个状态步打印一次。
+            if _base_lock["active"] and state in {PipelineState.CLOSE, PipelineState.LIFT}:
+                if state_step % 10 == 0:
+                    _print_base_lock_diag("BASE_LOCK")
+
             time.sleep(0.005)  # 实时 1×：让 MuJoCo passive viewer 有时间处理鼠标/键盘事件
 
-            # FREEZE_STATES：强制维持根节点位姿
+            # FREEZE_STATES：旧 set_root_pose() 仅保留给抓取前阶段。
+            # CLOSE/LIFT 已改为 MuJoCo equality weld 物理固定，严禁在这两个阶段瞬移根节点。
             _FREEZE_STATES = {
                 PipelineState.ARM_INIT, PipelineState.SCAN,
                 PipelineState.GRASP_PLAN,   # AnyGrasp 推理期间锁住底盘，防止漂移影响 IK
                 PipelineState.PRE_GRASP,
                 PipelineState.ORIENT,
-                PipelineState.REACH,        # 抓取推进阶段锁住底盘，防止漂移导致夹爪偏离
-                PipelineState.CLOSE,        # 夹爪闭合阶段锁住底盘
-                PipelineState.LIFT,         # 抬臂阶段锁住底盘，防止香蕉脱手
+                PipelineState.REACH,        # 抓取推进阶段仍沿用原有冻结逻辑（本次不改）
             }
             if state in _FREEZE_STATES and _frozen_pos is not None:
                 env.set_root_pose(_frozen_pos, _frozen_quat)

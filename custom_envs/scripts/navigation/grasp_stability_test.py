@@ -69,7 +69,8 @@ SUCCESS_Z           = 0.75          # 与管线 LIFT 判定一致
 DEFAULT_OBJ_POS = {
     "apple":  (4.9, 4.5, 0.6623),
     "banana": (4.9, 5.0, 0.6800),
-    "bowl":   (4.9, 5.5, 0.6891),
+    # bowl 已替换为圆柱 r=2.5cm h=6cm：z = 桌面 0.6613 + 半高 0.03 = 0.6913
+    "bowl":   (4.9, 5.5, 0.6913),
     "cube":   (4.9, 6.0, 0.6813),
 }
 # CLOSE 两段式冻结的加深量：必须与 navigate_mujoco.py 的 _CLOSE_FREEZE_S 保持同步
