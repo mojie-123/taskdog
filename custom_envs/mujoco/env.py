@@ -72,7 +72,7 @@ _KD_WHEEL  = 0.4                           # 轮子速度控制
 _KP_J1234  = 150.0;   _KD_J1234  = 15.0   # 臂 j1-4：kp=150（误差0.3rad -> 45N*m）
 _KP_J5     = 150.0;   _KD_J5     = 15.0   # 臂 j5
 _KP_J6     = 150.0;   _KD_J6     = 15.0   # 臂 j6
-_KP_GRIP   = 200.0;    _KD_GRIP   = 8.0    # 夹爪：kp=80（误差0.1rad -> 8N*m）
+_KP_GRIP   = 80.0;    _KD_GRIP   = 3.2    # 夹爪：kp=80（误差0.1rad -> 8N*m）
 
 _INIT_HEIGHT = 0.58
 
@@ -84,7 +84,7 @@ class MuJoCoEnv:
         self,
         robot_init_pos=(0.0, 0.0, _INIT_HEIGHT),
         robot_init_quat=(1.0, 0.0, 0.0, 0.0),  # (w,x,y,z)
-        substeps: int = 4,
+        substeps: int = 20,
         camera_width: int = 640,
         camera_height: int = 480,
         render: bool = False,
@@ -144,6 +144,22 @@ class MuJoCoEnv:
         self._grip_max_delta = _GRIP_MAX_DELTA
         self._grip_min_tau   = 0  # 最小夹爪力矩（N·m），防止接触时误差小导致力不足
 
+        # 夹爪控制模式：False=位置PD；True=恒力+速度阻尼夹持。
+        # joint7 的闭合方向是负，joint8 的闭合方向是正。
+        self._grip_force_mode = False
+        self._grip_hold_force = np.array([-1.0, +1.0], dtype=np.float64)
+        # FORCE 模式下的速度阻尼：抑制接触后的“撞上 -> 弹开 -> 再撞上”。
+        # 阻尼项永远不会把最终控制力反向到张开方向。
+        self._grip_force_kd = 2.0       # N / (m/s)，每指速度阻尼
+        self._grip_force_min = 0.3      # N，中心纠偏后每指仍至少保留这么大的向内夹紧力
+
+        # FORCE 模式额外锁定双指中心 c=(q7+q8)/2。
+        # 开合仍由 ±hold_force 控制；中心漂移由一个较弱的 PD 纠偏。
+        self._grip_center_target = None
+        self._grip_center_kp = 200.0    # N/m；已验证可将中心误差压到亚毫米级
+        self._grip_center_kd = 1.0      # N/(m/s)
+        self._grip_center_force = 0.0   # 最近一次中心纠偏力，仅用于诊断
+
         # 1-step action delay buffer（对应训练时 DelayedPDActuator max_delay=1）
         # 腿部 position target 和轮子 velocity target 各延迟 1 个 policy step 执行
         self._leg_target_buf   = None  # (12,) 上一步的 leg_target
@@ -197,9 +213,14 @@ class MuJoCoEnv:
             if qpa is not None:
                 self._data.qpos[qpa] = float(DEFAULT_JOINT_POS_ALL[i])
 
-        # 重置机械臂目标
+        # 重置机械臂/夹爪目标与夹爪控制模式
         self._arm_target  = DEFAULT_JOINT_POS_ALL[self._arm_all_idx].copy().astype(np.float64)
         self._grip_target = DEFAULT_JOINT_POS_ALL[self._grip_all_idx].copy().astype(np.float64)
+        self._grip_cmd    = self._grip_target.copy()
+        self._grip_force_mode = False
+        self._grip_hold_force[:] = [-1.0, +1.0]
+        self._grip_center_target = None
+        self._grip_center_force = 0.0
 
         # 重置 action delay buffer
         self._leg_target_buf   = None
@@ -230,6 +251,15 @@ class MuJoCoEnv:
         # 轮子 velocity target
         wheel_target_vel = action[12:16].astype(np.float64) * _WHEEL_SCALE
 
+        # 夹爪命令速率限制：每个 policy step 只更新一次。
+        # 注意 env.step() 内部会执行 self._substeps 个 MuJoCo 物理步；
+        # 如果把这段更新放进 substeps 循环，_grip_max_delta=1mm 实际会变成
+        # substeps*1mm / policy step（当前 substeps=4 时即 4mm/step）。
+        if not self._grip_force_mode:
+            grip_delta = np.clip(self._grip_target - self._grip_cmd,
+                                 -self._grip_max_delta, self._grip_max_delta)
+            self._grip_cmd += grip_delta
+
         for _ in range(self._substeps):
             # 每个物理步重读状态
             jpos = self._data.qpos[self._all_qpos_idx]
@@ -253,20 +283,50 @@ class MuJoCoEnv:
                     + self._arm_kd * (0.0 - arm_qd)
             np.clip(arm_tau, -220.0, 220.0, out=arm_tau)
 
-            # 夹爪 PD 力矩（带速率限制和最小力矩）
+            # 夹爪有两种模式：
+            #   1) 位置PD：用于张开、搜索接触；
+            #   2) 恒力+速度阻尼：双指都碰到物体后，持续向内夹，
+            #      同时用 -Kd*qdot 抑制接触反弹。
             grip_q   = jpos[self._grip_all_idx]
             grip_qd  = jvel[self._grip_all_idx]
-            # 速率限制：_grip_cmd 每步最多朝目标移动 _grip_max_delta
-            delta = np.clip(self._grip_target - self._grip_cmd,
-                            -self._grip_max_delta, self._grip_max_delta)
-            self._grip_cmd += delta
-            grip_tau = _KP_GRIP * (self._grip_cmd - grip_q) \
-                     + _KD_GRIP * (0.0 - grip_qd)
-            # 最小力矩：保持夹持方向上至少 _grip_min_tau 的力矩
-            for i in range(len(grip_tau)):
-                sign = np.sign(self._grip_cmd[i] - grip_q[i])
-                if sign != 0 and abs(grip_tau[i]) < self._grip_min_tau:
-                    grip_tau[i] = sign * self._grip_min_tau
+            if self._grip_force_mode:
+                # 1) 基础恒力 + 每指速度阻尼。
+                # joint7: 闭合方向为负；joint8: 闭合方向为正。
+                grip_tau = self._grip_hold_force - self._grip_force_kd * grip_qd
+
+                # 2) 锁定双指中心 c=(q7+q8)/2。
+                # 同号力同时加到两指上，只平移“夹持中心”，不直接改变夹紧力差。
+                if self._grip_center_target is not None:
+                    center = 0.5 * float(grip_q[0] + grip_q[1])
+                    center_vel = 0.5 * float(grip_qd[0] + grip_qd[1])
+                    center_err = center - float(self._grip_center_target)
+                    center_force = (
+                        -self._grip_center_kp * center_err
+                        -self._grip_center_kd * center_vel
+                    )
+
+                    # 纠偏不能强到让某一指失去向内夹紧力。
+                    hold_mag = min(abs(float(self._grip_hold_force[0])),
+                                   abs(float(self._grip_hold_force[1])))
+                    center_force_max = max(0.0, hold_mag - self._grip_force_min)
+                    center_force = float(np.clip(
+                        center_force, -center_force_max, +center_force_max))
+                    self._grip_center_force = center_force
+                    grip_tau = grip_tau + center_force
+                else:
+                    self._grip_center_force = 0.0
+
+                # 最终保护：任何情况下都不能把手指推向张开方向。
+                grip_tau[0] = min(grip_tau[0], -self._grip_force_min)
+                grip_tau[1] = max(grip_tau[1], +self._grip_force_min)
+            else:
+                grip_tau = _KP_GRIP * (self._grip_cmd - grip_q) \
+                         + _KD_GRIP * (0.0 - grip_qd)
+                # 最小力矩：保持位置模式下的原有逻辑。
+                for i in range(len(grip_tau)):
+                    sign = np.sign(self._grip_cmd[i] - grip_q[i])
+                    if sign != 0 and abs(grip_tau[i]) < self._grip_min_tau:
+                        grip_tau[i] = sign * self._grip_min_tau
             np.clip(grip_tau, -10.0, 10.0, out=grip_tau)
 
             # 写入 ctrl
@@ -360,8 +420,77 @@ class MuJoCoEnv:
         self._arm_target = np.asarray(q, dtype=np.float64).copy()
 
     def set_gripper_target(self, q: np.ndarray):
-        """设置夹爪目标角（2维，joint7/joint8）。"""
+        """设置夹爪目标位置（2维，joint7/joint8）。恒力模式下仅保存，不参与控制。"""
         self._grip_target = np.asarray(q, dtype=np.float64).copy()
+
+    def set_gripper_force_hold(self, force: float = 1.0, lock_center: bool = True):
+        """
+        切换到恒力夹持。
+
+        - 开合：joint7=-force、joint8=+force 持续向内夹；
+        - 中心：若 lock_center=True，则立即锁定切换瞬间的 c=(q7+q8)/2；
+          若为 False，则先只做恒力夹持，之后可用 set_gripper_center_hold_target()
+          在稳定后的中心位置上再开启中心锁定。
+        """
+        f = abs(float(force))
+        self._grip_hold_force[:] = [-f, +f]
+
+        if lock_center and (not self._grip_force_mode or self._grip_center_target is None):
+            grip_qpos_idx = self._all_qpos_idx[self._grip_all_idx]
+            q_now = self._data.qpos[grip_qpos_idx].astype(np.float64)
+            self._grip_center_target = 0.5 * float(q_now[0] + q_now[1])
+        elif not lock_center:
+            self._grip_center_target = None
+
+        self._grip_center_force = 0.0
+        self._grip_force_mode = True
+
+    def set_gripper_center_hold_target(self, target: float | None = None):
+        """
+        FORCE 模式下开启/更新中心锁定。
+        target=None 时锁定当前中心；否则使用给定的中心位置（m）。
+        """
+        if not self._grip_force_mode:
+            raise RuntimeError("gripper center lock requires FORCE mode")
+        if target is None:
+            grip_qpos_idx = self._all_qpos_idx[self._grip_all_idx]
+            q_now = self._data.qpos[grip_qpos_idx].astype(np.float64)
+            target = 0.5 * float(q_now[0] + q_now[1])
+        self._grip_center_target = float(target)
+        self._grip_center_force = 0.0
+
+    def disable_gripper_force_hold(self):
+        """退出恒力夹持并恢复位置PD；命令同步到当前实际位置，避免切换冲击。"""
+        if self._grip_force_mode:
+            grip_qpos_idx = self._all_qpos_idx[self._grip_all_idx]
+            q_now = self._data.qpos[grip_qpos_idx].astype(np.float64).copy()
+            self._grip_cmd = q_now.copy()
+            self._grip_target = q_now.copy()
+        self._grip_force_mode = False
+        self._grip_center_target = None
+        self._grip_center_force = 0.0
+
+    @property
+    def gripper_force_mode(self) -> bool:
+        return bool(self._grip_force_mode)
+
+    def get_gripper_center_hold_info(self) -> dict:
+        """返回 FORCE 模式中心锁定诊断信息，不改变仿真状态。"""
+        grip_qpos_idx = self._all_qpos_idx[self._grip_all_idx]
+        grip_dof_idx = self._all_dof_idx[self._grip_all_idx]
+        q = self._data.qpos[grip_qpos_idx]
+        qd = self._data.qvel[grip_dof_idx]
+        center = 0.5 * float(q[0] + q[1])
+        center_vel = 0.5 * float(qd[0] + qd[1])
+        target = self._grip_center_target
+        err = None if target is None else center - float(target)
+        return {
+            "center": center,
+            "target": target,
+            "error": err,
+            "velocity": center_vel,
+            "force": float(self._grip_center_force),
+        }
 
 
     # ──────────────────────────────────────────

@@ -16,9 +16,17 @@
 复用的真实常量：ARM_SIDE_ANGLES / ARM_PREGRASP_ANGLES / GRIPPER_*_POS /
 _PG_MAX_DELTA / _ARM_IDX，以及 arm_ik_mujoco 的 solve_for_gripper_base。
 
+CLOSE 段是本文件自己实现的两段式冻结（首触轻贴 0N → 两指都接触后同刻加深 28mm
+→ 5.6N/指，末 15 步单侧兜底）——**与 navigate_mujoco.py 的 CLOSE 分支（L1370-1453）
++ LIFT 沿用冻结目标（L1464-1466）保持同步，改了那边必须改这边**，否则 harness 测的
+就不是真实管线行为。
+
 用法：
   python custom_envs/scripts/navigation/grasp_stability_test.py \\
       --object apple --trials 5 --close_steps 100 --lift_steps 200 --lift_ramp 150
+
+  # CLOSE 两段式专用测试（4cm 方块放 (4.9, 6.0)，两夹持面严格平行 → 两指应同刻接触）
+  python custom_envs/scripts/navigation/grasp_stability_test.py --object cube --trials 5
 """
 
 import argparse
@@ -62,7 +70,11 @@ DEFAULT_OBJ_POS = {
     "apple":  (4.9, 4.5, 0.6623),
     "banana": (4.9, 5.0, 0.6800),
     "bowl":   (4.9, 5.5, 0.6891),
+    "cube":   (4.9, 6.0, 0.6813),
 }
+# CLOSE 两段式冻结的加深量：必须与 navigate_mujoco.py 的 _CLOSE_FREEZE_S 保持同步
+_CLOSE_FREEZE_S = 0.028
+_CLOSE_SINGLE_FALLBACK_STEP = 85     # 与管线一致：最后 15 步仍单侧接触 → 兜底加深
 FINGER_BODIES = ("link7", "link8")
 
 
@@ -125,17 +137,30 @@ class GraspHarness:
     # ── 接触统计 ──
     def contact_stats(self):
         """返回 (手指数, 物体接触对数, 最大接触法向力)"""
+        n_touch, max_fn, _ = self._contact_scan()
+        return n_touch, max_fn
+
+    def _contact_scan(self):
+        """返回 (接触对数, 最大法向力, {link7: bool, link8: bool})。
+
+        按指判定与 navigate_mujoco.py 的 _fingers_contact 同一套逻辑：扫 d.contact
+        全部接触对，某条接触对一边是物体、另一边是 link7/link8 即判该指接触（纯几何
+        接触，无力度阈值——这是"首触轻贴"能成立的前提）。
+        """
         mj, m, d = self.mj, self.model, self.data
-        finger_gids = set()
+        finger_gids = {}
         for nm in FINGER_BODIES:
             bid = self._body_id[nm]
+            gids = set()
             if bid >= 0:
                 for g in range(m.ngeom):
                     if m.geom_bodyid[g] == bid:
-                        finger_gids.add(g)
+                        gids.add(g)
+            finger_gids[nm] = gids
         obj_bid = self._body_id[self.args.object]
         obj_gids = {g for g in range(m.ngeom) if m.geom_bodyid[g] == obj_bid}
 
+        touch = {nm: False for nm in FINGER_BODIES}
         n_touch = 0
         max_fn = 0.0
         res = np.zeros(6, dtype=np.float64)
@@ -143,11 +168,19 @@ class GraspHarness:
             c = d.contact[i]
             g1, g2 = int(c.geom1), int(c.geom2)
             pair = {g1, g2}
-            if (pair & finger_gids) and (pair & obj_gids):
-                n_touch += 1
-                mj.mj_contactForce(m, d, i, res)
-                max_fn = max(max_fn, abs(float(res[0])))
-        return n_touch, max_fn
+            if (pair & obj_gids):
+                for nm in FINGER_BODIES:
+                    if pair & finger_gids[nm]:
+                        touch[nm] = True
+                if pair & (finger_gids["link7"] | finger_gids["link8"]):
+                    n_touch += 1
+                    mj.mj_contactForce(m, d, i, res)
+                    max_fn = max(max_fn, abs(float(res[0])))
+        return n_touch, max_fn, touch
+
+    def grip_q(self):
+        """当前 joint7/joint8 关节角（m）——直线滑块关节，目标也是米。"""
+        return self.env.get_robot_state()["joint_pos"][self.env._grip_all_idx].copy()
 
     def obj_state(self):
         a = self._obj_qposadr
@@ -232,27 +265,86 @@ class GraspHarness:
             print(f"[HARNESS]   REACH {reach_steps} steps, "
                   f"j7-obj 误差={log['reach_pos_err'] * 1000:.1f}mm", flush=True)
 
-        # ── 阶段 3：CLOSE ──
+        # ── 阶段 3：CLOSE（两段式冻结，镜像 navigate_mujoco.py L1370-1453）──
+        # 第一段：某指首次接触 → 该指目标冻结在接触时 q 本身（PD 误差≈0 → 挤压力≈0N），
+        #   未接触指继续盲闭 0.0；
+        # 第二段：两指都接触 → 同一步两侧同时加深 _CLOSE_FREEZE_S（对称挤压，净横向力≈0）；
+        # 兜底：最后 15 步仍单侧 → 已接触侧加深 S（速率限制 1mm/步，太晚触发压不出力）。
+        # ⚠ 本段必须与 navigate_mujoco.py 的 CLOSE 分支保持同步，改了那边要改这边。
         n_touch_trace, fn_trace = [], []
+        cl_frz = [None, None]        # [joint7, joint8] 冻结目标
+        cl_qc = [None, None]         # 冻结时记录的 q7/q8
+        cl_sq = [False]              # 第二段是否已触发
+        frz_steps = [None, None]     # 各指首触的步号（DIAG）
+        sq_step = [None]
         for s in range(close_steps):
-            self._step(q_ik, GRIPPER_CLOSE_POS)
+            _, _, tc = self._contact_scan()
+            gq = self.grip_q()
+            for k, nm in enumerate(FINGER_BODIES):      # link7 -> 0, link8 -> 1
+                if cl_frz[k] is None and tc[nm]:
+                    cl_frz[k] = float(gq[k])
+                    cl_qc[k] = float(gq[k])
+                    frz_steps[k] = s
+                    if verbose:
+                        print(f"[HARNESS]   CLOSE: {nm} 首触 @step{s} q{gq[k]:+.4f} "
+                              f"→ 轻贴冻结", flush=True)
+            if (not cl_sq[0]) and cl_frz[0] is not None and cl_frz[1] is not None:
+                cl_frz[0] = cl_qc[0] - _CLOSE_FREEZE_S
+                cl_frz[1] = cl_qc[1] + _CLOSE_FREEZE_S
+                cl_sq[0] = True
+                sq_step[0] = s
+                if verbose:
+                    print(f"[HARNESS]   CLOSE: 两指都已接触 @step{s} → 同时加深 "
+                          f"S={_CLOSE_FREEZE_S * 1000:.0f}mm → 目标 "
+                          f"[{cl_frz[0]:.4f}, {cl_frz[1]:.4f}] "
+                          f"= {200.0 * _CLOSE_FREEZE_S:.1f}N/指", flush=True)
+            if (not cl_sq[0]) and s >= _CLOSE_SINGLE_FALLBACK_STEP and \
+                    (cl_frz[0] is not None or cl_frz[1] is not None):
+                if cl_frz[0] is not None:
+                    cl_frz[0] = cl_qc[0] - _CLOSE_FREEZE_S
+                if cl_frz[1] is not None:
+                    cl_frz[1] = cl_qc[1] + _CLOSE_FREEZE_S
+                cl_sq[0] = True
+                sq_step[0] = s
+                if verbose:
+                    print(f"[HARNESS]   [WARN] CLOSE: 只有单侧接触 → 兜底单侧压 "
+                          f"S={_CLOSE_FREEZE_S * 1000:.0f}mm", flush=True)
+            grip_tgt = np.array([cl_frz[0] if cl_frz[0] is not None else 0.0,
+                                 cl_frz[1] if cl_frz[1] is not None else 0.0],
+                                dtype=np.float64)
+            self._step(q_ik, grip_tgt)
             nt, mf = self.contact_stats()
             n_touch_trace.append(nt)
             fn_trace.append(mf)
+
         log["close_steps"] = close_steps
         log["close_contacts_end"] = n_touch_trace[-1]
         log["close_max_fn"] = max(fn_trace) if fn_trace else 0.0
+        log["close_contact_step"] = list(frz_steps)        # [link7, link8] 首触步
+        log["close_squeeze_step"] = sq_step[0]
+        log["close_frz_target"] = [cl_frz[0], cl_frz[1]]
+        log["close_two_stage"] = bool(cl_frz[0] is not None and cl_frz[1] is not None
+                                      and frz_steps[0] is not None
+                                      and frz_steps[1] is not None
+                                      and cl_qc[0] is not None and cl_qc[1] is not None
+                                      # 两指都靠"首触轻贴"进入，而非兜底单侧压
+                                      and sq_step[0] is not None
+                                      and sq_step[0] < _CLOSE_SINGLE_FALLBACK_STEP)
+        log["close_step_gap"] = (abs(frz_steps[0] - frz_steps[1])
+                                 if None not in frz_steps else None)
         pos_c, _ = self.obj_state()
         log["pos_after_close"] = pos_c.copy()
-        log["grip_q_after_close"] = self.env.get_robot_state()["joint_pos"][
-            self.env._grip_all_idx].copy()
+        log["grip_q_after_close"] = self.grip_q()
 
-        # ── 阶段 4：LIFT ──
+        # ── 阶段 4：LIFT（沿用 CLOSE 冻结目标，镜像管线 L1464-1466）──
         lift_fn, lift_nt = [], []
+        lift_grip = np.array([cl_frz[0] if cl_frz[0] is not None else 0.0,
+                              cl_frz[1] if cl_frz[1] is not None else 0.0],
+                             dtype=np.float64)
         for s in range(lift_steps):
             cur_q = self._arm_q()
             alpha = min(1.3, s / max(float(lift_ramp), 1.0))
-            self._step(cur_q + alpha * (ARM_SIDE_ANGLES - cur_q), GRIPPER_CLOSE_POS)
+            self._step(cur_q + alpha * (ARM_SIDE_ANGLES - cur_q), lift_grip)
             nt, mf = self.contact_stats()
             lift_nt.append(nt)
             lift_fn.append(mf)
@@ -277,6 +369,11 @@ class GraspHarness:
             print(f"[HARNESS]   CLOSE端接触={log['close_contacts_end']} "
                   f"maxFn={log['close_max_fn']:.2f}N | "
                   f"LIFT端接触={log['lift_contacts_end']} maxFn={log['lift_max_fn']:.2f}N",
+                  flush=True)
+            print(f"[HARNESS]   CLOSE: 首触步={log['close_contact_step']} "
+                  f"步差={log['close_step_gap']} 加深步={log['close_squeeze_step']} "
+                  f"两段式={'OK' if log['close_two_stage'] else '未走通'} | "
+                  f"CLOSE后位移={np.linalg.norm(log['pos_after_close'][:2] - obj_pos0[:2]) * 1000:.2f}mm",
                   flush=True)
             print(f"[HARNESS]   final_z={log['final_z']:.4f} tilt={log['tilt_deg']:.1f}deg "
                   f"dxy={log['delta_xy'] * 1000:.1f}mm "
@@ -346,7 +443,8 @@ def main():
                      ("delta_xy", "{:.4f}"), ("close_contacts_end", "{:.1f}"),
                      ("lift_contacts_end", "{:.1f}"), ("close_max_fn", "{:.2f}"),
                      ("lift_max_fn", "{:.2f}"), ("reach_pos_err", "{:.4f}"),
-                     ("step_ms", "{:.2f}")):
+                     ("step_ms", "{:.2f}"),
+                     ("close_step_gap", "{:.1f}"), ("close_squeeze_step", "{:.1f}")):
         vals = np.array([l[key] for l in logs], dtype=np.float64)
         print("  {:<18s} mean={} min={} max={}".format(
             key, fmt.format(vals.mean()), fmt.format(vals.min()), fmt.format(vals.max())),
