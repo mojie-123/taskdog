@@ -133,6 +133,7 @@ class IsaacROS2Bridge:
 
     def send_goal(self, x: float, y: float) -> None:   # 向 Nav2发送目标点坐标，Nav2 接收后触发 A* 路径规划和 Pure Pursuit 跟踪
         """Send a Nav2 navigation goal."""
+        self._drain_feedback()   # 先清掉队列里上一个任务遗留的 nav_done 消息（否则本任务会读数秒完成）
         self._nav_done   = False
         self._nav_failed = False
         self._send({"type": "goal", "x": float(x), "y": float(y)})

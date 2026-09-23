@@ -2102,7 +2102,7 @@ def main():
                 if (not _cl_sq[0]) and _cl_frz[0] is not None and _cl_frz[1] is not None:
                     _cl_sq[0] = True
                     env._grip_max_delta = _GRIP_MAX_DELTA_NORMAL
-                    env.set_gripper_force_hold(1.0)
+                    env.set_gripper_force_hold(2.0)
                     print(
                         "[SM] CLOSE: both fingers touched -> SYMMETRIC FORCE HOLD "
                         "(joint7=-1.00N, joint8=+1.00N; no center lock)",
@@ -2527,8 +2527,11 @@ def main():
                     state_step = 0
 
             elif state == PipelineState.NAV2_DEST:
-                # 发送 Nav2 目标到 destination，等待完成
-                cmd_vx = 0.0; cmd_vy = 0.0; cmd_wz = 0.0
+                # 发送 Nav2 目标到 destination，等待完成。
+                # 不覆盖 cmd：与 NAV 阶段一致，主循环开头 get_cmd_vel() 读到的
+                # Nav2 速度指令直接进 policy，机器人沿 Nav2 路径驶向 destination。
+                # （曾经这里清零 cmd → policy 收到 (0,0,0)，狗站着不动、Nav2
+                #  永远到不了 goal，只能等 6000 步超时。）
                 _gripper_step(close=True)
                 if not _dest_goal_sent:
                     bridge.send_goal(args.destination[0], args.destination[1])
@@ -2580,17 +2583,22 @@ def main():
                     state_step = 0
 
             elif state == PipelineState.ROTATE:
-                # 插值 j1→+π/2, j2→1.8, j3→-1.8 over 200 steps
+                # 插值 j1→+π/2, j2→1.8, j3→-1.8 over 600 steps。
+                # 用余弦剖面（起步/收尾速度为零）而非线性：线性插值是恒角速度的
+                # 速度阶跃，臂 PD 跟踪快速斜坡产生的力矩反作用到未锁的躯干，
+                # 与 policy 腿平衡环路耦合 → 狗和臂一起剧烈抖动。
+                # 600 步（≈12s）把 j1 的峰值速度也从 0.0157 rad/步降到约一半以下；
+                # 同时 ROTATE 期间底座已加物理锁（见 _set_base_physical_lock 调用处）。
                 cmd_vx = 0.0; cmd_vy = 0.0; cmd_wz = 0.0
                 _gripper_step(close=True)
-                _a_r = min(1.0, state_step / 200.0)
+                _a_r = 0.5 * (1.0 - math.cos(math.pi * min(1.0, state_step / 600.0)))
                 _qr  = _get_arm_q(jpos).copy()
                 _qr[0] = _rotate_j1_start + _a_r * (_rotate_j_target[0] - _rotate_j1_start)
                 _qr[1] = _rotate_j2_start + _a_r * (_rotate_j_target[1] - _rotate_j2_start)
                 _qr[2] = _rotate_j3_start + _a_r * (_rotate_j_target[2] - _rotate_j3_start)
                 _arm_step(_qr)
                 state_step += 1
-                if state_step >= 200:
+                if state_step >= 600:
                     print("[SM] ROTATE done -> PUT_DOWN", flush=True)
                     state = PipelineState.PUT_DOWN
                     state_step = 0
@@ -2647,7 +2655,8 @@ def main():
             # CLOSE -> LIFT 时保持同一个 weld/anchor，不重新捕获位姿；
             # 一旦离开 LIFT（含失败回 ARM_INIT）则在下一次 physics step 前解除。
             _set_base_physical_lock(
-                state in {PipelineState.CLOSE, PipelineState.LIFT}
+                state in {PipelineState.CLOSE, PipelineState.LIFT,
+                          PipelineState.ROTATE}
             )
 
             # ── 执行 env.step ──

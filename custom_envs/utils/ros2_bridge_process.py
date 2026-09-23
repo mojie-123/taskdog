@@ -111,6 +111,12 @@ def main() -> None:
     _stop        = False
     _pending_goal: list = []
     CMD_TIMEOUT = 0.5
+    # 上次发射给父进程的 nav 状态（None = 还没发过，保证首条必发）。
+    # 主循环只在本对值变化时才发 nav_done/nav_failed：否则 NAV1 完成后
+    # _nav_done=True 会被无限重复发射，堆积在父进程队列里，导致下一个
+    # 导航任务（NAV2_DEST）在 send_goal 后立刻读到陈旧 true 而"秒完成"。
+    _last_nd_out = None
+    _last_nf_out = None
 
     def _cmd_cb(msg: Twist) -> None:
         nonlocal _vx, _omega_z, _last_cmd_t
@@ -338,8 +344,12 @@ def main() -> None:
             oz_out = 0.0 if stale else _omega_z
             nd_out = _nav_done
             nf_out = _nav_failed
-        _emit({"vx": vx_out, "omega_z": oz_out,
-               "nav_done": nd_out, "nav_failed": nf_out})
+        _emit({"vx": vx_out, "omega_z": oz_out})
+        # nav 状态只在变化时发射：避免上一个任务的 nav_done=true 被无限重复发送，
+        # 让父进程下个任务在 send_goal 后读到陈旧状态而秒完成。
+        if (nd_out, nf_out) != (_last_nd_out, _last_nf_out):
+            _emit({"nav_done": nd_out, "nav_failed": nf_out})
+            _last_nd_out, _last_nf_out = nd_out, nf_out
 
         time.sleep(0.001)
 
