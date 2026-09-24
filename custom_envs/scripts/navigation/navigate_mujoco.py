@@ -262,6 +262,13 @@ def main():
     _pos_w_at_scan   = None  # SCAN 完成时的机器人世界位置
     _quat_w_at_scan  = None  # SCAN 完成时的机器人四元数
     _pan_neg_x_goal  = None  # PAN_NEG_X 目标坐标
+    # PAN 平移统一平滑控制状态：用加速度限幅 + 停车滞回，避免 0↔最小步速来回跳。
+    _pan_ctrl_state   = None
+    _pan_cmd_vx       = 0.0
+    _pan_cmd_vy       = 0.0
+    _pan_cmd_wz       = 0.0
+    _pan_settling     = False
+    _pan_settle_count = 0
     _dest_goal_sent  = False # NAV2_DEST 是否已发送 goal
     _rotate_j_target = None  # ROTATE 目标关节角
     _rotate_j1_start = None
@@ -408,6 +415,87 @@ def main():
 
     def _yaw_err_to(target_yaw, current_yaw):
         return _wrap_angle(target_yaw - current_yaw)
+
+    # ── PAN 统一平滑速度控制 ──
+    # locomotion policy 在很小的非零速度附近容易在“站立/迈步”之间反复切换；旧代码又
+    # 直接把速度从 0 跳到 0.10m/s，因此会产生明显抖动。这里保留 0.10m/s 的有效步速，
+    # 但通过命令斜坡(slew-rate)平滑进出，并用 settling 滞回防止目标附近反复重启。
+    _PAN_MIN_MOVE_SPEED = 0.10       # m/s；真正移动时不长期停留在更低的不稳定步速
+    _PAN_DV_PER_STEP    = 0.012      # m/s per policy step；约0.6m/s^2（dt≈20ms）
+    _PAN_DW_PER_STEP    = 0.040      # rad/s per policy step；yaw保持也做斜坡
+    _PAN_YAW_KP         = 1.2
+    _PAN_YAW_MAX        = 0.35
+    _PAN_YAW_DEADBAND   = math.radians(1.0)
+    _PAN_SETTLE_SPEED   = 0.06       # m/s；底盘实际水平速度低于此值才允许切状态
+    _PAN_SETTLE_STEPS   = 8          # 连续稳定约0.16s后才切状态
+
+    def _slew(cur, target, max_delta):
+        return float(cur + np.clip(float(target) - float(cur), -max_delta, max_delta))
+
+    def _pan_axis_control(
+        pan_state, world_err, body_axis, body_sign, target_yaw,
+        pos_tol, resume_tol, kp, vmax, yaw_now, base_lin_vel,
+    ):
+        """统一 PAN 控制。
+
+        world_err  = 世界坐标目标 - 当前坐标（只传本阶段控制的那一轴）
+        body_axis  = 'vx' 或 'vy'
+        body_sign  = 世界正方向速度映射到该 body cmd 的符号
+        settling   = 一旦进入 pos_tol 就只减速停车；除非漂出更大的 resume_tol 才重新走，
+                     从而避免目标附近 0 ↔ 0.10m/s 抖动。
+        """
+        nonlocal _pan_ctrl_state, _pan_cmd_vx, _pan_cmd_vy, _pan_cmd_wz
+        nonlocal _pan_settling, _pan_settle_count
+
+        if _pan_ctrl_state != pan_state:
+            _pan_ctrl_state = pan_state
+            _pan_cmd_vx = 0.0
+            _pan_cmd_vy = 0.0
+            _pan_cmd_wz = 0.0
+            _pan_settling = False
+            _pan_settle_count = 0
+
+        ae = abs(float(world_err))
+        if _pan_settling:
+            # 只有明显漂出更宽的滞回区才重新起步，防止一步一停。
+            if ae > float(resume_tol):
+                _pan_settling = False
+                _pan_settle_count = 0
+        elif ae <= float(pos_tol):
+            _pan_settling = True
+            _pan_settle_count = 0
+
+        if _pan_settling:
+            axis_target = 0.0
+        else:
+            mag = min(float(vmax), max(_PAN_MIN_MOVE_SPEED, float(kp) * ae))
+            world_v_target = math.copysign(mag, float(world_err))
+            axis_target = float(body_sign) * world_v_target
+
+        vx_target = axis_target if body_axis == 'vx' else 0.0
+        vy_target = axis_target if body_axis == 'vy' else 0.0
+        _pan_cmd_vx = _slew(_pan_cmd_vx, vx_target, _PAN_DV_PER_STEP)
+        _pan_cmd_vy = _slew(_pan_cmd_vy, vy_target, _PAN_DV_PER_STEP)
+
+        yaw_err = _yaw_err_to(float(target_yaw), float(yaw_now))
+        if abs(yaw_err) <= _PAN_YAW_DEADBAND:
+            wz_target = 0.0
+        else:
+            wz_target = float(np.clip(_PAN_YAW_KP * yaw_err,
+                                      -_PAN_YAW_MAX, _PAN_YAW_MAX))
+        _pan_cmd_wz = _slew(_pan_cmd_wz, wz_target, _PAN_DW_PER_STEP)
+
+        _vxy = float(np.linalg.norm(np.asarray(base_lin_vel, dtype=np.float64)[:2]))
+        if (_pan_settling and _vxy <= _PAN_SETTLE_SPEED
+                and abs(yaw_err) <= math.radians(3.0)):
+            _pan_settle_count += 1
+        else:
+            _pan_settle_count = 0
+        done = (_pan_settle_count >= _PAN_SETTLE_STEPS)
+
+        return (_pan_cmd_vx, _pan_cmd_vy, _pan_cmd_wz, done,
+                dict(err=ae, vxy=_vxy, yaw_err=yaw_err,
+                     settling=_pan_settling, settle_count=_pan_settle_count))
 
     def _arm_step(q6):
         """设置机械臂目标角（6维）。"""
@@ -1095,105 +1183,92 @@ def main():
                 cmd_vx = 0.0; cmd_vy = 0.0
                 cmd_wz = float(np.clip(2.0 * err, -1.2, 1.2))
                 if abs(err) < 0.05:
-                    state = PipelineState.PAN_VY
+                    state = PipelineState.PAN_VX
                     state_step = 0
                     print("[MJ] ALIGN_YAW_1 done -> PAN_VX")
 
             elif state == PipelineState.PAN_VX:
-                # PD 控制：精调机器人 Y 方向位置（朝向 -Y 时 vx 对应世界 -Y 运动，需取反）
+                # 世界 Y 精调。机器人已由 ALIGN_YAW_1 对齐到 +Y，因此 body vx 与 world +Y 同向。
                 _dy_w = float(args.goal[1]) - float(pos_w[1])
-                _dy_err = abs(_dy_w)
+                cmd_vx, cmd_vy, cmd_wz, _pan_done, _pd = _pan_axis_control(
+                    PipelineState.PAN_VX, _dy_w, 'vx', +1.0, math.pi / 2,
+                    pos_tol=0.08, resume_tol=0.16, kp=0.8, vmax=0.25,
+                    yaw_now=yaw, base_lin_vel=rs["lin_vel"])
                 if state_step == 1:
-                    print(f"[SM] PAN_VX start dy_err={_dy_err:.3f}m", flush=True)
-                if state_step % 50 == 0:
-                    print(f"[SM] PAN_VX step {state_step}: dy_err={_dy_err:.3f}m", flush=True)
-                _v_cap = float(np.clip(0.4 * _dy_err, 0.0, 0.3))
-                if _v_cap < 0.10:  # 死区：速度过小时停止，避免 policy 步态不稳
-                    _v_cap = 0.0
-                # 面向+Y时 cmd_vx>0 => 世界y增大，同向
-                cmd_vx = float(np.clip(math.copysign(_v_cap, _dy_w), -0.3, 0.15))
-                cmd_vy = 0.0; cmd_wz = 0.0
+                    print(f"[SM] PAN_VX start dy_err={_pd['err']:.3f}m", flush=True)
+                if state_step % 25 == 0:
+                    print(f"[SM] PAN_VX step {state_step}: dy_err={_pd['err']:.3f}m "
+                          f"cmd=({cmd_vx:+.3f},{cmd_vy:+.3f},{cmd_wz:+.3f}) "
+                          f"vxy={_pd['vxy']:.3f} settling={int(_pd['settling'])} "
+                          f"settle={_pd['settle_count']}/{_PAN_SETTLE_STEPS}", flush=True)
                 state_step += 1
-                if _dy_err < 0.10 or state_step >= 400:
-                    print("[SM] PAN_VX done -> PAN_VY", flush=True)
+                if _pan_done or state_step >= 500:
+                    _why = "settled" if _pan_done else "timeout"
+                    print(f"[SM] PAN_VX done ({_why}) -> PAN_VY", flush=True)
                     state = PipelineState.PAN_VY
                     state_step = 0
 
             elif state == PipelineState.PAN_VY:
-                # PD 控制：精调机器人 X 方向位置（朝向 -Y 时 vy>0 => 世界+X，故同向）
-                # X 目标在 goal_x 基础上偏移 +0.5m（让机器人站在桌子侧面合适位置）
+                # 世界 X 精调：目标为 goal_x+0.5m。朝 +Y 时 body +vy(左移) = world -X，故符号取反。
                 _dx_w = float(args.goal[0]) + 0.5 - float(pos_w[0])
-                _dx_err = abs(_dx_w)
+                cmd_vx, cmd_vy, cmd_wz, _pan_done, _pd = _pan_axis_control(
+                    PipelineState.PAN_VY, _dx_w, 'vy', -1.0, math.pi / 2,
+                    pos_tol=0.10, resume_tol=0.20, kp=1.0, vmax=0.25,
+                    yaw_now=yaw, base_lin_vel=rs["lin_vel"])
                 if state_step == 1:
-                    print(f"[SM] PAN_VY start dx_err={_dx_err:.3f}m", flush=True)
-                if state_step % 50 == 0:
-                    print(f"[SM] PAN_VY step {state_step}: dx_err={_dx_err:.3f}m", flush=True)
-                _v_cap = float(np.clip(2.0 * _dx_err, 0.0, 0.3))
-                if _v_cap < 0.10:  # 死区：速度过小时停止，避免 policy 步态不稳
-                    _v_cap = 0.0
-                cmd_vx = 0.0
-                # 面向+Y时 cmd_vy>0 => 机器人左移 => 世界x减小，故取反
-                cmd_vy = float(np.clip(-math.copysign(_v_cap, _dx_w), -0.3, 0.15))
-                cmd_wz = 0.0
+                    print(f"[SM] PAN_VY start dx_err={_pd['err']:.3f}m", flush=True)
+                if state_step % 25 == 0:
+                    print(f"[SM] PAN_VY step {state_step}: dx_err={_pd['err']:.3f}m "
+                          f"cmd=({cmd_vx:+.3f},{cmd_vy:+.3f},{cmd_wz:+.3f}) "
+                          f"vxy={_pd['vxy']:.3f} settling={int(_pd['settling'])} "
+                          f"settle={_pd['settle_count']}/{_PAN_SETTLE_STEPS}", flush=True)
                 state_step += 1
-                if _dx_err < 0.12 or state_step >= 400:
-                    # ── 临时方案（2026-09-16）：跳过 PAN_VX_FINAL / ALIGN_YAW ──
-                    # 运控小速度指令抖动问题解决前，不再用速度指令做末段精调：
-                    #   x 保持 PAN_VY 结束时的值（被桌子挡住，已达物理可达位置）；
-                    #   y 直接瞬移到目标 goal_y；朝向一步对齐到 yaw=+π/2（直立）。
-                    # 注意：瞬移不符合物理实际，仅为绕过运控问题；修复运控后删除本块，
-                    # 恢复原流程 "PAN_VY -> PAN_VX_FINAL -> ALIGN_YAW -> ARM_INIT"。
-                    cmd_vx = 0.0; cmd_vy = 0.0; cmd_wz = 0.0
-                    _snap_pos = pos_w.copy()
-                    _snap_pos[1] = float(args.goal[1])        # y -> 目标位置（x/z 保持不变）
-                    _snap_quat = np.array(
-                        [math.cos(math.pi / 4), 0.0, 0.0, math.sin(math.pi / 4)],
-                        dtype=np.float64)                     # yaw=+π/2 直立四元数 (w,x,y,z)
-                    env.set_root_pose(_snap_pos, _snap_quat)  # 瞬移 base + 清零速度
-                    _frozen_pos  = _snap_pos.copy()           # 补上 ALIGN_YAW 原本保存的 FREEZE 锚点
-                    _frozen_quat = _snap_quat.copy()
-                    print(f"[SM] PAN_VY done -> SNAP {np.round(pos_w,3)} -> "
-                          f"{np.round(_snap_pos,3)} -> ARM_INIT", flush=True)
+                if _pan_done or state_step >= 500:
+                    _why = "settled" if _pan_done else "timeout"
+                    # 旧版因 PAN 抖动临时用 set_root_pose() 把 y 瞬移到目标；现在恢复物理精调流程。
+                    print(f"[SM] PAN_VY done ({_why}) -> PAN_VX_FINAL", flush=True)
                     state = PipelineState.ARM_INIT
                     state_step = 0
 
-            elif state == PipelineState.PAN_VX_FINAL:
-                # PAN_VY 之后的 Y 方向补正，消除侧移耦合引入的 Y 误差
-                _dy_w = float(args.goal[1]) - float(pos_w[1])
-                _dy_err = abs(_dy_w)
-                if state_step == 1:
-                    print(f"[SM] PAN_VX_FINAL start dy_err={_dy_err:.3f}m", flush=True)
-                if state_step % 50 == 0:
-                    print(f"[SM] PAN_VX_FINAL step {state_step}: dy_err={_dy_err:.3f}m", flush=True)
-                _v_cap = float(np.clip(0.4 * _dy_err, 0.0, 0.3))
-                if _v_cap < 0.10:  # 死区：速度过小时停止，避免 policy 步态不稳
-                    _v_cap = 0.1
-                cmd_vx = float(np.clip(math.copysign(_v_cap, _dy_w), -0.3, 0.15))
-                cmd_vy = 0.0; cmd_wz = 0.0
-                state_step += 1
-                if _dy_err < 0.10 or state_step >= 200:
-                    print("[SM] PAN_VX_FINAL done -> ALIGN_YAW", flush=True)
-                    state = PipelineState.ALIGN_YAW
-                    state_step = 0
+            # elif state == PipelineState.PAN_VX_FINAL:
+            #     # 侧移后再次补正世界 Y，消除 PAN_VY 产生的耦合误差。
+            #     _dy_w = float(args.goal[1]) - float(pos_w[1])
+            #     cmd_vx, cmd_vy, cmd_wz, _pan_done, _pd = _pan_axis_control(
+            #         PipelineState.PAN_VX_FINAL, _dy_w, 'vx', +1.0, math.pi / 2,
+            #         pos_tol=0.06, resume_tol=0.14, kp=0.8, vmax=0.22,
+            #         yaw_now=yaw, base_lin_vel=rs["lin_vel"])
+            #     if state_step == 1:
+            #         print(f"[SM] PAN_VX_FINAL start dy_err={_pd['err']:.3f}m", flush=True)
+            #     if state_step % 25 == 0:
+            #         print(f"[SM] PAN_VX_FINAL step {state_step}: dy_err={_pd['err']:.3f}m "
+            #               f"cmd=({cmd_vx:+.3f},{cmd_vy:+.3f},{cmd_wz:+.3f}) "
+            #               f"vxy={_pd['vxy']:.3f} settling={int(_pd['settling'])} "
+            #               f"settle={_pd['settle_count']}/{_PAN_SETTLE_STEPS}", flush=True)
+            #     state_step += 1
+            #     if _pan_done or state_step >= 350:
+            #         _why = "settled" if _pan_done else "timeout"
+            #         print(f"[SM] PAN_VX_FINAL done ({_why}) -> ALIGN_YAW", flush=True)
+            #         state = PipelineState.ALIGN_YAW
+            #         state_step = 0
 
-            elif state == PipelineState.ALIGN_YAW:
-                # 对齐到 +Y 方向（yaw = +π/2），面向桌子，然后进入 ARM_INIT
-                _yaw_err_align = _yaw_err_to(math.pi / 2, yaw)
-                if state_step == 1:
-                    print(f"[SM] ALIGN_YAW start: cur={math.degrees(yaw):.1f}deg", flush=True)
-                if state_step % 50 == 0:
-                    print(f"[SM] ALIGN_YAW step {state_step}: "
-                          f"err={math.degrees(_yaw_err_align):.1f}deg", flush=True)
-                cmd_vx = 0.0; cmd_vy = 0.0
-                cmd_wz = float(np.clip(100.0 * _yaw_err_align, -1.2, 1.2))
-                state_step += 1
-                if abs(_yaw_err_align) < 0.02 or state_step >= 600:
-                    print("[SM] ALIGN_YAW done -> ARM_INIT", flush=True)
-                    # 保存 FREEZE 锚点
-                    _frozen_pos  = pos_w.copy()
-                    _frozen_quat = quat_w.copy()
-                    state = PipelineState.ARM_INIT
-                    state_step = 0
+            # elif state == PipelineState.ALIGN_YAW:
+            #     # 对齐到 +Y 方向（yaw = +π/2），面向桌子，然后进入 ARM_INIT
+            #     _yaw_err_align = _yaw_err_to(math.pi / 2, yaw)
+            #     if state_step == 1:
+            #         print(f"[SM] ALIGN_YAW start: cur={math.degrees(yaw):.1f}deg", flush=True)
+            #     if state_step % 50 == 0:
+            #         print(f"[SM] ALIGN_YAW step {state_step}: "
+            #               f"err={math.degrees(_yaw_err_align):.1f}deg", flush=True)
+            #     cmd_vx = 0.0; cmd_vy = 0.0
+            #     cmd_wz = float(np.clip(100.0 * _yaw_err_align, -1.2, 1.2))
+            #     state_step += 1
+            #     if abs(_yaw_err_align) < 0.02 or state_step >= 600:
+            #         print("[SM] ALIGN_YAW done -> ARM_INIT", flush=True)
+            #         # 保存 FREEZE 锚点
+            #         _frozen_pos  = pos_w.copy()
+            #         _frozen_quat = quat_w.copy()
+            #         state = PipelineState.ARM_INIT
+            #         state_step = 0
 
             elif state == PipelineState.ARM_INIT:
                 # 机械臂插值到 ARM_SIDE_ANGLES，同时 FREEZE 根节点位姿。
@@ -2508,20 +2583,27 @@ def main():
                         state_step = 0
 
             elif state == PipelineState.PAN_NEG_X:
-                # PD 移动到 (pos[0]-0.5, pos[1]) 准备导航回放置点
-                _px_goal = pos_w[0] - 0.5
+                # LIFT 后先沿世界 -X 平移约 0.5m，再交给 Nav2。
+                # 当前朝向约 +Y：body +vy = world -X，因此 world-X 误差映射到 vy 时取反。
                 if _pan_neg_x_goal is None:
-                    _pan_neg_x_goal = _px_goal
-                _px_err = abs(pos_w[0] - _pan_neg_x_goal)
-                _pxv = float(np.clip(2.0 * (pos_w[0] - _pan_neg_x_goal), -0.3, 0.3))
-                cmd_vx = 0.0; cmd_vy = _pxv; cmd_wz = 0.0
+                    _pan_neg_x_goal = float(pos_w[0]) - 0.5
+                    print(f"[SM] PAN_NEG_X start: x={pos_w[0]:.3f} -> "
+                          f"goal={_pan_neg_x_goal:.3f} (-0.5m)", flush=True)
+                _px_w = float(_pan_neg_x_goal) - float(pos_w[0])
+                cmd_vx, cmd_vy, cmd_wz, _pan_done, _pd = _pan_axis_control(
+                    PipelineState.PAN_NEG_X, _px_w, 'vy', -1.0, math.pi / 2,
+                    pos_tol=0.03, resume_tol=0.08, kp=1.0, vmax=0.25,
+                    yaw_now=yaw, base_lin_vel=rs["lin_vel"])
                 _gripper_step(close=True)
-                if state_step % 50 == 0:
-                    print(f"[SM] PAN_NEG_X step {state_step}: "
-                          f"px_err={_px_err:.3f}m", flush=True)
+                if state_step % 25 == 0:
+                    print(f"[SM] PAN_NEG_X step {state_step}: px_err={_pd['err']:.3f}m "
+                          f"cmd=({cmd_vx:+.3f},{cmd_vy:+.3f},{cmd_wz:+.3f}) "
+                          f"vxy={_pd['vxy']:.3f} settling={int(_pd['settling'])} "
+                          f"settle={_pd['settle_count']}/{_PAN_SETTLE_STEPS}", flush=True)
                 state_step += 1
-                if _px_err < 0.2 or state_step >= 300:
-                    print("[SM] PAN_NEG_X done -> NAV2_DEST", flush=True)
+                if _pan_done or state_step >= 450:
+                    _why = "settled" if _pan_done else "timeout"
+                    print(f"[SM] PAN_NEG_X done ({_why}) -> NAV2_DEST", flush=True)
                     _pan_neg_x_goal = None
                     state = PipelineState.NAV2_DEST
                     state_step = 0
@@ -2560,18 +2642,24 @@ def main():
                     state_step = 0
 
             elif state == PipelineState.PAN_DES_X:
-                # 精调 X 位置到目标放置坐标的 X 方向
-                _pdx_err = float(args.destination[0]) - float(pos_w[0])
-                _pdx_abs = abs(_pdx_err)
-                _pdxv = float(np.clip(2.0 * _pdx_err, -0.3, 0.3))
-                cmd_vx = 0.0; cmd_vy = _pdxv; cmd_wz = 0.0
+                # 第二张桌前精调世界 X。此时 ALIGN_YAW_2 已对齐到 -Y；body +vy = world +X。
+                _pdx_w = float(args.destination[0]) - float(pos_w[0])
+                cmd_vx, cmd_vy, cmd_wz, _pan_done, _pd = _pan_axis_control(
+                    PipelineState.PAN_DES_X, _pdx_w, 'vy', +1.0, -math.pi / 2,
+                    pos_tol=0.08, resume_tol=0.16, kp=1.0, vmax=0.25,
+                    yaw_now=yaw, base_lin_vel=rs["lin_vel"])
                 _gripper_step(close=True)
-                if state_step % 50 == 0:
-                    print(f"[SM] PAN_DES_X step {state_step}: "
-                          f"dx_err={_pdx_abs:.3f}m", flush=True)
+                if state_step == 1:
+                    print(f"[SM] PAN_DES_X start dx_err={_pd['err']:.3f}m", flush=True)
+                if state_step % 25 == 0:
+                    print(f"[SM] PAN_DES_X step {state_step}: dx_err={_pd['err']:.3f}m "
+                          f"cmd=({cmd_vx:+.3f},{cmd_vy:+.3f},{cmd_wz:+.3f}) "
+                          f"vxy={_pd['vxy']:.3f} settling={int(_pd['settling'])} "
+                          f"settle={_pd['settle_count']}/{_PAN_SETTLE_STEPS}", flush=True)
                 state_step += 1
-                if _pdx_abs < 0.1 or state_step >= 400:
-                    print("[SM] PAN_DES_X done -> ROTATE", flush=True)
+                if _pan_done or state_step >= 500:
+                    _why = "settled" if _pan_done else "timeout"
+                    print(f"[SM] PAN_DES_X done ({_why}) -> ROTATE", flush=True)
                     _rotate_j1_start = _get_arm_q(jpos)[0]
                     _rotate_j2_start = _get_arm_q(jpos)[1]
                     _rotate_j3_start = _get_arm_q(jpos)[2]

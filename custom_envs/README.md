@@ -49,6 +49,6 @@ python custom_envs/scripts/navigation/navigate_to_goal_nav2.py     --task      F
 
 python custom_envs/scripts/navigation/navigate_to_goal_nav2_whole.py     --task      Flat-Deeprobotics-M20Pro-Piper-TwoTables-v0    --policy_task Flat-Deeprobotics-M20-v0     --load_run  2026-07-18_10-57-32     --checkpoint model_4999.pt     --map       custom_envs/maps/map_whole.npz     --goal      4.5 5.0     --grasp_checkpoint /home/mojie/anygrasp_sdk/grasp_detection/log/checkpoint_detection.tar  --object banana --destination 7.45 6.0
 
-python custom_envs/scripts/navigation/navigate_mujoco.py     --policy_path  deps/rl_training/logs/rsl_rl/deeprobotics_m20_flat/2026-07-18_10-57-32/model_4999.pt     --map          custom_envs/maps/map_whole.npz     --goal         4.0 6.0     --grasp_checkpoint /home/mojie/anygrasp_sdk/grasp_detection/log/checkpoint_detection.tar     --object      cube     --destination  7.45 6.0     --render
+python custom_envs/scripts/navigation/navigate_mujoco.py     --policy_path  deps/rl_training/logs/rsl_rl/deeprobotics_m20_flat/2026-07-18_10-57-32/model_4999.pt     --map          custom_envs/maps/map_whole.npz     --goal         4.0 5.5     --grasp_checkpoint /home/mojie/anygrasp_sdk/grasp_detection/log/checkpoint_detection.tar     --object      bowl     --destination  7.5 5.8     --render
 
 ```
