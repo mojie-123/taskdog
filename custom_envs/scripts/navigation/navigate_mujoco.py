@@ -16,11 +16,12 @@
 
 import argparse
 import enum
+from dataclasses import dataclass, field
+from typing import Any
 import math
 import os
 import sys
 import time
-import traceback
 
 # 在任何 mujoco/glfw 被 import 之前强制指定 X11 后端
 # 修复 Wayland 会话下 MuJoCo passive viewer 鼠标/键盘完全无响应的问题
@@ -32,6 +33,17 @@ os.environ.setdefault('DISPLAY', ':0')
 import numpy as np
 import torch
 
+from navigate_mujoco_diagnostics import (
+    capture_body_pose as _diag_capture_body_pose,
+    finger_contact_info as _diag_finger_contact_info,
+    print_close_step_diag as _diag_print_close_step,
+    print_finger_deep_diag as _diag_print_finger_deep,
+    print_reach_done_diag as _diag_print_reach_done,
+    save_choice_image as _diag_save_choice_image,
+    save_filter_image as _diag_save_filter_image,
+    save_scan_raw as _diag_save_scan_raw,
+)
+
 # ── 路径设置 ──
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.join(_HERE, "..", "..", "..")
@@ -39,17 +51,14 @@ sys.path.insert(0, _ROOT)
 sys.path.insert(0, os.path.join(_HERE, "..", "..", "utils"))
 
 
-# ── 状态机定义（和 Isaac Lab 版完全一致）──
+# ── 当前实际状态机 ──
 class PipelineState(enum.Enum):
     NAV          = "NAV"
     ALIGN_YAW_1  = "ALIGN_YAW_1"
     PAN_VX       = "PAN_VX"
     PAN_VY       = "PAN_VY"
-    PAN_VX_FINAL = "PAN_VX_FINAL"
-    ALIGN_YAW    = "ALIGN_YAW"
     ARM_INIT     = "ARM_INIT"
     SCAN         = "SCAN"
-    PRE_ADJUST   = "PRE_ADJUST"
     GRASP_PLAN   = "GRASP_PLAN"
     PRE_GRASP    = "PRE_GRASP"
     ORIENT       = "ORIENT"
@@ -67,13 +76,10 @@ class PipelineState(enum.Enum):
 
 # ── 机械臂常量（和 Isaac Lab 版一致）──
 ARM_JOINT_NAMES     = ["joint1","joint2","joint3","joint4","joint5","joint6"]
-GRIPPER_JOINT_NAMES = ["joint7","joint8"]
 GRIPPER_OPEN_POS    = np.array([ 0.035, -0.035], dtype=np.float32)
 GRIPPER_CLOSE_POS   = np.array([ 0.000,  0.000], dtype=np.float32)
 ARM_INIT_ANGLES     = np.array([0.0,  0.5, -1.0, 0.0,  0.5, 0.0], dtype=np.float32)  # = ARM_HOME_ANGLES in navigate_to_goal_nav2_whole.py
 ARM_SIDE_ANGLES     = np.array([-math.pi/2, 1.5, -1.5, 0.0, 1.2, 0.0], dtype=np.float32)  # matches navigate_to_goal_nav2_whole.py
-# PRE_ADJUST 目标姿态：j1=-π/2, j5 从 1.2->0（为 GraspNet IK 做准备）
-ARM_PREGRASP_ANGLES = np.array([-math.pi/2, 1.5, -1.5, 0.0, 0.0, 0.0], dtype=np.float32)
 
 # BUDGET（每个状态最大步数）
 BUDGET = {
@@ -83,20 +89,107 @@ BUDGET = {
     PipelineState.REACH:      300,
     PipelineState.CLOSE:      150,
     PipelineState.LIFT:       1000,
-    PipelineState.ALIGN_YAW_2: 200,
-    PipelineState.ROTATE:     200,
-    PipelineState.PUT_DOWN:   100,
 }
 
-PRE_GRASP_MAX_WORLD_ERR = 0.10
-PRE_GRASP_MAX_JOINT_ERR = 0.35
-PRE_GRASP_MAX_ROT_ERR   = 2.90
-REACH_MAX_WORLD_ERR     = 0.08
-REACH_MAX_JOINT_ERR     = 0.25
-REACH_MAX_ROT_ERR       = 0.80
-REACH_MAX_OBJECT_DIST   = 0.15
 SCAN_WARMUP  = 10
 SCAN_FRAMES  = 30
+
+# 状态机中原本散落的固定步数限制；只集中命名，不改变数值/行为。
+ALIGN_YAW_MAX_STEPS = 600
+PAN_MAX_STEPS       = 500
+PAN_NEG_X_MAX_STEPS = 450
+NAV2_DEST_MAX_STEPS = 6000
+ROTATE_STEPS        = 600
+PUT_DOWN_STEPS      = 100
+
+
+@dataclass
+class ReachState:
+    """REACH 跨 policy step 持久化的闭环纠偏状态。"""
+    target_cur: Any = None
+    target_gb_arm0: Any = None
+    corr_iter: int = 0
+    corr_world: np.ndarray = field(
+        default_factory=lambda: np.zeros(3, dtype=np.float64))
+    prev_actual_gb_world: Any = None
+    prev_cmd_move_world: Any = None
+    prev_target_q: Any = None
+    table_height: Any = None
+
+    def reset(self):
+        self.target_cur = None
+        self.target_gb_arm0 = None
+        self.corr_iter = 0
+        self.corr_world[:] = 0.0
+        self.prev_actual_gb_world = None
+        self.prev_cmd_move_world = None
+        self.prev_target_q = None
+        self.table_height = None
+
+
+@dataclass
+class CloseState:
+    """CLOSE 的夹持目标、接触历史和跨 env.step 诊断状态。"""
+    arm_q_hold: Any = None
+    finger_targets: list = field(default_factory=lambda: [None, None])
+    force_hold_started: bool = False
+    diag_obj_pose0: Any = (None, None)
+    diag_prev_contact: Any = None
+    deep_post_pending: Any = None
+    contact_hist: list = field(default_factory=list)
+    obj_pos_hist: list = field(default_factory=list)
+
+    def reset(self):
+        self.arm_q_hold = None
+        self.finger_targets[:] = [None, None]
+        self.force_hold_started = False
+        self.diag_obj_pose0 = (None, None)
+        self.diag_prev_contact = None
+        self.deep_post_pending = None
+        self.contact_hist.clear()
+        self.obj_pos_hist.clear()
+
+
+@dataclass
+class LiftState:
+    """LIFT 两阶段轨迹及 CLOSE 后 hold 检验的跨帧状态。"""
+    stage: int = 0
+    q_stage1_start: Any = None
+    q_stage1_cmd: Any = None
+    stage1_step: int = 0
+    ee_p_start: Any = None
+    fk_dxyz: Any = None
+    q_retract0: Any = None
+    stage2_step: int = 0
+    obj_z_start: Any = None
+    hold_remaining: int = 0
+    hold_seen: int = 0
+    hold_contacts: np.ndarray = field(
+        default_factory=lambda: np.zeros(2, dtype=np.int32))
+    hold_obj_p0: Any = None
+
+    def reset(self):
+        self.stage = 0
+        self.q_stage1_start = None
+        self.q_stage1_cmd = None
+        self.stage1_step = 0
+        self.ee_p_start = None
+        self.fk_dxyz = None
+        self.q_retract0 = None
+        self.stage2_step = 0
+        self.obj_z_start = None
+        self.hold_remaining = 0
+        self.hold_seen = 0
+        self.hold_contacts[:] = 0
+        self.hold_obj_p0 = None
+
+    def begin(self, cur_q, ee_p_start, hold_steps):
+        self.reset()
+        self.stage = 1
+        self.q_stage1_start = np.asarray(cur_q, dtype=np.float64).copy()
+        self.q_stage1_cmd = np.asarray(cur_q, dtype=np.float64).copy()
+        self.ee_p_start = np.asarray(ee_p_start, dtype=np.float64).copy()
+        self.hold_remaining = int(hold_steps)
 
 
 def load_policy(policy_path: str, device: str = "cuda"):
@@ -110,7 +203,6 @@ def load_policy(policy_path: str, device: str = "cuda"):
     返回 act_inference callable：obs_tensor -> action_tensor
     """
     import copy
-    import os
 
     import yaml
 
@@ -191,6 +283,368 @@ def load_policy(policy_path: str, device: str = "cuda"):
     return policy
 
 
+def _run_grasp_plan(
+    env, args, depth_accum, scan_rgb,
+    q_scan_at_scan, pos_w_at_scan, quat_w_at_scan,
+    pos_w, quat_w, ransac_fit_plane, ransac_remove_plane,
+):
+    """Run the synchronous GRASP_PLAN computation after the final SCAN physics step.
+
+    This is intentionally a pure structural extraction of the former inline block:
+    it keeps the same point-cloud construction, AnyGrasp worker IPC, filtering,
+    ranking, diagnostics, and PRE_GRASP/DONE transition decisions.
+    """
+    state = PipelineState.GRASP_PLAN
+    grasp_result = None
+    table_cloud_world = None
+
+    import subprocess as _subproc
+    depth_med = np.median(np.stack(depth_accum, axis=0), axis=0)
+    H, W = depth_med.shape
+    fx_c, fy_c = 616.0, 616.0
+    cx_c, cy_c = W / 2.0, H / 2.0
+    u_g, v_g = np.meshgrid(np.arange(W), np.arange(H))
+    z = depth_med
+    mask = (z > 0.05) & (z < 4.0)
+    z_v  = z[mask]
+    pts  = np.stack([
+        (u_g[mask] - cx_c) * z_v / fx_c,
+        (v_g[mask] - cy_c) * z_v / fy_c,
+        z_v,    # 点云 Z 正值 = 物体方向，与 AnyGrasp 约定一致（AnyGrasp 期望 Z 正 = 前方）
+    ], axis=-1).astype(np.float32)
+    rgb_u = scan_rgb if scan_rgb is not None \
+        else np.zeros((H, W, 3), np.uint8)
+    cols  = (rgb_u[mask] / 255.0).astype(np.float32)
+    print(f"[SM] GRASP_PLAN: 点云原始 {len(pts)} pts "
+          f"(z min={z_v.min():.2f} max={z_v.max():.2f})", flush=True)
+
+    # ── 桌面点云保存（RANSAC 之前，供穿桌检测使用）──
+    try:
+        import cv2 as _cv2_tb
+        _cols_u8_tb = (cols * 255).astype(np.uint8).reshape(1, -1, 3)
+        _hsv_tb = _cv2_tb.cvtColor(_cols_u8_tb, _cv2_tb.COLOR_RGB2HSV)[0]
+        _table_mask_tb = (_hsv_tb[:, 1] < 40) & (_hsv_tb[:, 2] > 40) & (_hsv_tb[:, 2] < 160)
+        _pts_table_cam = pts[_table_mask_tb]
+        print(f'[SM] 桌面颜色点云: {len(_pts_table_cam)} pts', flush=True)
+        if len(_pts_table_cam) > 50:
+            from arm_ik_mujoco import fk_gripper as _fk_gb_tc, quat_to_rot as _q2r_tc, \
+                _CAM_OFFSET_POS as _cop_tc, _CAM_OFFSET_ROT as _cor_tc
+            _R_rob_tc    = _q2r_tc(quat_w_at_scan.astype(np.float64))
+            _arm_base_tc = pos_w_at_scan + _R_rob_tc @ np.array([0., 0., 0.0888])
+            _T_gb_tc     = _fk_gb_tc(q_scan_at_scan.astype(np.float64))
+            _R_c2w_tc    = _R_rob_tc @ _T_gb_tc[:3, :3] @ _cor_tc
+            _t_cam_tc    = _R_rob_tc @ (_T_gb_tc[:3, :3] @ _cop_tc + _T_gb_tc[:3, 3]) + _arm_base_tc
+            # 点云是光学系（x右 y下 z前），_R_c2w_tc 已是光学系->世界，无需翻转
+            _pts_table_cam_c = _pts_table_cam.astype(np.float64).copy()
+            _pts_table_world = (_pts_table_cam_c @ _R_c2w_tc.T) + _t_cam_tc
+            # ── 平面过滤：颜色滤波会把白/灰色物体表面也筛进来（如白碗壁、
+            # 苹果顶高光），它们高于桌面 → clip 取邻域 z 中位数时会误判桌面高度
+            # （碗场景实测 h=0.7143=碗壁，导致下探提前截断、抓空）。
+            # 这里只保留主平面（桌面）附近的点；主平面接近水平才采信，否则保留原样。
+            try:
+                _tb_nv, _tb_dv, _ = ransac_fit_plane(
+                    _pts_table_world.astype(np.float64))
+                if _tb_nv is None:
+                    print(f'[SM] 桌面点云平面拟合: 点太少({len(_pts_table_world)})，保留原样',
+                          flush=True)
+                elif abs(float(_tb_nv[2])) < 0.9:
+                    print(f'[SM] WARN: 桌面点云主平面非水平 '
+                          f'(normal={np.round(_tb_nv, 3)})，保留原样', flush=True)
+                else:
+                    _tb_keep = np.abs(_pts_table_world @ _tb_nv - _tb_dv) < 0.010
+                    if int(_tb_keep.sum()) < 50:
+                        print(f'[SM] WARN: 桌面点云平面过滤后仅 '
+                              f'{int(_tb_keep.sum())} pts，保留原样', flush=True)
+                    else:
+                        print(f'[SM] 桌面点云平面过滤: {len(_pts_table_world)} -> '
+                              f'{int(_tb_keep.sum())} pts '
+                              f'(z中位={np.median(_pts_table_world[_tb_keep, 2]):.4f})，'
+                              f'剔除物体表面点', flush=True)
+                        _pts_table_world = _pts_table_world[_tb_keep]
+            except Exception as _tb_pf_e:
+                print(f'[SM] 桌面点云平面过滤失败: {_tb_pf_e}', flush=True)
+            table_cloud_world = _pts_table_world.astype(np.float32).copy()
+            print(f'[SM] 桌面点云已缓存到内存（{len(table_cloud_world)} pts）', flush=True)
+        else:
+            print(f'[SM] WARN: 桌面颜色点云过少({len(_pts_table_cam)} pts)，跳过缓存', flush=True)
+    except Exception as _tb_e:
+        print(f'[SM] 桌面点云构建失败: {_tb_e}', flush=True)
+
+    _keep = ransac_remove_plane(pts)
+    # 物体点云（RANSAC 去桌面后）：不再喂 AnyGrasp，只用于"抓取点必须落在
+    # 物体上"的几何筛选（见下方 GRASP_PLAN 的落物体筛选）。
+    # AnyGrasp 现在吃**完整点云（含桌面）** —— 让它知道桌子存在，避免产生
+    # 指尖穿桌之类的不可行候选。
+    _pts_obj  = pts[_keep]
+    _cols_obj = cols[_keep]
+    _obj_filter_ok = (len(_pts_obj) >= 200)
+    print(f"[SM] GRASP_PLAN: 完整点云 {len(pts)} pts (喂 AnyGrasp, 含桌面), "
+          f"物体点云 {len(_pts_obj)} pts (去桌面后)", flush=True)
+    if not _obj_filter_ok:
+        print(f"[WARN] 物体点云不足 200 pts ({len(_pts_obj)}) "
+              f"—— 跳过落物体筛选, 全部候选放行", flush=True)
+    if len(pts) < 200:
+        print("[SM] Too few points — DONE.", flush=True)
+        state = PipelineState.DONE
+    else:
+        # 完整点云（含桌面）通过 /tmp/pointcloud.npz 传给独立 grasp_worker；
+        # 物体点云只在本进程内用于候选筛选，不再额外写磁盘。
+        np.savez("/tmp/pointcloud.npz", points=pts, colors=cols)
+        _worker = os.path.join(_HERE, "grasp_worker.py")
+        _res = _subproc.run(
+            [sys.executable, _worker,
+             "--checkpoint", args.grasp_checkpoint,
+             "--topk", "50"],
+            timeout=120,
+        )
+        if _res.returncode != 0 or \
+                not os.path.exists("/tmp/grasp_result.npz"):
+            print("[SM] GraspNet failed — DONE.", flush=True)
+            state = PipelineState.DONE
+        else:
+            _gr = np.load("/tmp/grasp_result.npz",
+                          allow_pickle=True)
+            if len(_gr["scores"]) == 0:
+                print("[SM] No valid grasps — DONE.", flush=True)
+                state = PipelineState.DONE
+            else:
+                # ── 诊断：任取第0个候选，打印各坐标系下的approach方向 ──
+                try:
+                    from arm_ik_mujoco import (
+                        quat_to_rot as _q2r_diag,
+                        fk_gripper as _fkg_diag,
+                        _CAM_OFFSET_ROT as _COR_diag,
+                    )
+                    _R_diag = _gr["rotations"][0]   # 相机系
+                    _app_cam = _R_diag[:, 0]
+                    _R_gb_diag = _fkg_diag(q_scan_at_scan.astype(np.float64))[:3, :3]
+                    _app_gb    = _COR_diag @ _app_cam
+                    _R_rob_diag = _q2r_diag(quat_w_at_scan.astype(np.float64))
+                    _app_base  = _R_rob_diag @ _R_gb_diag @ _app_gb
+                    _app_world = _app_base   # world z = base z（平地）
+                    print(f"[DIAG-APPROACH] cam  ={np.round(_app_cam,4)}", flush=True)
+                    print(f"[DIAG-APPROACH] gb   ={np.round(_app_gb,4)}", flush=True)
+                    print(f"[DIAG-APPROACH] world={np.round(_app_world,4)}", flush=True)
+                except Exception as _diag_e:
+                    print(f"[DIAG-APPROACH] failed: {_diag_e}", flush=True)
+                # ── 目标过滤：高饱和度过滤 S>=80（对齐原版 fallback 逻辑）──
+                # 只作用在**物体点云**上（_pts_obj/_cols_obj）；AnyGrasp 吃的是
+                # 完整点云，桌面候选主要由下方"落物体筛选"拦截，这里降级为
+                # 颜色偏好叠加。
+                _bmask = None
+                _q_scan_saved    = q_scan_at_scan.copy()
+                _pos_w_scan_pre  = pos_w_at_scan.copy()
+                _quat_w_scan_pre = quat_w_at_scan.copy()
+                try:
+                    import cv2 as _cv2_f
+                    from scipy.spatial import cKDTree as _KDTree_f
+                    _cols_u8_ng = (_cols_obj * 255).astype(np.uint8).reshape(1, -1, 3)
+                    _hsv_ng = _cv2_f.cvtColor(_cols_u8_ng, _cv2_f.COLOR_RGB2HSV)[0]
+                    _vivid_mask = (_hsv_ng[:, 1] >= 80)
+                    _vivid_pts = _pts_obj[_vivid_mask]
+                    print(f"[SM] 高饱和过滤(S>=80): {len(_vivid_pts)} 鲜艳点", flush=True)
+                    # 调试图输出独立到 diagnostics 模块；不参与候选筛选逻辑。
+                    _diag_save_filter_image(
+                        scan_rgb, mask, _keep, _vivid_mask)
+                    if len(_vivid_pts) >= 20:
+                        _kd_ng = _KDTree_f(_vivid_pts)
+                        _dists_ng, _ = _kd_ng.query(_gr["translations"], k=1)
+                        _bmask_ng = _dists_ng < 0.05
+                        _n_ok_ng = int(_bmask_ng.sum())
+                        print(f"[SM] 高饱和过滤: {_n_ok_ng}/{len(_gr['translations'])} 候选近鲜艳点", flush=True)
+                        if _n_ok_ng > 0:
+                            _bmask = _bmask_ng
+                        else:
+                            print("[SM] 高饱和过滤无候选 -> 全部候选进排序", flush=True)
+                    else:
+                        print("[SM] 高饱和点不足 -> 全部候选进排序", flush=True)
+                except Exception as _cfe:
+                    print(f"[SM] 目标过滤异常: {_cfe}", flush=True)
+
+                # ── IK 预筛选 + 排序（对齐原版逻辑）──
+                try:
+                    from arm_ik_mujoco import (
+                        solve as _ik_solve_pos_gp,
+                        cam_to_world as _ctw_gp,
+                        world_pos_to_arm_frame as _w2a_gp,
+                        compute_desired_ee_rot_in_arm as _cder_gp,
+                        quat_to_rot as _q2r_gp,
+                        fk_gripper as _fkg_gp,
+                        _CAM_OFFSET_ROT as _COR_gp,
+                    )
+                    _R_rob_gp    = _q2r_gp(_quat_w_scan_pre)
+                    _R_gb_gp     = _fkg_gp(_q_scan_saved)[:3, :3]
+                    _R_cam2world = _R_rob_gp @ _R_gb_gp @ _COR_gp
+                    # _bmask=None 时全部候选进排序，否则只排序颜色过滤后的候选
+                    _banana_idxs_pre = list(np.where(_bmask)[0]) \
+                        if _bmask is not None else list(range(len(_gr["scores"])))
+                    if not _banana_idxs_pre:
+                        _banana_idxs_pre = list(range(len(_gr["scores"])))
+                    # ── 落物体筛选（主判据）──
+                    # C = 掌心 + d·a 是 AnyGrasp 认为的**指尖落点**；要求 C 距
+                    # 物体点云（已去桌面，光学系，与 AnyGrasp 输出同系）最近距离
+                    # < 1cm 才算"抓在物体上"。必须判 C 而不是掌心：掌心在物体外
+                    # d(2~6cm) 处，用掌心会误杀全部有效抓取。
+                    # 物体点云不可用/无候选/异常 -> 警告 + 全部放行（不阻断）。
+                    _GS_DIST_MAX = 0.08
+                    _gr_depths_pre = _gr["depths"] if "depths" in _gr else \
+                        np.full(len(_gr["scores"]), 0.0658, dtype=np.float32)
+                    _gs_kd = None
+                    if _obj_filter_ok:
+                        try:
+                            from scipy.spatial import cKDTree as _KDTree_gs
+                            _gs_kd = _KDTree_gs(_pts_obj.astype(np.float64))
+                            print(f"[SM] 落物体筛选: KD树 {len(_pts_obj)} pts, "
+                                  f"阈值 {_GS_DIST_MAX * 100:.0f}cm", flush=True)
+                        except Exception as _gs_e:
+                            print(f"[WARN] 落物体筛选 KD树构建失败: {_gs_e} "
+                                  f"—— 全部候选放行", flush=True)
+                            _gs_kd = None
+                    else:
+                        print("[WARN] 落物体筛选未启用（物体点云不足）"
+                              "—— 全部候选放行", flush=True)
+                    _gs_ok = {}
+                    if _gs_kd is not None:
+                        for _ci in _banana_idxs_pre:
+                            try:
+                                _C_ci = (
+                                    np.asarray(_gr["translations"][_ci],
+                                               dtype=np.float64)
+                                    + float(_gr_depths_pre[_ci])
+                                    * np.asarray(_gr["rotations"][_ci][:, 0],
+                                                 dtype=np.float64))
+                                _gs_ok[_ci] = bool(
+                                    _gs_kd.query(_C_ci, k=1)[0] < _GS_DIST_MAX)
+                            except Exception:
+                                _gs_ok[_ci] = True   # 异常 -> 该候选放行
+                        _n_gs_pass = int(sum(_gs_ok.values()))
+                        print(f"[SM] 落物体筛选: {_n_gs_pass}/"
+                              f"{len(_banana_idxs_pre)} 候选的抓取点距物体 "
+                              f"<{_GS_DIST_MAX * 100:.0f}cm", flush=True)
+                        if _n_gs_pass == 0:
+                            print("[WARN] 落物体筛选后无候选 —— 全部候选放行",
+                                  flush=True)
+                            _gs_ok = {}
+                    _banana_idxs_pre = [i for i in _banana_idxs_pre
+                                        if _gs_ok.get(i, True)]
+                    _ranked_pre = []
+                    for _ci in _banana_idxs_pre:
+                        _t_ci  = _gr["translations"][_ci]
+                        _tw_ci = _ctw_gp(_t_ci, _q_scan_saved,
+                                         _pos_w_scan_pre, _quat_w_scan_pre)
+                        _ta_ci = _w2a_gp(_tw_ci, _pos_w_scan_pre,
+                                         _quat_w_scan_pre)
+                        try:
+                            _q_pre = _ik_solve_pos_gp(
+                                _ta_ci, target_rot=None,
+                                initial_angles=_q_scan_saved)
+                            _ik_ok_pre = (float(_q_pre[1]) < 2.8)
+                        except Exception:
+                            _ik_ok_pre = False
+                        _R_cam_ci      = _gr["rotations"][_ci]
+                        _app_world_ci  = _R_cam2world @ _R_cam_ci[:, 0]
+                        _approach_z_ci = float(_app_world_ci[2])
+                        _ranked_pre.append((
+                            _ik_ok_pre,
+                            float(_gr["scores"][_ci]),
+                            _ci,
+                            _approach_z_ci,
+                        ))
+                    # 排序：IK可解优先，score 越高越好，approach_z 越负越好
+                    _ranked_pre.sort(
+                        key=lambda x: (-int(x[0]), -x[1], x[3]))
+                    _ranked_idxs = [x[2] for x in _ranked_pre]
+                    print(
+                        f"[SM] 候选排序({len(_ranked_idxs)}个): "
+                        + " ".join(
+                            f"[{r[2]}]{'✓' if r[0] else '✗'}"
+                            f"s={r[1]:.2f}az={r[3]:.2f}"
+                            for r in _ranked_pre[:6]
+                        ),
+                        flush=True,
+                    )
+                except Exception as _rank_e:
+                    print(f"[SM] IK预筛选异常({_rank_e}),使用原始顺序",
+                          flush=True)
+                    _ranked_idxs = list(range(len(_gr["scores"])))
+                _best_gi = _ranked_idxs[0]
+                try:
+                    _R_des_best = _cder_gp(
+                        _gr["rotations"][_best_gi], _q_scan_saved)
+                except Exception:
+                    _R_des_best = None
+                # ── 每抓取 depth（AnyGrasp 约定：指尖 = 掌心 + depth·a）──
+                # 旧版 npz 无 depths key → 回退 0.0658（= 旧行为），不崩
+                _gr_depths = _gr["depths"] if "depths" in _gr else \
+                    np.full(len(_gr["scores"]), 0.0658, dtype=np.float32)
+                print(f"[DIAG] best grasp R_cam approach(col0)={np.round(_gr['rotations'][_best_gi][:,0],4)} depth={float(_gr_depths[_best_gi]):.4f}", flush=True)
+                # GraspNet 原始输出即光学系（x右 y下 z前），直接使用
+                _R_cam_best = _gr["rotations"][_best_gi].copy()
+                grasp_result = {
+                    "t_cam":   _gr["translations"][_best_gi],
+                    "R_cam":   _R_cam_best,
+                    "score":   float(_gr["scores"][_best_gi]),
+                    "depth":   float(_gr_depths[_best_gi]),
+                    "R_desired_EE_in_arm": _R_des_best,
+                    "gr_translations": _gr["translations"],
+                    "gr_rotations":    _gr["rotations"],
+                    "gr_scores":       _gr["scores"],
+                    "gr_depths":       _gr_depths,
+                    "q_scan":      _q_scan_saved,
+                    "pos_w_scan":  _pos_w_scan_pre,
+                    "quat_w_scan": _quat_w_scan_pre,
+                    "ranked_candidate_idxs": _ranked_idxs,
+                    "tried_set":             {_best_gi},
+                }
+                print(f"[SM] GRASP_PLAN done: "
+                      f"{len(_gr['scores'])} grasps, "
+                      f"best=[{_best_gi}] score={grasp_result['score']:.3f}",
+                      flush=True)
+                # ── DIAG + approach sanity check（approach_z>0 时自动 flip）──
+                try:
+                    from arm_ik_mujoco import (
+                        cam_to_world as _c2w_d, quat_to_rot as _q2r_d,
+                        _CAM_OFFSET_ROT as _COR_d, fk_gripper as _fkg_d,
+                        compute_desired_ee_rot_in_arm as _cder_d,
+                    )
+                    _t_c_d = grasp_result["t_cam"]
+                    _R_c_d = grasp_result["R_cam"]
+                    _T_fk_d  = _fkg_d(grasp_result["q_scan"])
+                    _R_cw_d  = _q2r_d(quat_w) @ _T_fk_d[:3, :3] @ _COR_d
+                    _app_w_d = _R_cw_d @ _R_c_d[:, 0]
+                    _t_obj_w_d = _c2w_d(_t_c_d, grasp_result["q_scan"], pos_w, quat_w)
+                    print(f"[DIAG] t_cam={np.round(_t_c_d,4)} depth={_t_c_d[2]:.3f}m", flush=True)
+                    print(f"[DIAG] t_obj_world={np.round(_t_obj_w_d,4)} z={_t_obj_w_d[2]:.3f}m", flush=True)
+                    print(f"[DIAG] approach world={np.round(_app_w_d,3)}", flush=True)
+                    try:
+                        _real_obj_pos = env.get_object_pos(args.object)
+                        print(f"[DIAG] object real world={np.round(_real_obj_pos,4)} "
+                              f"(delta from t_obj: {np.round(_real_obj_pos - _t_obj_w_d,4)})",
+                              flush=True)
+                    except Exception:
+                        pass
+                    _approach_world_z = float(_app_w_d[2])
+                    if _approach_world_z > 0.0:
+                        print(f"[WARN] approach z={_approach_world_z:.3f}>0, flipping.", flush=True)
+                        _R_flipped = grasp_result["R_cam"].copy()
+                        _R_flipped[:, 0] = -_R_flipped[:, 0]
+                        _R_flipped[:, 1] = -_R_flipped[:, 1]
+                        grasp_result["R_cam"] = _R_flipped
+                        grasp_result["R_desired_EE_in_arm"] = _cder_d(
+                            _R_flipped, grasp_result["q_scan"])
+                        print(f"[WARN] After flip z={float((_R_cw_d@_R_flipped[:,0])[2]):.3f}", flush=True)
+                    else:
+                        print(f"[INFO] approach z={_approach_world_z:.3f}<0 (OK)", flush=True)
+                except Exception as _de:
+                    print(f"[DIAG] failed: {_de}", flush=True)
+                state = PipelineState.PRE_GRASP
+
+    if grasp_result is not None:
+        # 与 REACH 同进程共享，避免 /tmp/table_cloud.npz 写盘再读盘。
+        grasp_result["table_cloud_world"] = table_cloud_world
+
+    return state, grasp_result
+
 def main():
     parser = argparse.ArgumentParser("Navigate MuJoCo")
     parser.add_argument("--map",            required=True)
@@ -241,23 +695,15 @@ def main():
     # ── 发送导航目标 ──
     bridge.send_goal(args.goal[0], args.goal[1])
 
-    # ── grasp worker 改为 GRASP_PLAN 状态时同步调用，此处仅保留 proc 占位 ──
-    grasp_proc = None  # 不再预启动；GRASP_PLAN 状态用 subprocess.run()
-    grasp_result_q = None  # 保留变量兼容 finally 块
-
     # ── 状态机变量初始化 ──
     state          = PipelineState.NAV
     state_step     = 0
     last_action    = np.zeros(16, dtype=np.float32)
-    _frozen_pos    = None   # FREEZE 时保存的根节点位置
-    _frozen_quat   = None   # FREEZE 时保存的根节点四元数
     grasp_result   = None   # grasp_worker 返回的抓取结果 dict
     depth_accum    = []     # SCAN 阶段累积的 depth 帧列表
     scan_rgb       = None   # SCAN 阶段保存的 RGB 帧
-    target_angles_arm = None  # PRE_GRASP/REACH/CLOSE/LIFT 阶段的机械臂目标角
     j6_target      = None   # ORIENT 阶段的 j6 目标角
     _orient_q_fixed = None  # ORIENT 阶段固定的 j1~j5 实际角度
-    _orient_j6_start = None
     _q_scan_at_scan  = None  # SCAN 完成时的机械臂关节角（供 IK 用）
     _pos_w_at_scan   = None  # SCAN 完成时的机器人世界位置
     _quat_w_at_scan  = None  # SCAN 完成时的机器人四元数
@@ -281,43 +727,17 @@ def main():
     _rotate_j3_start = None
     _pg_cmd          = None  # PRE_GRASP 斜坡指令（按 step 累积）
     _pg_target_cur   = None  # PRE_GRASP IK 目标关节角（供斜坡使用）
-    _re_target_cur   = None  # PRE_GRASP 兼容变量；新 REACH 不再依赖一次性关节终点
-    # ORIENT -> REACH -> CLOSE -> LIFT 的局部笛卡尔 pose-servo 状态
-    _reach_p_goal       = None
-    _reach_R_hold       = None
-    _reach_table_h      = None
-    _reach_fail_count   = 0
-    _close_q_hold       = None
-    # CLOSE 诊断基准（只用于打印，不参与控制）
-    _cl_diag_obj_p0     = None
-    _cl_diag_obj_R0     = None
-    _cl_diag_prev_contact = None
-    _cl_deep_post_pending = None   # 仅诊断：记录本轮 CLOSE PRE 信息，env.step 后打印 POST
-    # CLOSE 结束判定：不再依赖最后一帧 contact，而统计最近一小段时间。
-    _cl_contact_hist    = []
-    _cl_obj_pos_hist    = []
-    _lift_stage         = 0          # 0=未初始化, 1=j2/j3脱桌, 2=全关节安全收臂
-    _lift_p_goal        = None        # 旧DLS变量保留兼容；新Stage1不再使用
-    _lift_R_hold        = None        # 旧DLS变量保留兼容；新Stage1不再使用
-    _lift_q_stage1_start= None        # LIFT开始时实际q1~q6
-    _lift_q_stage1_cmd  = None        # Stage1累计命令；仅j2/j3变化
-    _lift_stage1_step   = 0
-    _lift_ee_p_start    = None        # LIFT开始时gripper_base世界位置
-    _lift_fk_dxyz       = None        # 一次性FK试探预测位移，仅诊断
-    _lift_q_retract0    = None
-    _lift_stage2_step   = 0
-    _lift_obj_z_start   = None        # 当前阶段仅用于打印/最终抓取诊断
-    _lift_fail_count    = 0
-    _lift_hold_remaining= 0
-    _lift_hold_seen     = 0
-    _lift_hold_contacts = np.zeros(2, dtype=np.int32)
-    _lift_hold_obj_p0   = None
-    _lift_best_err      = None
-    _lift_diverge_count = 0
 
-    # ── CLOSE/LIFT 底盘物理锁定（MuJoCo equality weld） ──
-    # 与旧的每 policy step set_root_pose() 不同：weld 在每个 physics substep 内由
-    # MuJoCo 约束求解器持续施加约束反力，因此不会产生 20ms 一次的根节点“瞬移”。
+    # REACH / CLOSE / LIFT 的跨帧状态集中管理。
+    # 只收纳真正需要跨 policy step 保存的量；单帧几何/IK 临时量仍留在对应状态分支内。
+    reach_ctx = ReachState()
+    close_ctx = CloseState()
+    lift_ctx = LiftState()
+
+    # ── 抓取阶段底盘物理锁定（MuJoCo equality weld） ──
+    # 从 ARM_INIT 开始到 LIFT 结束，全程共用同一个世界锚点。weld 在每个 physics
+    # substep 内由 MuJoCo 约束求解器施加约束反力，不再使用 set_root_pose()
+    # 对根节点做离散“瞬移”式冻结。ROTATE 阶段仍沿用同一物理锁机制。
     import mujoco as _mj_lock
     _base_lock_bid = _mj_lock.mj_name2id(
         env._model, _mj_lock.mjtObj.mjOBJ_BODY, "base_link")
@@ -341,8 +761,35 @@ def main():
         ref_quat=None,
     )
 
+    # 抓取阶段从机械臂开始动作起就固定底盘，并在整个抓取链路中保持同一个 anchor。
+    # 失败后回到 ARM_INIT 仍保持锁定；只有真正离开抓取阶段时才释放。
+    _GRASP_BASE_LOCK_STATES = {
+        PipelineState.ARM_INIT,
+        PipelineState.SCAN,
+        PipelineState.GRASP_PLAN,
+        PipelineState.PRE_GRASP,
+        PipelineState.ORIENT,
+        PipelineState.REACH,
+        PipelineState.CLOSE,
+        PipelineState.LIFT,
+    }
+    _BASE_LOCK_STATES = _GRASP_BASE_LOCK_STATES | {PipelineState.ROTATE}
+
+    # 每帧固定不变的状态集合只构造一次，避免主循环内重复创建。
+    _ARM_IDLE_STATES = {
+        PipelineState.ALIGN_YAW_1,
+        PipelineState.PAN_VX,
+        PipelineState.PAN_VY,
+    }
+    _LOCOMOTION_DISABLED_STATES = {
+        PipelineState.ARM_INIT, PipelineState.SCAN,
+        PipelineState.GRASP_PLAN, PipelineState.PRE_GRASP,
+        PipelineState.ORIENT, PipelineState.REACH,
+        PipelineState.CLOSE, PipelineState.LIFT,
+    }
+
     def _set_base_physical_lock(enable):
-        """CLOSE/LIFT 物理底盘锁：mocap anchor + site weld；只在状态切换时动作一次。"""
+        """底盘物理锁：mocap anchor + site weld；仅在锁定状态集合边界动作一次。"""
         _enable = bool(enable)
         if _enable == bool(_base_lock["active"]):
             return
@@ -392,20 +839,7 @@ def main():
     # PRE_GRASP 每步最大增量（与原版 navigate_to_goal_nav2_whole.py 一致）
     _PG_MAX_DELTA = np.array([0.03, 0.05, 0.05, 0.04, 0.04, 0.04], dtype=np.float64)
 
-    # 抓取末段 Cartesian pose-servo 参数。每帧目标只向前走几毫米，
-    # 姿态由 6D DLS 显式保持，不再靠 joint6 钉死或事后位置纠偏。
-    _REACH_CART_POS_STEP = 0.0015                 # m / policy step；接近阶段约 7.5cm/s 的局部目标推进
-    _LIFT_CART_POS_STEP  = 0.0004                 # m / policy step；约 2cm/s，刚离桌阶段更温和
-    _CART_MAX_DQ          = 0.05                   # 其他 pose-servo 保留；LIFT 使用更严格的独立限幅
-    _LIFT_MAX_DQ          = 0.008                  # rad / joint / policy step；限制线性化失效和关节猛跳
-    _CART_ROT_SCALE       = 0.06                   # 旧 6D servo 参数（LIFT 不再直接使用）
-    _LIFT_ROT_DEADBAND    = math.radians(2.0)      # 2°内不追姿态，避免姿态任务压过 0.4mm 上抬任务
-    _LIFT_ROT_GAIN        = 0.25                   # 姿态只作为位置零空间中的弱二级任务
     _LIFT_HOLD_STEPS      = 20                     # CLOSE 后先静置约 0.4s，让接触/夹持力稳定
-    _POSE_POS_TOL       = 0.003                    # m
-    _POSE_ROT_TOL       = math.radians(2.0)
-    _REACH_ADVANCE      = 0.115                    # m，沿 AnyGrasp approach 从 PRE 前进
-    _TABLE_CLEARANCE    = 0.001                    # m，指板最低点相对桌面安全余量
     # 新LIFT Stage1：不再强制末端走世界坐标竖直直线。先固定j1/j4~j6，
     # 仅让j2/j3朝ARM_SIDE方向缓慢移动；末端实际升高20mm后进入Stage2。
     _LIFT_STAGE1_EE_RISE = 0.020                   # m；当前调轨迹阶段只看末端高度
@@ -478,76 +912,17 @@ def main():
             err=err, wz_actual=float(ang_vel_z),
             settle_count=_align_settle_count)
 
-    def _pan_axis_control(
-        pan_state, world_err, body_axis, body_sign, target_yaw,
-        pos_tol, resume_tol, kp, vmax, yaw_now, base_lin_vel,
-    ):
-        """统一 PAN 控制。
-
-        world_err  = 世界坐标目标 - 当前坐标（只传本阶段控制的那一轴）
-        body_axis  = 'vx' 或 'vy'
-        body_sign  = 世界正方向速度映射到该 body cmd 的符号
-        settling   = 一旦进入 pos_tol 就只减速停车；除非漂出更大的 resume_tol 才重新走，
-                     从而避免目标附近 0 ↔ 0.10m/s 抖动。
-        """
-        nonlocal _pan_ctrl_state, _pan_cmd_vx, _pan_cmd_vy, _pan_cmd_wz
-        nonlocal _pan_settling, _pan_settle_count
-
-        if _pan_ctrl_state != pan_state:
-            _pan_ctrl_state = pan_state
-            _pan_cmd_vx = 0.0
-            _pan_cmd_vy = 0.0
-            _pan_cmd_wz = 0.0
-            _pan_settling = False
-            _pan_settle_count = 0
-
-        ae = abs(float(world_err))
-        if _pan_settling:
-            # 只有明显漂出更宽的滞回区才重新起步，防止一步一停。
-            if ae > float(resume_tol):
-                _pan_settling = False
-                _pan_settle_count = 0
-        elif ae <= float(pos_tol):
-            _pan_settling = True
-            _pan_settle_count = 0
-
-        if _pan_settling:
-            axis_target = 0.0
-        else:
-            mag = min(float(vmax), max(_PAN_MIN_MOVE_SPEED, float(kp) * ae))
-            world_v_target = math.copysign(mag, float(world_err))
-            axis_target = float(body_sign) * world_v_target
-
-        vx_target = axis_target if body_axis == 'vx' else 0.0
-        vy_target = axis_target if body_axis == 'vy' else 0.0
-        _pan_cmd_vx = _slew(_pan_cmd_vx, vx_target, _PAN_DV_PER_STEP)
-        _pan_cmd_vy = _slew(_pan_cmd_vy, vy_target, _PAN_DV_PER_STEP)
-
-        yaw_err = _yaw_err_to(float(target_yaw), float(yaw_now))
-        wz_target = _yaw_target_with_min(
-            yaw_err, _PAN_YAW_KP, _PAN_YAW_MIN, _PAN_YAW_MAX, _PAN_YAW_DEADBAND)
-        _pan_cmd_wz = _slew(_pan_cmd_wz, wz_target, _PAN_DW_PER_STEP)
-
-        _vxy = float(np.linalg.norm(np.asarray(base_lin_vel, dtype=np.float64)[:2]))
-        if (_pan_settling and _vxy <= _PAN_SETTLE_SPEED
-                and abs(yaw_err) <= math.radians(3.0)):
-            _pan_settle_count += 1
-        else:
-            _pan_settle_count = 0
-        done = (_pan_settle_count >= _PAN_SETTLE_STEPS)
-
-        return (_pan_cmd_vx, _pan_cmd_vy, _pan_cmd_wz, done,
-                dict(err=ae, vxy=_vxy, yaw_err=yaw_err,
-                     settling=_pan_settling, settle_count=_pan_settle_count))
-
     def _pan_world_axis_control(
         pan_state, world_err, world_axis, target_yaw,
         pos_tol, resume_tol, kp, vmax, yaw_now, base_lin_vel,
+        settle_use_vxy=False,
     ):
         """按世界坐标轴做 PAN 精调，再用实时 yaw 转成机体系 vx/vy。
 
         这样即使机器人没有精确停在 target_yaw，世界系运动方向也不会跟着机体偏航。
         world_axis 目前支持 'x' / 'y'；world_err = 目标世界坐标 - 当前世界坐标。
+        settle_use_vxy=True 时沿用旧 PAN_VY/PAN_NEG_X 的停车判据：要求整机水平
+        速度范数 vxy 足够小；False 时只要求当前受控世界轴速度足够小。
         """
         nonlocal _pan_ctrl_state, _pan_cmd_vx, _pan_cmd_vy, _pan_cmd_wz
         nonlocal _pan_settling, _pan_settle_count
@@ -598,7 +973,8 @@ def main():
         _vworld = np.asarray(base_lin_vel, dtype=np.float64)[:2]
         _vxy = float(np.linalg.norm(_vworld))
         _axis_vel = float(_vworld[0] if world_axis == 'x' else _vworld[1])
-        if (_pan_settling and abs(_axis_vel) <= _PAN_SETTLE_SPEED
+        _settle_speed = _vxy if settle_use_vxy else abs(_axis_vel)
+        if (_pan_settling and _settle_speed <= _PAN_SETTLE_SPEED
                 and abs(yaw_err) <= math.radians(3.0)):
             _pan_settle_count += 1
         else:
@@ -609,6 +985,7 @@ def main():
                 dict(err=ae, signed_err=float(world_err), vxy=_vxy,
                      axis_vel=_axis_vel, yaw_err=yaw_err,
                      settling=_pan_settling, settle_count=_pan_settle_count,
+                     settle_speed=_settle_speed,
                      world_vx_target=world_vx_target,
                      world_vy_target=world_vy_target))
 
@@ -632,14 +1009,8 @@ def main():
     # 第一段 — 某指首次接触后，不再“零力轻贴”，而给该指约 0.25N 的轻预压力；同时把
     #   夹爪命令速率从 1mm/policy-step 临时降到 0.4mm/policy-step，让另一指慢慢靠近，
     #   避免后接触的一侧把 cube 在桌面上撞/推走。
-    # 第二段 — **两指都已接触**后，两侧目标同时加深 _CLOSE_FREEZE_S（温和对称挤压，
-    #   净横向力≈0，物体原地被夹住）。故意闭得更深、超出关节范围也没关系：
-    #   set_gripper_target 不夹范围、控制循环只做 1mm/步速率限制、tau 夹 ±10N。
-    #   "目标−实际"约为 S；实际夹持力由 env.py 的 _KP_GRIP、速度项和接触约束共同决定。
-    # 兜底 — 到最后 15 步另一指仍没接触（被桌面/器壁挡在半路、抓取中心偏太多）→
-    #   回退旧行为（已接触侧加深 S）并 WARN，避免"轻贴抓不住"。留 15 步是为了让
-    #   速率限制（1mm/步）走得动：3 步只能走 3mm ≈ 0.6N·m，等于没压。
-    _CLOSE_FREEZE_S = 0.0125        # m；双侧接触后约 1.0N/指（kp=80）
+    # 第二段 — **两指都已接触**后，切换为对称恒力夹持，
+    # 不再继续追逐物体内部的位置目标。
     _CLOSE_PRELOAD_S = 0.003125     # m；首触侧轻预压，静态比例项约 0.25N
     _CLOSE_SEARCH_MAX_DELTA = 0.0004 # m/policy-step；单侧已接触时另一侧慢速靠近
     _GRIP_MAX_DELTA_NORMAL = float(env._grip_max_delta)
@@ -649,10 +1020,6 @@ def main():
     _CLOSE_CONTACT_RATE_MIN = 0.40    # 每侧最近窗口接触率至少40%
     _CLOSE_STABLE_MOVE_MAX = 0.002    # m；最近窗口cube净位移不超过2mm
     _GRI_Q7_I, _GRI_Q8_I = map(int, np.asarray(env._grip_all_idx).tolist())
-
-    _cl_frz = [None, None]           # [joint7 冻结目标, joint8 冻结目标], None=未接触
-    _cl_qc  = [None, None]           # 冻结时记录的 q7/q8（DIAG）
-    _cl_sq  = [False]                # 第二段（两指都已接触→同时加深 S）是否已触发
 
     # ── 指板最低点 FK（第九轮，REACH 纠偏地板用）──
     # 纠偏会把命令往桌子方向压，判"指板会不会进桌面"必须按**真实指板几何**：第一轮
@@ -717,250 +1084,7 @@ def main():
             pass
         return out
 
-    def _finger_contact_info(obj_name):
-        """{link7: {...}|None, link8: {...}|None}: 各指板与 obj_name 的**第一处**接触详情。
 
-        给第五轮定标用：接触点的世界坐标 + 在**物体局部系**的坐标 → 一次回归就能反解
-        真实的夹持半径 r_C（碗：ρ_外 − q_外 = ρ_内 + q_内；本函数直接给出接触点，比
-        "用 q 反推"少一层接触穿透偏差）与过沿口深度 d_g（碗）/ 夹持偏心（香蕉）。
-        与 _fingers_contact 同款扫描，只在首触那一步调用，开销可忽略。
-        """
-        out = {"link7": None, "link8": None}
-        try:
-            import mujoco as _mj_ci
-            _m, _d = env._model, env._data
-            _fing = {_n: _mj_ci.mj_name2id(_m, _mj_ci.mjtObj.mjOBJ_BODY, _n)
-                     for _n in ("link7", "link8")}
-            _obj = _mj_ci.mj_name2id(_m, _mj_ci.mjtObj.mjOBJ_BODY, obj_name)
-            if _obj < 0:
-                return out
-            _bp = _d.xpos[_obj].copy()
-            _bR = _d.xmat[_obj].reshape(3, 3)
-            for _ci in range(int(_d.ncon)):
-                _ct = _d.contact[_ci]
-                _b1 = int(_m.geom_bodyid[int(_ct.geom1)])
-                _b2 = int(_m.geom_bodyid[int(_ct.geom2)])
-                if _obj not in (_b1, _b2):
-                    continue
-                _og = int(_ct.geom1) if _b1 == _obj else int(_ct.geom2)
-                for _n, _bid in _fing.items():
-                    if _bid >= 0 and _bid in (_b1, _b2) and out[_n] is None:
-                        _pw = _d.contact[_ci].pos.copy()
-                        out[_n] = dict(
-                            world=_pw,
-                            local=(_pw - _bp) @ _bR,
-                            obj_geom=_og,
-                            obj_geom_name=(_mj_ci.mj_id2name(
-                                _m, _mj_ci.mjtObj.mjOBJ_GEOM, _og) or ('id%d' % _og)),
-                            dist=float(_d.contact[_ci].dist),
-                        )
-        except Exception:
-            pass
-        return out
-
-    def _close_contact_diag(obj_name):
-        """返回 CLOSE 诊断信息；只读 MuJoCo 当前状态，不修改任何控制量。
-
-        每个 finger 给出：
-          - ncon: 与目标物体的当前接触点数量
-          - min_dist: 当前这些接触中的最小 contact.dist (m)
-          - normal_force: mj_contactForce 的法向力之和 (N)
-          - tangential_force: 两个切向分量合力的逐接触求和 (N)
-          - others: finger 当前还接触到的其他 body 名称（如 table1/table2）
-        """
-        out = {
-            "link7": dict(ncon=0, min_dist=None, normal_force=0.0,
-                          tangential_force=0.0, others=set()),
-            "link8": dict(ncon=0, min_dist=None, normal_force=0.0,
-                          tangential_force=0.0, others=set()),
-        }
-        try:
-            import mujoco as _mj_cd
-            _m, _d = env._model, env._data
-            _fing = {_n: _mj_cd.mj_name2id(_m, _mj_cd.mjtObj.mjOBJ_BODY, _n)
-                     for _n in ("link7", "link8")}
-            _obj = _mj_cd.mj_name2id(_m, _mj_cd.mjtObj.mjOBJ_BODY, obj_name)
-            for _ci in range(int(_d.ncon)):
-                _ct = _d.contact[_ci]
-                _g1, _g2 = int(_ct.geom1), int(_ct.geom2)
-                _b1 = int(_m.geom_bodyid[_g1])
-                _b2 = int(_m.geom_bodyid[_g2])
-                for _n, _fb in _fing.items():
-                    if _fb < 0 or _fb not in (_b1, _b2):
-                        continue
-                    _other = _b2 if _b1 == _fb else _b1
-                    if _other == _obj:
-                        _o = out[_n]
-                        _o["ncon"] += 1
-                        _dist = float(_ct.dist)
-                        if _o["min_dist"] is None or _dist < _o["min_dist"]:
-                            _o["min_dist"] = _dist
-                        _cf = np.zeros(6, dtype=np.float64)
-                        _mj_cd.mj_contactForce(_m, _d, _ci, _cf)
-                        _o["normal_force"] += max(0.0, float(_cf[0]))
-                        _o["tangential_force"] += float(np.hypot(_cf[1], _cf[2]))
-                    else:
-                        _bn = _mj_cd.mj_id2name(_m, _mj_cd.mjtObj.mjOBJ_BODY, _other)
-                        if _bn:
-                            out[_n]["others"].add(_bn)
-            for _n in out:
-                out[_n]["others"] = sorted(out[_n]["others"])
-        except Exception as _e:
-            out["error"] = repr(_e)
-        return out
-
-    def _finger_deep_diag(obj_name):
-        """CLOSE 深度诊断（只读，不改变控制）。
-
-        每根手指返回：
-          q/qd/qacc           : 滑动关节位置、速度、加速度
-          ctrl                : 当前 actuator ctrl（注意 PRE 时仍是上一 physics step 留下值）
-          qfrc_actuator       : MuJoCo 映射到该 DOF 的执行器广义力
-          qfrc_constraint     : 该 DOF 上所有约束广义力（contact/joint-limit 等的合力）
-          qfrc_passive        : damping/friction 等被动力
-          cube_contact        : 当前 data.contact 中是否存在 finger-body <-> object-body
-          geom_gap            : pad 与目标物体各 geom 的最小几何距离（若 mj_geomDistance 可用）
-          fromto              : 对应最近距离的两个世界系最近点 [pad_xyz, obj_xyz]
-          contacts            : 此 finger 当前参与的所有 MuJoCo contact 明细
-        """
-        out = {"link7": {}, "link8": {}}
-        try:
-            import mujoco as _mj_dd
-            _m, _d = env._model, env._data
-            _obj_bid = _mj_dd.mj_name2id(_m, _mj_dd.mjtObj.mjOBJ_BODY, obj_name)
-            _obj_geoms = [g for g in range(int(_m.ngeom))
-                          if int(_m.geom_bodyid[g]) == int(_obj_bid)] if _obj_bid >= 0 else []
-
-            for _name, _pad_name in (("link7", "link7_pad"), ("link8", "link8_pad")):
-                _jid = _mj_dd.mj_name2id(_m, _mj_dd.mjtObj.mjOBJ_JOINT,
-                                         "joint7" if _name == "link7" else "joint8")
-                _bid = _mj_dd.mj_name2id(_m, _mj_dd.mjtObj.mjOBJ_BODY, _name)
-                _gid = _mj_dd.mj_name2id(_m, _mj_dd.mjtObj.mjOBJ_GEOM, _pad_name)
-                _aid = _mj_dd.mj_name2id(_m, _mj_dd.mjtObj.mjOBJ_ACTUATOR,
-                                         "joint7_motor" if _name == "link7" else "joint8_motor")
-                _qa = int(_m.jnt_qposadr[_jid]) if _jid >= 0 else -1
-                _da = int(_m.jnt_dofadr[_jid]) if _jid >= 0 else -1
-                _x = dict(
-                    q=(float(_d.qpos[_qa]) if _qa >= 0 else float('nan')),
-                    qd=(float(_d.qvel[_da]) if _da >= 0 else float('nan')),
-                    qacc=(float(_d.qacc[_da]) if _da >= 0 else float('nan')),
-                    ctrl=(float(_d.ctrl[_aid]) if _aid >= 0 else float('nan')),
-                    qfrc_actuator=(float(_d.qfrc_actuator[_da]) if _da >= 0 else float('nan')),
-                    qfrc_constraint=(float(_d.qfrc_constraint[_da]) if _da >= 0 else float('nan')),
-                    qfrc_passive=(float(_d.qfrc_passive[_da]) if _da >= 0 else float('nan')),
-                    cube_contact=False,
-                    geom_gap=None,
-                    fromto=None,
-                    nearest_obj_geom=None,
-                    contacts=[],
-                )
-
-                # pad <-> object 的真正最近几何距离；与 contact list 独立。
-                # distmax 5 cm 足够覆盖本任务的诊断范围。
-                if _gid >= 0 and _obj_geoms and hasattr(_mj_dd, 'mj_geomDistance'):
-                    _best = None
-                    for _og in _obj_geoms:
-                        try:
-                            _ft = np.zeros(6, dtype=np.float64)
-                            _dist = float(_mj_dd.mj_geomDistance(
-                                _m, _d, int(_gid), int(_og), 0.05, _ft))
-                            if _best is None or _dist < _best[0]:
-                                _best = (_dist, _ft.copy(), int(_og))
-                        except Exception:
-                            continue
-                    if _best is not None:
-                        _x["geom_gap"] = _best[0]
-                        _x["fromto"] = _best[1]
-                        _x["nearest_obj_geom"] = (_mj_dd.mj_id2name(
-                            _m, _mj_dd.mjtObj.mjOBJ_GEOM, _best[2]) or f"id{_best[2]}")
-
-                # finger 当前所有 contact；不只看 cube。
-                for _ci in range(int(_d.ncon)):
-                    _ct = _d.contact[_ci]
-                    _g1, _g2 = int(_ct.geom1), int(_ct.geom2)
-                    _b1, _b2 = int(_m.geom_bodyid[_g1]), int(_m.geom_bodyid[_g2])
-                    if _bid < 0 or _bid not in (_b1, _b2):
-                        continue
-                    _other_b = _b2 if _b1 == _bid else _b1
-                    _other_g = _g2 if _b1 == _bid else _g1
-                    if _other_b == _obj_bid:
-                        _x["cube_contact"] = True
-                    _cf = np.zeros(6, dtype=np.float64)
-                    try:
-                        _mj_dd.mj_contactForce(_m, _d, _ci, _cf)
-                    except Exception:
-                        pass
-                    _x["contacts"].append(dict(
-                        idx=int(_ci),
-                        self_geom=(_mj_dd.mj_id2name(
-                            _m, _mj_dd.mjtObj.mjOBJ_GEOM,
-                            _g1 if _b1 == _bid else _g2) or f"id{_g1 if _b1 == _bid else _g2}"),
-                        other_geom=(_mj_dd.mj_id2name(
-                            _m, _mj_dd.mjtObj.mjOBJ_GEOM, _other_g) or f"id{_other_g}"),
-                        other_body=(_mj_dd.mj_id2name(
-                            _m, _mj_dd.mjtObj.mjOBJ_BODY, _other_b) or f"id{_other_b}"),
-                        dist=float(_ct.dist),
-                        Fn=max(0.0, float(_cf[0])),
-                        Ft=float(np.hypot(_cf[1], _cf[2])),
-                        pos=np.asarray(_ct.pos, dtype=np.float64).copy(),
-                    ))
-                out[_name] = _x
-        except Exception as _e:
-            out["error"] = repr(_e)
-        return out
-
-    def _print_finger_deep_diag(tag, step_label, obj_name, force_contacts=False):
-        """打印一帧 gripper 深诊断。tag 为 CPRE/CPOST。"""
-        _dd = _finger_deep_diag(obj_name)
-        if "error" in _dd:
-            print(f"[{tag}] step={step_label:03d} diagnostic error: {_dd['error']}", flush=True)
-            return _dd
-
-        _tc_bits = []
-        for _nm in ("link7", "link8"):
-            _x = _dd[_nm]
-            _tc_bits.append(int(bool(_x.get("cube_contact", False))))
-        print(f"[{tag}] step={step_label:03d} cube_contact={_tc_bits[0]}/{_tc_bits[1]}", flush=True)
-
-        for _nm in ("link7", "link8"):
-            _x = _dd[_nm]
-            _gap = "n/a" if _x.get("geom_gap") is None else f"{_x['geom_gap']*1000:+.3f}mm"
-            print(
-                f"[{tag}]   {_nm}: q={_x['q']*1000:+.3f}mm "
-                f"qd={_x['qd']*1000:+.3f}mm/s qacc={_x['qacc']:+.3f}m/s^2 "
-                f"ctrl={_x['ctrl']:+.3f}N act={_x['qfrc_actuator']:+.3f}N "
-                f"constraint={_x['qfrc_constraint']:+.3f}N "
-                f"passive={_x['qfrc_passive']:+.3f}N gap={_gap}",
-                flush=True)
-            if _x.get("fromto") is not None:
-                _ft = np.asarray(_x["fromto"], dtype=np.float64).reshape(2, 3)
-                print(
-                    f"[{tag}]     nearest: pad={np.round(_ft[0],6)} "
-                    f"obj={np.round(_ft[1],6)} obj_geom={_x.get('nearest_obj_geom')}",
-                    flush=True)
-
-            # POST 异常时详细列出该 finger 的全部接触。
-            _stalled = (abs(float(_x.get("ctrl", 0.0))) > 0.5 and
-                        abs(float(_x.get("qd", 0.0))) < 0.002 and
-                        not bool(_x.get("cube_contact", False)))
-            if force_contacts or _stalled:
-                _cts = _x.get("contacts", [])
-                if not _cts:
-                    print(f"[{tag}]     all_contacts: NONE", flush=True)
-                else:
-                    for _c in _cts:
-                        print(
-                            f"[{tag}]     contact#{_c['idx']} "
-                            f"{_c['self_geom']} <-> {_c['other_body']}/{_c['other_geom']} "
-                            f"dist={_c['dist']*1000:+.3f}mm "
-                            f"Fn={_c['Fn']:.3f}N Ft={_c['Ft']:.3f}N "
-                            f"pos={np.round(_c['pos'],6)}",
-                            flush=True)
-        return _dd
-
-    def _alpha(s_state, step):
-        b = BUDGET.get(s_state, 1)
-        return min(step / max(b, 1), 1.0)
 
     def _ransac_fit_plane(pts, n_iter=150, dist_thresh=0.008):
         """RANSAC 拟合内点最多的主平面。返回 (nv, dv, inlier_mask)；点数过少时 nv=None。
@@ -1004,61 +1128,14 @@ def main():
               f"normal={np.round(nv, 3)} d={dv:.3f}", flush=True)
         return keep
 
-    def _so3_log(R):
-        """SO(3) rotation matrix -> rotation vector (axis * angle, rad)."""
-        R = np.asarray(R, dtype=np.float64)
-        c = float(np.clip((np.trace(R) - 1.0) * 0.5, -1.0, 1.0))
-        theta = math.acos(c)
-        vee = np.array([
-            R[2, 1] - R[1, 2],
-            R[0, 2] - R[2, 0],
-            R[1, 0] - R[0, 1],
-        ], dtype=np.float64)
-        if theta < 1e-7:
-            return 0.5 * vee
-        if math.pi - theta < 1e-4:
-            # Near pi: sin(theta) is numerically ill-conditioned.  Recover an
-            # axis from (R + I) / 2, then choose signs from the skew part.
-            A = 0.5 * (R + np.eye(3))
-            axis = np.sqrt(np.maximum(np.diag(A), 0.0))
-            k = int(np.argmax(axis))
-            if axis[k] < 1e-8:
-                axis = np.array([1.0, 0.0, 0.0])
-            else:
-                if k == 0:
-                    axis[1] = math.copysign(axis[1], R[0, 1] + R[1, 0])
-                    axis[2] = math.copysign(axis[2], R[0, 2] + R[2, 0])
-                elif k == 1:
-                    axis[0] = math.copysign(axis[0], R[0, 1] + R[1, 0])
-                    axis[2] = math.copysign(axis[2], R[1, 2] + R[2, 1])
-                else:
-                    axis[0] = math.copysign(axis[0], R[0, 2] + R[2, 0])
-                    axis[1] = math.copysign(axis[1], R[1, 2] + R[2, 1])
-                axis /= max(float(np.linalg.norm(axis)), 1e-12)
-            return theta * axis
-        return (theta / (2.0 * math.sin(theta))) * vee
 
-    def _clip_vec_norm(v, max_norm):
-        """Limit a vector's Euclidean norm without changing its direction."""
-        v = np.asarray(v, dtype=np.float64)
-        n = float(np.linalg.norm(v))
-        if n <= max_norm or n < 1e-12:
-            return v.copy()
-        return v * (max_norm / n)
-
-    # ── MuJoCo-native gripper_base pose servo ──────────────────────────────
-    # 末段 REACH/LIFT 必须以 MuJoCo 实际模型为闭环真值。此前用 ikpy FK 数值 Jacobian
-    # 生成局部 dq，再把 dq 发给 MuJoCo；只要 URDF 与 scene.xml 在关节限位、fixed
-    # transform 或轴约定上有任何差异，就可能出现“ikpy local_res 很小，但 MuJoCo
-    # 实际越走越远”。这里直接使用 MuJoCo point Jacobian (mj_jac)，彻底消除这层模型不一致。
+    # ── MuJoCo gripper_base 真值位姿 / 临时 FK 辅助 ──
     import mujoco as _mj_servo
     _GB_BODY_ID = _mj_servo.mj_name2id(
         env._model, _mj_servo.mjtObj.mjOBJ_BODY, "gripper_base")
     if _GB_BODY_ID < 0:
         raise RuntimeError("scene.xml 中找不到 gripper_base body")
 
-    _ARM_DOF_COLS = np.array(
-        [env._jnt_dofadr[n] for n in ARM_JOINT_NAMES], dtype=np.int32)
     _ARM_JOINT_IDS = np.array([
         _mj_servo.mj_name2id(env._model, _mj_servo.mjtObj.mjOBJ_JOINT, n)
         for n in ARM_JOINT_NAMES
@@ -1124,144 +1201,17 @@ def main():
                 float(np.linalg.norm(_fk_dls(q)[:3, 3] - tgt)),
                 float(np.abs(q - q0).max()))
 
-    def _mj_gb_pose_step(
-        q_start,
-        target_pos_world,
-        target_rot_world,
-        lam=2e-3,
-        rot_scale=0.06,
-        max_joint_delta=0.04,
-    ):
-        """One local 6D DLS step using MuJoCo's actual body Jacobian.
-
-        Position/orientation errors and Jacobian are all expressed in WORLD frame.
-        The returned q_cmd is only one local step from the measured q_start; the next
-        policy frame re-reads MuJoCo state and closes the loop again.
-        """
-        q0 = np.asarray(q_start, dtype=np.float64).copy()
-        p_cur, R_cur = _gb_pose_world()
-        p_des = np.asarray(target_pos_world, dtype=np.float64)
-        R_des = np.asarray(target_rot_world, dtype=np.float64)
-
-        e_p = p_des - p_cur
-        e_R = _so3_log(R_des @ R_cur.T)   # spatial/world rotation vector
-
-        jacp = np.zeros((3, env._model.nv), dtype=np.float64)
-        jacr = np.zeros((3, env._model.nv), dtype=np.float64)
-        # IMPORTANT: control the gripper_base BODY-FRAME ORIGIN p_cur exactly.
-        # mj_jac() computes the Jacobian of an arbitrary world-space point attached
-        # to a body, so its translational rows are consistent with env._data.xpos.
-        _mj_servo.mj_jac(env._model, env._data, jacp, jacr, p_cur, _GB_BODY_ID)
-        Jp = jacp[:, _ARM_DOF_COLS]
-        Jr = jacr[:, _ARM_DOF_COLS]
-
-        J = np.vstack((Jp, rot_scale * Jr))
-        e = np.concatenate((e_p, rot_scale * e_R))
-        A = J @ J.T + (lam * lam) * np.eye(6)
-        try:
-            dq = J.T @ np.linalg.solve(A, e)
-        except np.linalg.LinAlgError:
-            dq = np.linalg.pinv(J) @ e
-
-        if not np.all(np.isfinite(dq)):
-            return q0.copy(), float('inf'), float('inf'), float('inf')
-
-        # Preserve DLS direction: scale the WHOLE dq rather than clipping each joint
-        # independently. This matters near singular/ill-conditioned configurations.
-        dq_max_raw = float(np.max(np.abs(dq)))
-        if dq_max_raw > max_joint_delta and dq_max_raw > 1e-12:
-            dq *= max_joint_delta / dq_max_raw
-
-        q_cmd = np.clip(q0 + dq, _ARM_LO, _ARM_HI)
-        dq_applied = q_cmd - q0
-
-        # Linearized residual under the *same MuJoCo Jacobian*. This is only a
-        # command-quality diagnostic; the next frame uses the actual body pose again.
-        pred_p = e_p - Jp @ dq_applied
-        pred_R = e_R - Jr @ dq_applied
-        return (q_cmd, float(np.linalg.norm(pred_p)),
-                float(np.linalg.norm(pred_R)),
-                float(np.max(np.abs(dq_applied))))
-
-    def _mj_gb_lift_step(
-        q_start,
-        target_pos_world,
-        target_rot_world,
-        lam_pos=1e-2,
-        lam_rot=3e-2,
-        rot_deadband=_LIFT_ROT_DEADBAND,
-        rot_gain=_LIFT_ROT_GAIN,
-        max_joint_delta=_LIFT_MAX_DQ,
-    ):
-        """LIFT 专用分层 DLS：位置一级、姿态二级。
-
-        与旧 6D DLS 的关键区别：不再把位置和姿态拼成同一个 6×6 任务直接求逆。
-        先用 MuJoCo 的真实 Jp 完成局部位置步，再只在位置任务的零空间中修姿态；
-        2°以内的姿态误差完全不追，避免 1°≈1mm 的等效旋转误差压过每步 0.4mm
-        的竖直位移。单步关节增量也限制在 0.008rad，保证微分线性化有效。
-        """
-        q0 = np.asarray(q_start, dtype=np.float64).copy()
-        p_cur, R_cur = _gb_pose_world()
-        p_des = np.asarray(target_pos_world, dtype=np.float64)
-        R_des = np.asarray(target_rot_world, dtype=np.float64)
-
-        e_p = p_des - p_cur
-        e_R_full = _so3_log(R_des @ R_cur.T)
-        rnorm = float(np.linalg.norm(e_R_full))
-        if rnorm <= rot_deadband:
-            e_R = np.zeros(3, dtype=np.float64)
-        else:
-            # 只纠正超出 deadband 的那一部分，且后面再乘弱增益。
-            e_R = e_R_full * ((rnorm - rot_deadband) / max(rnorm, 1e-12))
-
-        jacp = np.zeros((3, env._model.nv), dtype=np.float64)
-        jacr = np.zeros((3, env._model.nv), dtype=np.float64)
-        _mj_servo.mj_jac(env._model, env._data, jacp, jacr, p_cur, _GB_BODY_ID)
-        Jp = jacp[:, _ARM_DOF_COLS]
-        Jr = jacr[:, _ARM_DOF_COLS]
-
-        # 一级任务：位置。
-        Ap = Jp @ Jp.T + (lam_pos * lam_pos) * np.eye(3)
-        try:
-            Ap_inv_ep = np.linalg.solve(Ap, e_p)
-            Jp_pinv = Jp.T @ np.linalg.solve(Ap, np.eye(3))
-        except np.linalg.LinAlgError:
-            Jp_pinv = np.linalg.pinv(Jp)
-            Ap_inv_ep = None
-        dq_pos = (Jp.T @ Ap_inv_ep) if Ap_inv_ep is not None else (Jp_pinv @ e_p)
-
-        # 二级任务：姿态，只在位置零空间内做弱修正。
-        N = np.eye(6) - Jp_pinv @ Jp
-        dq_rot = np.zeros(6, dtype=np.float64)
-        if float(np.linalg.norm(e_R)) > 1e-10:
-            JrN = Jr @ N
-            Ar = JrN @ JrN.T + (lam_rot * lam_rot) * np.eye(3)
-            try:
-                dq_rot = N @ JrN.T @ np.linalg.solve(Ar, e_R)
-            except np.linalg.LinAlgError:
-                dq_rot = N @ np.linalg.pinv(JrN) @ e_R
-
-        dq = dq_pos + rot_gain * dq_rot
-        raw_dq_max = float(np.max(np.abs(dq))) if np.all(np.isfinite(dq)) else float('inf')
-        if not np.all(np.isfinite(dq)):
-            return q0.copy(), float('inf'), float('inf'), float('inf'), raw_dq_max
-
-        # 统一缩放整个 dq，保持方向；LIFT 不允许 0.05rad 级的大步。
-        if raw_dq_max > max_joint_delta and raw_dq_max > 1e-12:
-            dq *= max_joint_delta / raw_dq_max
-
-        q_cmd = np.clip(q0 + dq, _ARM_LO, _ARM_HI)
-        dq_applied = q_cmd - q0
-        pred_p = e_p - Jp @ dq_applied
-        pred_R = e_R_full - Jr @ dq_applied
-        return (q_cmd, float(np.linalg.norm(pred_p)),
-                float(np.linalg.norm(pred_R)),
-                float(np.max(np.abs(dq_applied))), raw_dq_max)
 
     # ── 主循环 ──
     print("[MJ] Starting main loop, state=", state)
     try:
         while state != PipelineState.DONE:
+            # 本轮 physics step 的状态固定为 current_state。状态处理器只能修改
+            # next_state；所有 action / weld / env.step 都完整按 current_state 执行，
+            # physics step 完成后才提交状态切换，避免“一帧内混用两个状态”。
+            current_state = state
+            next_state = current_state
+
             # 读取机器人状态
             rs = env.get_robot_state()
             pos_w   = rs["pos"]       # (3,) 世界坐标
@@ -1282,16 +1232,16 @@ def main():
             cmd_vy = 0.0
 
             # ── 状态机：速度指令覆盖 ──
-            if state == PipelineState.NAV:
+            if current_state == PipelineState.NAV:
                 # 导航阶段保持 ARM_HOME_ANGLES（收起但不到侧面）
                 _arm_step(ARM_INIT_ANGLES)
-                nav_done, nav_failed = bridge.get_nav_status()
+                nav_done, _ = bridge.get_nav_status()
                 if nav_done:
-                    state = PipelineState.ALIGN_YAW_1
+                    next_state = PipelineState.ALIGN_YAW_1
                     state_step = 0
                     print("[MJ] NAV done -> ALIGN_YAW_1")
 
-            elif state == PipelineState.ALIGN_YAW_1:
+            elif current_state == PipelineState.ALIGN_YAW_1:
                 # 对齐到 +Y。角速度命令设最小有效值，并等实际 yaw rate 停稳后再进入 PAN。
                 cmd_vx = 0.0; cmd_vy = 0.0
                 cmd_wz, _align_done, _ad = _align_yaw_control(
@@ -1303,13 +1253,13 @@ def main():
                           f"err={math.degrees(_ad['err']):+.2f}deg "
                           f"cmd_wz={cmd_wz:+.3f} actual_wz={_ad['wz_actual']:+.3f} "
                           f"settle={_ad['settle_count']}/{_ALIGN_SETTLE_STEPS}", flush=True)
-                if _align_done or state_step >= 600:
+                if _align_done or state_step >= ALIGN_YAW_MAX_STEPS:
                     _why = "settled" if _align_done else "timeout"
                     print(f"[MJ] ALIGN_YAW_1 done ({_why}) -> PAN_VX", flush=True)
-                    state = PipelineState.PAN_VX
+                    next_state = PipelineState.PAN_VX
                     state_step = 0
 
-            elif state == PipelineState.PAN_VX:
+            elif current_state == PipelineState.PAN_VX:
                 # 世界 Y 精调：和 PAN_DES_X 一样直接在世界系闭环，实时 yaw 只负责坐标变换。
                 _dy_w = float(args.goal[1]) - float(pos_w[1])
                 cmd_vx, cmd_vy, cmd_wz, _pan_done, _pd = _pan_world_axis_control(
@@ -1326,76 +1276,39 @@ def main():
                           f"settling={int(_pd['settling'])} "
                           f"settle={_pd['settle_count']}/{_PAN_SETTLE_STEPS}", flush=True)
                 state_step += 1
-                if _pan_done or state_step >= 500:
+                if _pan_done or state_step >= PAN_MAX_STEPS:
                     _why = "settled" if _pan_done else "timeout"
                     print(f"[SM] PAN_VX done ({_why}) -> PAN_VY", flush=True)
-                    state = PipelineState.PAN_VY
+                    next_state = PipelineState.PAN_VY
                     state_step = 0
 
-            elif state == PipelineState.PAN_VY:
-                # 世界 X 精调：目标为 goal_x+0.5m。朝 +Y 时 body +vy(左移) = world -X，故符号取反。
+            elif current_state == PipelineState.PAN_VY:
+                # 世界 X 精调：目标为 goal_x+0.5m。直接按 world X 闭环，再根据实时 yaw
+                # 转成 body vx/vy，避免依赖“yaw 必须恰好为 +pi/2”的固定符号假设。
                 _dx_w = float(args.goal[0]) + 0.5 - float(pos_w[0])
-                cmd_vx, cmd_vy, cmd_wz, _pan_done, _pd = _pan_axis_control(
-                    PipelineState.PAN_VY, _dx_w, 'vy', -1.0, math.pi / 2,
+                cmd_vx, cmd_vy, cmd_wz, _pan_done, _pd = _pan_world_axis_control(
+                    PipelineState.PAN_VY, _dx_w, 'x', math.pi / 2,
                     pos_tol=0.10, resume_tol=0.20, kp=1.0, vmax=0.25,
-                    yaw_now=yaw, base_lin_vel=rs["lin_vel"])
+                    yaw_now=yaw, base_lin_vel=rs["lin_vel"],
+                    settle_use_vxy=True)
                 if state_step == 1:
-                    print(f"[SM] PAN_VY start dx_err={_pd['err']:.3f}m", flush=True)
+                    print(f"[SM] PAN_VY start dx_err={_pd['signed_err']:+.3f}m", flush=True)
                 if state_step % 25 == 0:
-                    print(f"[SM] PAN_VY step {state_step}: dx_err={_pd['err']:.3f}m "
+                    print(f"[SM] PAN_VY step {state_step}: dx_err={_pd['signed_err']:+.3f}m "
                           f"cmd=({cmd_vx:+.3f},{cmd_vy:+.3f},{cmd_wz:+.3f}) "
-                          f"vxy={_pd['vxy']:.3f} settling={int(_pd['settling'])} "
+                          f"vx_world={_pd['axis_vel']:+.3f} vxy={_pd['vxy']:.3f} "
+                          f"yaw_err={math.degrees(_pd['yaw_err']):+.2f}deg "
+                          f"settling={int(_pd['settling'])} "
                           f"settle={_pd['settle_count']}/{_PAN_SETTLE_STEPS}", flush=True)
                 state_step += 1
-                if _pan_done or state_step >= 500:
+                if _pan_done or state_step >= PAN_MAX_STEPS:
                     _why = "settled" if _pan_done else "timeout"
-                    # 旧版因 PAN 抖动临时用 set_root_pose() 把 y 瞬移到目标；现在恢复物理精调流程。
-                    print(f"[SM] PAN_VY done ({_why}) -> PAN_VX_FINAL", flush=True)
-                    state = PipelineState.ARM_INIT
+                    print(f"[SM] PAN_VY done ({_why}) -> ARM_INIT", flush=True)
+                    next_state = PipelineState.ARM_INIT
                     state_step = 0
 
-            # elif state == PipelineState.PAN_VX_FINAL:
-            #     # 侧移后再次补正世界 Y，消除 PAN_VY 产生的耦合误差。
-            #     _dy_w = float(args.goal[1]) - float(pos_w[1])
-            #     cmd_vx, cmd_vy, cmd_wz, _pan_done, _pd = _pan_axis_control(
-            #         PipelineState.PAN_VX_FINAL, _dy_w, 'vx', +1.0, math.pi / 2,
-            #         pos_tol=0.06, resume_tol=0.14, kp=0.8, vmax=0.22,
-            #         yaw_now=yaw, base_lin_vel=rs["lin_vel"])
-            #     if state_step == 1:
-            #         print(f"[SM] PAN_VX_FINAL start dy_err={_pd['err']:.3f}m", flush=True)
-            #     if state_step % 25 == 0:
-            #         print(f"[SM] PAN_VX_FINAL step {state_step}: dy_err={_pd['err']:.3f}m "
-            #               f"cmd=({cmd_vx:+.3f},{cmd_vy:+.3f},{cmd_wz:+.3f}) "
-            #               f"vxy={_pd['vxy']:.3f} settling={int(_pd['settling'])} "
-            #               f"settle={_pd['settle_count']}/{_PAN_SETTLE_STEPS}", flush=True)
-            #     state_step += 1
-            #     if _pan_done or state_step >= 350:
-            #         _why = "settled" if _pan_done else "timeout"
-            #         print(f"[SM] PAN_VX_FINAL done ({_why}) -> ALIGN_YAW", flush=True)
-            #         state = PipelineState.ALIGN_YAW
-            #         state_step = 0
-
-            # elif state == PipelineState.ALIGN_YAW:
-            #     # 对齐到 +Y 方向（yaw = +π/2），面向桌子，然后进入 ARM_INIT
-            #     _yaw_err_align = _yaw_err_to(math.pi / 2, yaw)
-            #     if state_step == 1:
-            #         print(f"[SM] ALIGN_YAW start: cur={math.degrees(yaw):.1f}deg", flush=True)
-            #     if state_step % 50 == 0:
-            #         print(f"[SM] ALIGN_YAW step {state_step}: "
-            #               f"err={math.degrees(_yaw_err_align):.1f}deg", flush=True)
-            #     cmd_vx = 0.0; cmd_vy = 0.0
-            #     cmd_wz = float(np.clip(100.0 * _yaw_err_align, -1.2, 1.2))
-            #     state_step += 1
-            #     if abs(_yaw_err_align) < 0.02 or state_step >= 600:
-            #         print("[SM] ALIGN_YAW done -> ARM_INIT", flush=True)
-            #         # 保存 FREEZE 锚点
-            #         _frozen_pos  = pos_w.copy()
-            #         _frozen_quat = quat_w.copy()
-            #         state = PipelineState.ARM_INIT
-            #         state_step = 0
-
-            elif state == PipelineState.ARM_INIT:
-                # 机械臂插值到 ARM_SIDE_ANGLES，同时 FREEZE 根节点位姿。
+            elif current_state == PipelineState.ARM_INIT:
+                # 机械臂插值到 ARM_SIDE_ANGLES；底盘由抓取阶段统一 weld 固定。
                 # 每次重试/初始化都先退出恒力夹持，允许夹爪正常张开。
                 if state_step == 0:
                     env.disable_gripper_force_hold()
@@ -1421,14 +1334,14 @@ def main():
                     print(f"[SM] ARM_INIT done ({_reason} at step {state_step-1})",
                           flush=True)
                     if args.grasp_checkpoint:
-                        state = PipelineState.SCAN
+                        next_state = PipelineState.SCAN
                     else:
-                        state = PipelineState.DONE
+                        next_state = PipelineState.DONE
                     state_step = 0
                     depth_accum = []
                     scan_rgb    = None
 
-            elif state == PipelineState.SCAN:
+            elif current_state == PipelineState.SCAN:
                 # 收集 wrist_cam 的 RGB + depth 帧
                 cmd_vx = 0.0; cmd_vy = 0.0; cmd_wz = 0.0
                 _gripper_step(close=False)
@@ -1454,31 +1367,21 @@ def main():
                         _q_scan_at_scan  = _get_arm_q(jpos).copy()
                         _pos_w_at_scan   = pos_w.copy()
                         _quat_w_at_scan  = quat_w.copy()
-                        # ── 保存 scan_raw.png：SCAN 阶段采集到的原始 RGB 帧 ──
-                        try:
-                            import cv2 as _cv2_sr
-                            _sr_dir = "/home/mojie/taskdog/custom_envs/tmp_pictures"
-                            os.makedirs(_sr_dir, exist_ok=True)
-                            if scan_rgb is not None:
-                                _sr_bgr = _cv2_sr.cvtColor(scan_rgb, _cv2_sr.COLOR_RGB2BGR)
-                                _sr_path = os.path.join(_sr_dir, "scan_raw.png")
-                                _cv2_sr.imwrite(_sr_path, _sr_bgr)
-                                print(f"[SM] scan_raw.png 已保存: {_sr_path}", flush=True)
-                        except Exception as _sr_e:
-                            print(f"[SM] scan_raw.png 保存失败: {_sr_e}", flush=True)
-                        state = PipelineState.GRASP_PLAN
+                        # 调试图输出独立到 diagnostics 模块。
+                        _diag_save_scan_raw(scan_rgb)
+                        next_state = PipelineState.GRASP_PLAN
                         state_step = 0
                 except ValueError as _scan_e:
                     print(f"[SM] SCAN camera unavailable ({_scan_e}) -- DONE.",
                           flush=True)
-                    state = PipelineState.DONE
+                    next_state = PipelineState.DONE
                     state_step = 0
 
-            elif state == PipelineState.PRE_GRASP:
+            elif current_state == PipelineState.PRE_GRASP:
                 # IK 求解 + 斜坡移动机械臂到 pre-grasp 姿态（对齐原版逻辑）
                 cmd_vx = 0.0; cmd_vy = 0.0; cmd_wz = 0.0
                 if grasp_result is None:
-                    state = PipelineState.DONE
+                    next_state = PipelineState.DONE
                 else:
                     if _pg_cmd is None:
                         # state_step==0 时一次性求解 IK（对应原版 state_step==1 块）
@@ -1547,7 +1450,7 @@ def main():
                                     depth_accum.clear()
                                     scan_rgb = None
                                     _pg_cmd = None
-                                    state = PipelineState.ARM_INIT
+                                    next_state = PipelineState.ARM_INIT
                                     state_step = 0
                                 else:
                                     _tried.add(_next_ci)
@@ -1556,7 +1459,6 @@ def main():
                                     # GraspNet 原始输出即光学系（x右 y下 z前），直接使用
                                     grasp_result["R_cam"]     = grasp_result["gr_rotations"][_next_ci].copy()
                                     grasp_result["score"]     = float(grasp_result["gr_scores"][_next_ci])
-                                    grasp_result["width"]     = float(grasp_result["gr_widths"][_next_ci])
                                     grasp_result["depth"]     = float(grasp_result["gr_depths"][_next_ci])
                                     # 重新计算 R_desired_EE_in_arm（对齐原版逻辑）
                                     try:
@@ -1612,42 +1514,16 @@ def main():
                                     print(f"[SM] _pg_t_gb_world_fixed 计算失败: {_pgfe}", flush=True)
                                 print(f"[SM] PRE_GRASP IK={np.round(_pg_target_cur,3)}",
                                       flush=True)
-                                # ── 保存 choice.png：在 scan_rgb 上标注最终抓取点和 closing 轴 ──
-                                try:
-                                    import cv2 as _cv2_ch
-                                    if scan_rgb is not None:
-                                        _ch_img = _cv2_ch.cvtColor(scan_rgb, _cv2_ch.COLOR_RGB2BGR).copy()
-                                    else:
-                                        _ch_img = np.zeros((480, 640, 3), dtype=np.uint8)
-                                    _H_ch, _W_ch = _ch_img.shape[:2]
-                                    _fx_ch, _fy_ch = 616.0, 616.0
-                                    _cx_ch, _cy_ch = _W_ch / 2.0, _H_ch / 2.0
-                                    _t_sel = grasp_result["t_cam"]   # 相机系抓取点 [X,Y,Z]
-                                    _R_sel = grasp_result["R_cam"]   # 3×3，[:,1]=closing轴
-                                    # 抓取点投影到像素
-                                    _u0 = int(_t_sel[0] / _t_sel[2] * _fx_ch + _cx_ch)
-                                    _v0 = int(_t_sel[1] / _t_sel[2] * _fy_ch + _cy_ch)
-                                    # closing 轴端点（沿 closing 轴延伸 0.05m）
-                                    _closing_end = _t_sel + _R_sel[:, 1] * 0.05
-                                    _u1 = int(_closing_end[0] / _closing_end[2] * _fx_ch + _cx_ch)
-                                    _v1 = int(_closing_end[1] / _closing_end[2] * _fy_ch + _cy_ch)
-                                    # 红点（抓取点）+ 绿色箭头（closing 轴方向）
-                                    _cv2_ch.circle(_ch_img, (_u0, _v0), 6, (0, 0, 255), -1)
-                                    _cv2_ch.arrowedLine(_ch_img, (_u0, _v0), (_u1, _v1),
-                                                        (0, 255, 0), 2, tipLength=0.3)
-                                    _ch_dir = "/home/mojie/taskdog/custom_envs/tmp_pictures"
-                                    os.makedirs(_ch_dir, exist_ok=True)
-                                    _choice_path = os.path.join(_ch_dir, "choice.png")
-                                    _cv2_ch.imwrite(_choice_path, _ch_img)
-                                    print(f"[SM] choice.png 已保存: {_choice_path}  "
-                                          f"grasp_pt=({_u0},{_v0}) closing=({_u1},{_v1})",
-                                          flush=True)
-                                except Exception as _che:
-                                    print(f"[SM] choice.png 保存失败: {_che}", flush=True)
+                                # 最终抓取选择可视化移到 diagnostics 模块。
+                                _diag_save_choice_image(
+                                    scan_rgb,
+                                    grasp_result["t_cam"],
+                                    grasp_result["R_cam"],
+                                )
                         except Exception as _ike:
                             print(f"[SM] PRE_GRASP IK err: {_ike} — DONE.", flush=True)
-                            state = PipelineState.DONE
-                    if _pg_cmd is not None and state == PipelineState.PRE_GRASP:
+                            next_state = PipelineState.DONE
+                    if _pg_cmd is not None and next_state == current_state:
                         cur_q = _get_arm_q(jpos)
                         # 原版: _pg_cmd 滚动 += clip(target - cmd)，每步小步积分
                         for _ji in range(6):
@@ -1715,15 +1591,15 @@ def main():
                                 depth_accum.clear()
                                 scan_rgb = None
                                 _pg_cmd = None
-                                state = PipelineState.ARM_INIT
+                                next_state = PipelineState.ARM_INIT
                                 state_step = 0
                             else:
                                 print(f"[SM] PRE_GRASP done (step={state_step}) -> ORIENT",
                                       flush=True)
-                                state = PipelineState.ORIENT
+                                next_state = PipelineState.ORIENT
                                 state_step = 0
 
-            elif state == PipelineState.ORIENT:
+            elif current_state == PipelineState.ORIENT:
                 # 只用 joint6 绕 gripper approach 轴旋转；j1~j5 锁定“进入 ORIENT 时的实际值”。
                 # 本版 ORIENT 不再精确复现 AnyGrasp closing 的小竖直倾角，而是：
                 #   1) 保持当前实际 approach 方向不变；
@@ -1732,7 +1608,7 @@ def main():
                 # 因而 ORIENT 结束时两根平行手指在理想刚体几何下等高，后续 REACH 只保持该姿态前进。
                 cmd_vx = 0.0; cmd_vy = 0.0; cmd_wz = 0.0
                 if grasp_result is None or "R_desired_EE_in_arm" not in grasp_result:
-                    state = PipelineState.DONE
+                    next_state = PipelineState.DONE
                 else:
                     cur_q = _get_arm_q(jpos)
                     if state_step == 0:
@@ -1748,7 +1624,7 @@ def main():
 
                         # 以 MuJoCo 当前真实姿态的 approach 作为固定旋转轴。
                         # joint6 只绕该轴转，因此 ORIENT 不改变 approach。
-                        _p_or_init_w, _R_or_init_w = _gb_pose_world()
+                        _, _R_or_init_w = _gb_pose_world()
                         _approach_w = np.asarray(_R_or_init_w[:, 2], dtype=np.float64)
                         _approach_w /= max(float(np.linalg.norm(_approach_w)), 1e-12)
 
@@ -1821,14 +1697,12 @@ def main():
                                   f"-> ARM_INIT retry", flush=True)
                             grasp_result = None
                             _pg_cmd = None
-                            _reach_R_hold = None
-                            _reach_p_goal = None
-                            state = PipelineState.ARM_INIT
+                            next_state = PipelineState.ARM_INIT
                             state_step = 0
                         else:
                             from arm_ik_mujoco import quat_to_rot as _q2r_or_done
                             _cur_q_orient_done = _get_arm_q(jpos).copy()
-                            _p_or_actual_w, _R_or_actual_w = _gb_pose_world()
+                            _, _R_or_actual_w = _gb_pose_world()
                             _R_robot_or = _q2r_or_done(np.asarray(quat_w, dtype=np.float64))
                             _R_gb_desired_w = _R_robot_or @ _R_gb_desired_or
 
@@ -1848,16 +1722,10 @@ def main():
                                       f"-> ARM_INIT retry", flush=True)
                                 grasp_result = None
                                 _pg_cmd = None
-                                _reach_R_hold = None
-                                _reach_p_goal = None
-                                state = PipelineState.ARM_INIT
+                                next_state = PipelineState.ARM_INIT
                                 state_step = 0
                             else:
-                                _reach_R_hold = _R_or_actual_w.copy()
                                 grasp_result["target_angles_orient"] = _cur_q_orient_done.copy()
-                                grasp_result["R_gb_orient_actual_world"] = _reach_R_hold.copy()
-                                _reach_p_goal = None
-                                _reach_fail_count = 0
                                 _closing_actual_tilt = math.degrees(math.asin(float(np.clip(
                                     abs(_R_or_actual_w[2, 1]), 0.0, 1.0))))
                                 print(f"[SM] ORIENT done: j6={_cur_q_orient_done[5]:.4f} "
@@ -1866,17 +1734,17 @@ def main():
                                       f"closing_err={math.degrees(_close_err):.2f}deg, "
                                       f"actual_closing_tilt={_closing_actual_tilt:.2f}deg -> REACH",
                                       flush=True)
-                                state = PipelineState.REACH
+                                next_state = PipelineState.REACH
                                 state_step = 0
-                                target_angles_arm = None
+                                reach_ctx.reset()
 
-            elif state == PipelineState.REACH:
+            elif current_state == PipelineState.REACH:
                 # 沿 approach 轴前进 0.06m 到接触点（对齐原版逻辑）
                 cmd_vx = 0.0; cmd_vy = 0.0; cmd_wz = 0.0
                 if grasp_result is None or "pre_t_gb_arm" not in grasp_result:
-                    state = PipelineState.DONE
+                    next_state = PipelineState.DONE
                 else:
-                    if target_angles_arm is None:
+                    if reach_ctx.target_cur is None:
                         # state_step==0 时一次性求解 IK（对应原版 state_step==1 块）
                         try:
                             from arm_ik_mujoco import (
@@ -1895,20 +1763,14 @@ def main():
                             _re_t_gb_arm = (_re_pre_t_gb
                                             + REACH_ADVANCE * _re_approach)
                             # ── 闭环纠偏状态（REACH 结束时用 gb 实测误差反推命令，见 done 分支）──
-                            _re_t_gb_arm0 = _re_t_gb_arm.copy()  # 原始(clip 后)命令目标，纠偏基准
-                            _re_corr_iter = 0                    # 已纠偏次数
-                            _re_corr_w    = np.zeros(3)          # 世界系累积修正量
-                            _cc_act_prev  = None                 # 上一轮纠偏时的实测 gb（世界系）
-                            _cc_cmd_move  = None                 # 上一轮纠偏命令的 gb 位移（世界系）
-                            _re_prev_q    = None                 # 上一次纠偏前的目标关节角（不跟随时的回退点）
-                            _tc_h    = None                      # 桌面高度（世界 z）
-                            _tc_need = None                      # 指尖最低允许高度（clip 量）
+                            reach_ctx.target_gb_arm0 = _re_t_gb_arm.copy()  # 原始(clip 后)命令目标，纠偏基准
+                            _tc_need = None                      # 指尖最低允许高度（仅本次初始化使用）
                             # ── 桌面 clip: 手不得插进桌面（沿 approach 自动收缩前进量）──
                             # 指尖目标 = 掌心 + (depth + s)·a：depth < 0.1358 时指尖会落到
                             # 掌心之下较浅处，若物体矮（苹果）则该目标可能低于桌面 → 手指压桌、
                             # 机器狗对抗、抓空。这里按桌面高度收缩 advance 兜底。
-                            # 桌面高度取 GRASP_PLAN 阶段保存的 /tmp/table_cloud.npz（世界系，
-                            # 白/灰颜色筛出的桌面点），用指尖 XY 邻域点 z 的**中位数**估计
+                            # 桌面高度直接使用 GRASP_PLAN 缓存在 grasp_result 中的世界系点云，
+                            # 用指尖 XY 邻域点 z 的**中位数**估计
                             # （邻域里可能混有物体表面点，max 会被抬高，中位数对物体/离群点鲁棒）；
                             # 邻域点不足时逐级放大半径；仍无数据或 approach 非向下则不 clip（fail-open）。
                             # 指尖不是最低点：指板沿 approach 长 76.5mm、内侧半宽 35.1mm，
@@ -1922,23 +1784,24 @@ def main():
                                 # advance=0 时指尖（j7 原点）的世界位置
                                 _tc_tip_w = (_tc_R_rob @ (_re_pre_t_gb + 0.1358 * _re_approach)
                                              + _tc_base_w)
-                                if _tc_apw[2] < -0.05 and os.path.exists('/tmp/table_cloud.npz'):
-                                    _tc_pts  = np.load('/tmp/table_cloud.npz')['points'].astype(np.float64)
-                                    _tc_dxy  = np.linalg.norm(_tc_pts[:, :2] - _tc_tip_w[:2], axis=1)
+                                _tc_pts_mem = grasp_result.get("table_cloud_world")
+                                if _tc_apw[2] < -0.05 and _tc_pts_mem is not None:
+                                    _tc_pts = np.asarray(_tc_pts_mem, dtype=np.float64)
+                                    _tc_dxy = np.linalg.norm(_tc_pts[:, :2] - _tc_tip_w[:2], axis=1)
                                     for _tc_r in (0.03, 0.05, 0.10):
                                         if int((_tc_dxy < _tc_r).sum()) >= 20:
-                                            _tc_h = float(np.median(_tc_pts[_tc_dxy < _tc_r, 2]))
+                                            reach_ctx.table_height = float(np.median(_tc_pts[_tc_dxy < _tc_r, 2]))
                                             break
-                                if _tc_h is None:
+                                if reach_ctx.table_height is None:
                                     print("[WARN] 桌面 clip: 桌面点云不足或 approach 非向下 -> 不 clip",
                                           flush=True)
                                 else:
                                     # 指尖需停在 need_eff 以上；指板外角再低 35.1mm×sin(倾角)
-                                    _tc_need = (_tc_h + TABLE_CLEARANCE
+                                    _tc_need = (reach_ctx.table_height + TABLE_CLEARANCE
                                                 + 0.0351 * float(np.hypot(_tc_apw[0], _tc_apw[1])))
                                     _tc_dmax = ((_tc_tip_w[2] - _tc_need) / (-_tc_apw[2]))
                                     if 0.0 < _tc_dmax < REACH_ADVANCE:
-                                        print(f"[SM] REACH clip: 桌面z={_tc_h:.4f} "
+                                        print(f"[SM] REACH clip: 桌面z={reach_ctx.table_height:.4f} "
                                               f"指尖停在z>={_tc_need:.4f} advance "
                                               f"{REACH_ADVANCE:.3f}->{_tc_dmax:.3f}m", flush=True)
                                         _re_t_gb_arm = _re_pre_t_gb + _tc_dmax * _re_approach
@@ -1985,10 +1848,9 @@ def main():
                             if abs(_rq[5] - _j6_ik) > 0.01:
                                 print(f"[INFO] REACH j6 pinned: IK={_j6_ik:+.4f} "
                                       f"-> {_rq[5]:+.4f} (ORIENT end)", flush=True)
-                            target_angles_arm = np.asarray(_rq,
-                                                           dtype=np.float64).copy()
-                            _re_target_cur    = target_angles_arm.copy()
-                            print(f"[SM] REACH IK={np.round(target_angles_arm,3)}",
+                            reach_ctx.target_cur = np.asarray(
+                                _rq, dtype=np.float64).copy()
+                            print(f"[SM] REACH IK={np.round(reach_ctx.target_cur,3)}",
                                   flush=True)
                             # 打印 REACH 目标点（gripper_base 原点）的世界坐标
                             try:
@@ -1996,7 +1858,7 @@ def main():
                                 _re_R_rob   = _q2r_re(grasp_result["quat_w_scan"])
                                 _re_pos_rob = grasp_result["pos_w_scan"]
                                 _re_arm_base_w = _re_pos_rob + _re_R_rob @ np.array([0.0, 0.0, 0.0888])
-                                _re_T_arm = _fk_re_diag(target_angles_arm)
+                                _re_T_arm = _fk_re_diag(reach_ctx.target_cur)
                                 _re_gb_world = _re_R_rob @ _re_T_arm[:3, 3] + _re_arm_base_w
                                 _apw_re    = _re_R_rob @ _re_approach
                                 _re_j7_world = _re_gb_world + 0.1358 * _apw_re
@@ -2026,14 +1888,14 @@ def main():
                                 print(f"[DIAG] REACH world calc err: {_re_diag_e}", flush=True)
                         except Exception as _re:
                             print(f"[SM] REACH IK err: {_re} — DONE.", flush=True)
-                            state = PipelineState.DONE
-                    if target_angles_arm is not None \
-                            and state == PipelineState.REACH:
+                            next_state = PipelineState.DONE
+                    if reach_ctx.target_cur is not None \
+                            and next_state == current_state:
                         from arm_ik_mujoco import _IK_JOINT_LIMITS as _re_lims2
                         cur_q = _get_arm_q(jpos)
                         # 速度限制斜坡：每步最多移动 _PG_MAX_DELTA，避免瞬移穿模
                         _re_delta = np.clip(
-                            _re_target_cur - cur_q,
+                            reach_ctx.target_cur - cur_q,
                             -_PG_MAX_DELTA, +_PG_MAX_DELTA)
                         _q6_re = np.clip(
                             cur_q + _re_delta,
@@ -2042,7 +1904,7 @@ def main():
                         _arm_step(_q6_re)
                         _gripper_step(close=False)
                         if state_step % 50 == 0:
-                            _re_err = np.abs(cur_q - _re_target_cur)
+                            _re_err = np.abs(cur_q - reach_ctx.target_cur)
                             print(f"[SM] REACH step {state_step}/{BUDGET[PipelineState.REACH]}: "
                                   f"max_err={_re_err.max():.4f}", flush=True)
                         state_step += 1
@@ -2055,7 +1917,7 @@ def main():
                             # 两道保护：误差不在 5~50mm 区间视为异常/已够好，不追；
                             # 纠偏后误差没实质减小（实际没跟随 → 硬顶物体/到限位）则回退并停止。
                             _re_corr_done = False
-                            if _re_corr_iter < 3:
+                            if reach_ctx.corr_iter < 3:
                                 try:
                                     import mujoco as _mj_cc
                                     from arm_ik_mujoco import quat_to_rot as _q2r_cc
@@ -2072,7 +1934,7 @@ def main():
                                     _cc_base  = (np.asarray(grasp_result["pos_w_scan"],
                                                             dtype=np.float64)
                                                  + _cc_R @ np.array([0., 0., 0.0888]))
-                                    _cc_gb_ana  = _cc_R @ _re_t_gb_arm0 + _cc_base
+                                    _cc_gb_ana  = _cc_R @ reach_ctx.target_gb_arm0 + _cc_base
                                     _cc_e_w     = _gb_act_c - _cc_gb_ana   # 实测 − 解析(原始基准)
                                     _cc_en      = float(np.linalg.norm(_cc_e_w))
                                     # ── 接触急停：指板已碰到物体 → 停止纠偏（苹果骑肩
@@ -2095,10 +1957,10 @@ def main():
                                         print(f"[SM] REACH corr 接触急停: 指板已接触 "
                                               f"{args.object} (|e|={_cc_en * 1000:.1f}mm) -> "
                                               f"停止纠偏, 直接 CLOSE", flush=True)
-                                        _re_corr_iter = 3   # 之后不再纠偏
-                                    elif _cc_act_prev is not None and \
-                                            float(np.linalg.norm(_gb_act_c - _cc_act_prev)) \
-                                            < 0.4 * float(np.linalg.norm(_cc_cmd_move)):
+                                        reach_ctx.corr_iter = 3   # 之后不再纠偏
+                                    elif reach_ctx.prev_actual_gb_world is not None and \
+                                            float(np.linalg.norm(_gb_act_c - reach_ctx.prev_actual_gb_world)) \
+                                            < 0.4 * float(np.linalg.norm(reach_ctx.prev_cmd_move_world)):
                                         # 实际没跟随命令（硬顶物体/到限位）：再纠只会把
                                         # 纠正量越积越大、持续加压 → 回退到纠偏前的目标并停止。
                                         # 判据 = "实测 gb 位移 vs 当轮命令位移"：跟随与不跟随
@@ -2106,13 +1968,12 @@ def main():
                                         # 都判不出来），只有位移有区分度。
                                         print(f"[WARN] REACH corr: 实际未跟随命令 "
                                               f"(实测 gb 位移 "
-                                              f"{float(np.linalg.norm(_gb_act_c - _cc_act_prev)) * 1000:.1f}mm"
-                                              f" < 命令位移 {float(np.linalg.norm(_cc_cmd_move)) * 1000:.1f}mm"
+                                              f"{float(np.linalg.norm(_gb_act_c - reach_ctx.prev_actual_gb_world)) * 1000:.1f}mm"
+                                              f" < 命令位移 {float(np.linalg.norm(reach_ctx.prev_cmd_move_world)) * 1000:.1f}mm"
                                               f" 的 40%) -> 回退并停止纠偏", flush=True)
-                                        _re_corr_iter = 3
-                                        if _re_prev_q is not None:
-                                            target_angles_arm = _re_prev_q
-                                            _re_target_cur    = _re_prev_q.copy()
+                                        reach_ctx.corr_iter = 3
+                                        if reach_ctx.prev_target_q is not None:
+                                            reach_ctx.target_cur = reach_ctx.prev_target_q.copy()
                                             state_step        = 0
                                             _re_corr_done     = True
                                     elif 0.005 < _cc_en < 0.05:
@@ -2123,8 +1984,8 @@ def main():
                                             _cc_step = _cc_step * (0.015 / _cc_en)
                                             print(f"[SM] REACH corr 限幅: 单轮移动 "
                                                   f"{_cc_en * 1000:.1f} -> 15.0mm", flush=True)
-                                        _cc_corr = _re_corr_w + _cc_step
-                                        _cc_gb_cmd_arm = _re_t_gb_arm0 + _cc_R.T @ _cc_corr
+                                        _cc_corr = reach_ctx.corr_world + _cc_step
+                                        _cc_gb_cmd_arm = reach_ctx.target_gb_arm0 + _cc_R.T @ _cc_corr
                                         _cc_cur_q = _get_arm_q(jpos).copy()
                                         # 局部增量（纯平移，j6 不动）：不重建朝向，
                                         # 因此不依赖 IK 种子/滚动角，也不会跳到另一分支
@@ -2135,10 +1996,10 @@ def main():
                                         # 标准，只是换成精确几何）→ 低于就沿世界 z 抬差额重算。
                                         # 旧公式（按 |e| 猜"预测实际"再反推命令）已删：静差
                                         # 翻号时它把指板放到了桌面下（第一轮 0.6525 < 0.6613）。
-                                        if _tc_h is not None and _cc_res <= 0.010 and _cc_dq <= 0.35:
+                                        if reach_ctx.table_height is not None and _cc_res <= 0.010 and _cc_dq <= 0.35:
                                             try:
-                                                _cc_floor_z = float(_tc_h) + TABLE_CLEARANCE
-                                                for _cc_fl in range(2):
+                                                _cc_floor_z = float(reach_ctx.table_height) + TABLE_CLEARANCE
+                                                for _ in range(2):
                                                     _cc_padz = _pad_min_z_fk(_cc_q)
                                                     _cc_dz   = _cc_floor_z - _cc_padz
                                                     if _cc_dz <= 1e-4:
@@ -2149,7 +2010,7 @@ def main():
                                                           f"{_cc_floor_z:.4f} -> 沿世界 z 抬 "
                                                           f"{_cc_dz * 1000:.1f}mm", flush=True)
                                                     _cc_corr = _cc_corr + np.array([0., 0., _cc_dz])
-                                                    _cc_gb_cmd_arm = (_re_t_gb_arm0
+                                                    _cc_gb_cmd_arm = (reach_ctx.target_gb_arm0
                                                                       + _cc_R.T @ _cc_corr)
                                                     _cc_q, _cc_res, _cc_dq = _dls_gb_step(
                                                         _cc_cur_q, _cc_gb_cmd_arm)
@@ -2162,16 +2023,15 @@ def main():
                                                   f"{np.degrees(_cc_dq):.1f}deg) -> 放弃纠偏",
                                                   flush=True)
                                         else:
-                                            _re_prev_q        = _re_target_cur.copy()  # 回退点
-                                            _re_corr_iter    += 1
-                                            _cc_act_prev      = _gb_act_c.copy()       # 下轮判跟随用
-                                            _cc_cmd_move      = _cc_corr - _re_corr_w  # 本轮命令位移
-                                            _re_corr_w        = _cc_corr
-                                            target_angles_arm = _cc_q
-                                            _re_target_cur    = _cc_q.copy()
+                                            reach_ctx.prev_target_q        = reach_ctx.target_cur.copy()  # 回退点
+                                            reach_ctx.corr_iter    += 1
+                                            reach_ctx.prev_actual_gb_world      = _gb_act_c.copy()       # 下轮判跟随用
+                                            reach_ctx.prev_cmd_move_world      = _cc_corr - reach_ctx.corr_world  # 本轮命令位移
+                                            reach_ctx.corr_world        = _cc_corr
+                                            reach_ctx.target_cur = _cc_q.copy()
                                             state_step        = 0
                                             _re_corr_done     = True
-                                            print(f"[SM] REACH corr iter={_re_corr_iter} "
+                                            print(f"[SM] REACH corr iter={reach_ctx.corr_iter} "
                                                   f"err={np.round(_cc_e_w * 1000, 1)}mm "
                                                   f"|err|={_cc_en * 1000:.1f}mm "
                                                   f"-> 新命令 gb={np.round(_cc_gb_cmd_arm, 4)} (arm)"
@@ -2182,106 +2042,61 @@ def main():
                             if not _re_corr_done:
                                 print(f"[SM] REACH done (step={state_step}) -> CLOSE",
                                       flush=True)
-                                try:
-                                    import mujoco as _mj_rd
-                                    _gb_bid_rd = _mj_rd.mj_name2id(env._model, _mj_rd.mjtObj.mjOBJ_BODY, "gripper_base")
-                                    _gb_actual_rd = env._data.xpos[_gb_bid_rd].copy()
-                                    _j7_bid_rd = _mj_rd.mj_name2id(env._model, _mj_rd.mjtObj.mjOBJ_BODY, "link7")
-                                    _j7_actual_rd = env._data.xpos[_j7_bid_rd].copy() if _j7_bid_rd >= 0 else None
-                                    print(f"[DIAG] REACH done gb_actual_world  = {np.round(_gb_actual_rd,4)}  ← MuJoCo实际", flush=True)
-                                    if _j7_actual_rd is not None:
-                                        print(f"[DIAG] REACH done j7_actual_world  = {np.round(_j7_actual_rd,4)}  ← MuJoCo实际", flush=True)
-                                except Exception as _rd_e:
-                                    print(f"[DIAG] REACH done xpos read err: {_rd_e}", flush=True)
-                                try:
-                                    _real_obj_reach_done = env.get_object_pos(args.object)
-                                    print(f"[DIAG] REACH done object real world={np.round(_real_obj_reach_done,4)}",
-                                          flush=True)
-                                except Exception:
-                                    pass
-                                # 打印各关节实际角度 vs IK目标，诊断未收敛原因
-                                try:
-                                    _cur_q_rd = _get_arm_q(jpos)
-                                    _tgt_q_rd = _re_target_cur
-                                    _err_q_rd  = _cur_q_rd - _tgt_q_rd
-                                    print(f"[DIAG] REACH done joint_actual = {np.round(_cur_q_rd,4)}", flush=True)
-                                    print(f"[DIAG] REACH done joint_target = {np.round(_tgt_q_rd,4)}", flush=True)
-                                    print(f"[DIAG] REACH done joint_err    = {np.round(_err_q_rd,4)}  (deg={np.round(np.degrees(_err_q_rd),2)})", flush=True)
-                                except Exception as _qe_rd:
-                                    print(f"[DIAG] REACH done joint read err: {_qe_rd}", flush=True)
-                                state = PipelineState.CLOSE
+                                _diag_print_reach_done(
+                                    env, args.object, jpos, _ARM_IDX, reach_ctx.target_cur)
+                                next_state = PipelineState.CLOSE
                                 state_step = 0
 
-            elif state == PipelineState.CLOSE:
+            elif current_state == PipelineState.CLOSE:
                 # CLOSE 只允许两个 finger 动；机械臂六关节固定为“进入 CLOSE 时的实际 q”。
                 # 这样不会再追逐 REACH 的旧理论 target，接触建立过程中末端姿态保持不变。
                 cmd_vx = 0.0; cmd_vy = 0.0; cmd_wz = 0.0
                 cur_q = _get_arm_q(jpos)
                 if state_step == 0:
                     env.disable_gripper_force_hold()
-                    _close_q_hold = cur_q.copy()
-                    _cl_frz[0] = _cl_frz[1] = None
-                    _cl_qc[0]  = _cl_qc[1]  = None
-                    _cl_sq[0]  = False
+                    close_ctx.reset()
+                    close_ctx.arm_q_hold = cur_q.copy()
                     env._grip_max_delta = _GRIP_MAX_DELTA_NORMAL
-                    _cl_diag_prev_contact = None
-                    _cl_deep_post_pending = None
-                    _cl_contact_hist.clear()
-                    _cl_obj_pos_hist.clear()
                     # 记录 CLOSE 起点物体位姿，后续只用于诊断相对平移/转角。
-                    try:
-                        import mujoco as _mj_c0
-                        _cl_obj_bid = _mj_c0.mj_name2id(
-                            env._model, _mj_c0.mjtObj.mjOBJ_BODY, args.object)
-                        if _cl_obj_bid >= 0:
-                            _cl_diag_obj_p0 = env._data.xpos[_cl_obj_bid].astype(np.float64).copy()
-                            _cl_diag_obj_R0 = env._data.xmat[_cl_obj_bid].reshape(3, 3).astype(np.float64).copy()
-                        else:
-                            _cl_diag_obj_p0 = None
-                            _cl_diag_obj_R0 = None
-                    except Exception:
-                        _cl_diag_obj_p0 = None
-                        _cl_diag_obj_R0 = None
+                    close_ctx.diag_obj_pose0 = _diag_capture_body_pose(env, args.object)
                     print(f"[SM] CLOSE start: arm q 固定；首触约0.25N预压，另一指降速到 "
                           f"{_CLOSE_SEARCH_MAX_DELTA*1000:.1f}mm/step；"
                           f"双指都曾接触后切换恒力夹持 ±1.0N", flush=True)
 
-                _arm_step(_close_q_hold)
+                _arm_step(close_ctx.arm_q_hold)
                 tc = _fingers_contact(args.object)
                 q7c, q8c = float(jpos[_GRI_Q7_I]), float(jpos[_GRI_Q8_I])
 
                 # CLOSE 成功判定历史：只记录，不参与当前帧控制。
-                _cl_contact_hist.append((bool(tc["link7"]), bool(tc["link8"])))
-                if len(_cl_contact_hist) > _CLOSE_CHECK_WINDOW:
-                    _cl_contact_hist.pop(0)
+                close_ctx.contact_hist.append((bool(tc["link7"]), bool(tc["link8"])))
+                if len(close_ctx.contact_hist) > _CLOSE_CHECK_WINDOW:
+                    close_ctx.contact_hist.pop(0)
                 try:
                     _obj_p_hist = np.asarray(
                         env.get_object_pos(args.object), dtype=np.float64
                     ).copy()
-                    _cl_obj_pos_hist.append(_obj_p_hist)
-                    if len(_cl_obj_pos_hist) > _CLOSE_CHECK_WINDOW:
-                        _cl_obj_pos_hist.pop(0)
+                    close_ctx.obj_pos_hist.append(_obj_p_hist)
+                    if len(close_ctx.obj_pos_hist) > _CLOSE_CHECK_WINDOW:
+                        close_ctx.obj_pos_hist.pop(0)
                 except Exception:
                     pass
 
-                if _cl_frz[0] is None and tc["link7"]:
-                    _cl_qc[0] = q7c
-                    _cl_frz[0] = q7c - _CLOSE_PRELOAD_S
+                if close_ctx.finger_targets[0] is None and tc["link7"]:
+                    close_ctx.finger_targets[0] = q7c - _CLOSE_PRELOAD_S
                     print(f"[SM] CLOSE: link7 contact @q7={q7c:.4f} -> "
-                          f"preload target={_cl_frz[0]:.4f} (~0.25N)", flush=True)
-                    ci = _finger_contact_info(args.object)["link7"]
+                          f"preload target={close_ctx.finger_targets[0]:.4f} (~0.25N)", flush=True)
+                    ci = _diag_finger_contact_info(env, args.object)["link7"]
                     if ci is not None:
                         p, l = ci["world"], ci["local"]
                         print(f"[DIAG] CLOSE link7↔{ci['obj_geom_name']}: "
                               f"world={np.round(p,4)} local_mm={np.round(l*1000,2)} "
                               f"dist={ci['dist']*1000:+.2f}mm", flush=True)
 
-                if _cl_frz[1] is None and tc["link8"]:
-                    _cl_qc[1] = q8c
-                    _cl_frz[1] = q8c + _CLOSE_PRELOAD_S
+                if close_ctx.finger_targets[1] is None and tc["link8"]:
+                    close_ctx.finger_targets[1] = q8c + _CLOSE_PRELOAD_S
                     print(f"[SM] CLOSE: link8 contact @q8={q8c:.4f} -> "
-                          f"preload target={_cl_frz[1]:.4f} (~0.25N)", flush=True)
-                    ci = _finger_contact_info(args.object)["link8"]
+                          f"preload target={close_ctx.finger_targets[1]:.4f} (~0.25N)", flush=True)
+                    ci = _diag_finger_contact_info(env, args.object)["link8"]
                     if ci is not None:
                         p, l = ci["world"], ci["local"]
                         print(f"[DIAG] CLOSE link8↔{ci['obj_geom_name']}: "
@@ -2289,8 +2104,8 @@ def main():
                               f"dist={ci['dist']*1000:+.2f}mm", flush=True)
 
                 # 只有一侧已经首触时，两指都减速：首触侧缓慢建立预压力，另一侧慢速搜索。
-                _n_contacted_once = int(_cl_qc[0] is not None) + int(_cl_qc[1] is not None)
-                if (not _cl_sq[0]) and _n_contacted_once == 1:
+                _n_contacted_once = int(close_ctx.finger_targets[0] is not None) + int(close_ctx.finger_targets[1] is not None)
+                if (not close_ctx.force_hold_started) and _n_contacted_once == 1:
                     env._grip_max_delta = _CLOSE_SEARCH_MAX_DELTA
                 else:
                     env._grip_max_delta = _GRIP_MAX_DELTA_NORMAL
@@ -2298,8 +2113,8 @@ def main():
                 # 两指都曾经接触后，不再继续追逐“物体内部的位置目标”。
                 # 直接切到对称恒力夹持：joint7=-1N、joint8=+1N。
                 # 不锁中心、不做中心自适应，让物体自行在双指之间找到稳定位置。
-                if (not _cl_sq[0]) and _cl_frz[0] is not None and _cl_frz[1] is not None:
-                    _cl_sq[0] = True
+                if (not close_ctx.force_hold_started) and close_ctx.finger_targets[0] is not None and close_ctx.finger_targets[1] is not None:
+                    close_ctx.force_hold_started = True
                     env._grip_max_delta = _GRIP_MAX_DELTA_NORMAL
                     env.set_gripper_force_hold(2.0)
                     print(
@@ -2311,79 +2126,34 @@ def main():
                 # 单侧接触时继续慢速搜索另一侧；只有双指都曾接触才允许进入恒力模式。
 
                 env.set_gripper_target(np.array([
-                    _cl_frz[0] if _cl_frz[0] is not None else 0.0,
-                    _cl_frz[1] if _cl_frz[1] is not None else 0.0,
+                    close_ctx.finger_targets[0] if close_ctx.finger_targets[0] is not None else 0.0,
+                    close_ctx.finger_targets[1] if close_ctx.finger_targets[1] is not None else 0.0,
                 ], dtype=np.float64))
 
                 # ── CLOSE 诊断：每 10 step，或接触状态发生变化时立即打印。
                 # 只读取当前 MuJoCo 状态，不改变任何控制逻辑。
                 _cl_contact_tuple = (bool(tc["link7"]), bool(tc["link8"]))
                 _cl_diag_due = (state_step % 10 == 0 or
-                                _cl_diag_prev_contact is None or
-                                _cl_contact_tuple != _cl_diag_prev_contact)
+                                close_ctx.diag_prev_contact is None or
+                                _cl_contact_tuple != close_ctx.diag_prev_contact)
                 if _cl_diag_due:
-                    try:
-                        import mujoco as _mj_cdlog
-                        _cd = _close_contact_diag(args.object)
-                        _obj_bid = _mj_cdlog.mj_name2id(
-                            env._model, _mj_cdlog.mjtObj.mjOBJ_BODY, args.object)
-                        if _obj_bid >= 0:
-                            _obj_p = env._data.xpos[_obj_bid].astype(np.float64).copy()
-                            _obj_R = env._data.xmat[_obj_bid].reshape(3, 3).astype(np.float64).copy()
-                        else:
-                            _obj_p = None; _obj_R = None
-
-                        if _obj_p is not None and _cl_diag_obj_p0 is not None:
-                            _dp_mm = (_obj_p - _cl_diag_obj_p0) * 1000.0
-                        else:
-                            _dp_mm = np.array([np.nan, np.nan, np.nan])
-                        if _obj_R is not None and _cl_diag_obj_R0 is not None:
-                            _dR = _obj_R @ _cl_diag_obj_R0.T
-                            _cth = float(np.clip((np.trace(_dR) - 1.0) * 0.5, -1.0, 1.0))
-                            _dtheta_deg = math.degrees(math.acos(_cth))
-                        else:
-                            _dtheta_deg = float('nan')
-
-                        _gt = env.get_gripper_target()
-                        _gcmd = np.asarray(getattr(env, '_grip_cmd', _gt), dtype=np.float64).copy()
-                        _gctrl = env._data.ctrl[np.asarray(env._grip_ctrl_idx, dtype=np.int32)].copy()
-                        _gmode = "FORCE" if getattr(env, 'gripper_force_mode', False) else "POS"
-
-                        def _fmt_side(_name):
-                            _x = _cd[_name]
-                            _dist = '--' if _x['min_dist'] is None else f"{_x['min_dist']*1000:+.3f}mm"
-                            _oth = ','.join(_x['others']) if _x['others'] else '-'
-                            return (f"{_name}:c={_x['ncon']} dist={_dist} "
-                                    f"Fn={_x['normal_force']:.2f}N Ft={_x['tangential_force']:.2f}N "
-                                    f"other={_oth}")
-
-                        print(
-                            f"[CDIAG] CLOSE step={state_step:03d} contact="
-                            f"{int(tc['link7'])}/{int(tc['link8'])} "
-                            f"q=[{q7c:+.4f},{q8c:+.4f}] "
-                            f"mode={_gmode} "
-                            f"target=[{_gt[0]:+.4f},{_gt[1]:+.4f}] "
-                            f"cmd=[{_gcmd[0]:+.4f},{_gcmd[1]:+.4f}] "
-                            f"ctrl=[{_gctrl[0]:+.2f},{_gctrl[1]:+.2f}]N "
-                            f"obj_dmm={np.round(_dp_mm,3)} obj_dR={_dtheta_deg:.3f}deg",
-                            flush=True)
-                        print(f"[CDIAG]   {_fmt_side('link7')} | {_fmt_side('link8')}",
-                              flush=True)
-                    except Exception as _ce:
-                        print(f"[CDIAG] CLOSE diagnostic error: {_ce}", flush=True)
+                    _diag_print_close_step(
+                        env, args.object, state_step, tc, q7c, q8c,
+                        close_ctx.diag_obj_pose0,
+                    )
 
                     # 深度 PRE 诊断：与当前 CDIAG 同一时刻；随后在 env.step() 后打印 POST。
                     # PRE 的 ctrl 是上一物理步留下的值，因此只用于和 POST 对照，不单独作因果判断。
                     try:
-                        _print_finger_deep_diag("CPRE", state_step, args.object, force_contacts=False)
-                        _cl_deep_post_pending = dict(
+                        _diag_print_finger_deep(env, "CPRE", state_step, args.object, force_contacts=False)
+                        close_ctx.deep_post_pending = dict(
                             step=int(state_step),
                             pre_contact=_cl_contact_tuple,
                         )
                     except Exception as _de_pre:
                         print(f"[CPRE] diagnostic error: {_de_pre}", flush=True)
-                        _cl_deep_post_pending = None
-                _cl_diag_prev_contact = _cl_contact_tuple
+                        close_ctx.deep_post_pending = None
+                close_ctx.diag_prev_contact = _cl_contact_tuple
 
                 state_step += 1
                 if state_step % 20 == 0:
@@ -2393,19 +2163,19 @@ def main():
                           f"contact={int(tc['link7'])}/{int(tc['link8'])}", flush=True)
 
                 if state_step >= BUDGET[PipelineState.CLOSE]:
-                    frz_s = [None if x is None else round(float(x), 4) for x in _cl_frz]
+                    frz_s = [None if x is None else round(float(x), 4) for x in close_ctx.finger_targets]
 
                     # 不再要求最后一帧恰好 1/1：使用最近窗口的接触率判断。
-                    if len(_cl_contact_hist) > 0:
-                        r7 = sum(int(x[0]) for x in _cl_contact_hist) / len(_cl_contact_hist)
-                        r8 = sum(int(x[1]) for x in _cl_contact_hist) / len(_cl_contact_hist)
+                    if len(close_ctx.contact_hist) > 0:
+                        r7 = sum(int(x[0]) for x in close_ctx.contact_hist) / len(close_ctx.contact_hist)
+                        r8 = sum(int(x[1]) for x in close_ctx.contact_hist) / len(close_ctx.contact_hist)
                     else:
                         r7 = r8 = 0.0
 
                     # 最近窗口内 cube 的净位移，用于排除“虽然反复接触但物体仍在滑”的情况。
-                    if len(_cl_obj_pos_hist) >= 2:
+                    if len(close_ctx.obj_pos_hist) >= 2:
                         close_recent_move = float(np.linalg.norm(
-                            _cl_obj_pos_hist[-1] - _cl_obj_pos_hist[0]
+                            close_ctx.obj_pos_hist[-1] - close_ctx.obj_pos_hist[0]
                         ))
                     else:
                         close_recent_move = float("inf")
@@ -2427,9 +2197,8 @@ def main():
 
                     env._grip_max_delta = _GRIP_MAX_DELTA_NORMAL
 
-                    # Diagnostic experiment: always enter LIFT after CLOSE budget expires.
-                    # Keep close_stable and all diagnostics above for observation only;
-                    # do not use contact rate / cube motion to reject the grasp here.
+                    # CLOSE 稳定性指标当前仅用于诊断；完成 budget 后始终进入 LIFT，
+                    # 不用接触率/物体位移在这里拒绝抓取。
                     if close_stable:
                         print(
                             f"[SM] CLOSE stable -> LIFT: contact_rate={r7:.2f}/{r8:.2f}, "
@@ -2438,7 +2207,7 @@ def main():
                         )
                     else:
                         print(
-                            f"[TEST] CLOSE acceptance bypassed -> LIFT anyway: "
+                            f"[DIAG] CLOSE not stable by diagnostic metric -> LIFT: "
                             f"contact_rate={r7:.2f}/{r8:.2f}, "
                             f"obj_move={close_recent_move*1000:.2f}mm",
                             flush=True
@@ -2447,73 +2216,60 @@ def main():
                     # IMPORTANT: keep FORCE HOLD active into LIFT exactly as before on a
                     # successful CLOSE.  This test is intended to reveal whether the
                     # visually plausible grasp can actually support the object.
-                    _lift_stage = 0
-                    state = PipelineState.LIFT
+                    next_state = PipelineState.LIFT
                     state_step = 0
 
-            elif state == PipelineState.LIFT:
+            elif current_state == PipelineState.LIFT:
                 # 新LIFT：先用j2/j3把夹爪抬离桌面，再全关节收回ARM_SIDE。
                 # Stage1不再要求world x/y不变，也不做DLS/姿态保持。
                 cmd_vx = 0.0; cmd_vy = 0.0; cmd_wz = 0.0
                 cur_q = _get_arm_q(jpos)
-                p_cur_w, R_cur_w = _gb_pose_world()
+                p_cur_w, _ = _gb_pose_world()
 
                 env.set_gripper_target(np.array([
-                    _cl_frz[0] if _cl_frz[0] is not None else 0.0,
-                    _cl_frz[1] if _cl_frz[1] is not None else 0.0,
+                    close_ctx.finger_targets[0] if close_ctx.finger_targets[0] is not None else 0.0,
+                    close_ctx.finger_targets[1] if close_ctx.finger_targets[1] is not None else 0.0,
                 ], dtype=np.float64))
 
-                if _lift_stage == 0:
-                    _lift_stage = 1
-                    _lift_q_stage1_start = cur_q.copy()
-                    _lift_q_stage1_cmd = cur_q.copy()
-                    _lift_stage1_step = 0
-                    _lift_ee_p_start = p_cur_w.copy()
-                    _lift_q_retract0 = None
-                    _lift_stage2_step = 0
-                    _lift_fail_count = 0
-                    _lift_hold_remaining = _LIFT_HOLD_STEPS
-                    _lift_hold_seen = 0
-                    _lift_hold_contacts[:] = 0
-                    _lift_best_err = None
-                    _lift_diverge_count = 0
+                if lift_ctx.stage == 0:
+                    lift_ctx.begin(cur_q, p_cur_w, _LIFT_HOLD_STEPS)
 
                     try:
                         _lift_obj_p0 = np.asarray(
                             env.get_object_pos(args.object), dtype=np.float64).copy()
-                        _lift_obj_z_start = float(_lift_obj_p0[2])
-                        _lift_hold_obj_p0 = _lift_obj_p0.copy()
+                        lift_ctx.obj_z_start = float(_lift_obj_p0[2])
+                        lift_ctx.hold_obj_p0 = _lift_obj_p0.copy()
                     except Exception:
-                        _lift_obj_z_start = None
-                        _lift_hold_obj_p0 = None
+                        lift_ctx.obj_z_start = None
+                        lift_ctx.hold_obj_p0 = None
 
                     # 只在LIFT开始时做一次MuJoCo FK方向检查：
                     # 沿j2/j3 -> ARM_SIDE各试探最多0.01rad，确认末端z会增加。
-                    _q_test = _lift_q_stage1_start.copy()
+                    _q_test = lift_ctx.q_stage1_start.copy()
                     for _ji in (1, 2):
                         _dq_to_side = float(ARM_SIDE_ANGLES[_ji] - _q_test[_ji])
                         _q_test[_ji] += float(np.clip(
                             _dq_to_side, -_LIFT_STAGE1_TEST_DQ, _LIFT_STAGE1_TEST_DQ))
                     try:
-                        _p_fk0 = _gb_pos_for_arm_q(_lift_q_stage1_start)
+                        _p_fk0 = _gb_pos_for_arm_q(lift_ctx.q_stage1_start)
                         _p_fk1 = _gb_pos_for_arm_q(_q_test)
-                        _lift_fk_dxyz = _p_fk1 - _p_fk0
+                        lift_ctx.fk_dxyz = _p_fk1 - _p_fk0
                     except Exception as _e:
-                        _lift_fk_dxyz = np.array([np.nan, np.nan, np.nan])
+                        lift_ctx.fk_dxyz = np.array([np.nan, np.nan, np.nan])
                         print(f"[WARN] LIFT FK direction check failed: {_e} -> ARM_INIT retry",
                               flush=True)
                         grasp_result = None
-                        _lift_stage = 0
-                        state = PipelineState.ARM_INIT
+                        lift_ctx.reset()
+                        next_state = PipelineState.ARM_INIT
                         state_step = 0
 
-                    if state == PipelineState.LIFT:
-                        _fk_dz = float(_lift_fk_dxyz[2])
+                    if next_state == current_state:
+                        _fk_dz = float(lift_ctx.fk_dxyz[2])
                         print(
                             f"[SM] LIFT stage1 joint-lift init: "
-                            f"ee_world={np.round(_lift_ee_p_start,4)}, "
-                            f"q_start={np.round(_lift_q_stage1_start,3)}, "
-                            f"FK_test_dxyz_mm={np.round(_lift_fk_dxyz*1000.0,3)}",
+                            f"ee_world={np.round(lift_ctx.ee_p_start,4)}, "
+                            f"q_start={np.round(lift_ctx.q_stage1_start,3)}, "
+                            f"FK_test_dxyz_mm={np.round(lift_ctx.fk_dxyz*1000.0,3)}",
                             flush=True)
                         if (not np.isfinite(_fk_dz)) or _fk_dz <= _LIFT_STAGE1_FK_MIN_DZ:
                             print(
@@ -2521,43 +2277,43 @@ def main():
                                 f"pred_dz={_fk_dz*1000.0:.3f}mm -> ARM_INIT retry",
                                 flush=True)
                             grasp_result = None
-                            _lift_stage = 0
-                            state = PipelineState.ARM_INIT
+                            lift_ctx.reset()
+                            next_state = PipelineState.ARM_INIT
                             state_step = 0
 
-                if _lift_stage == 1 and state == PipelineState.LIFT:
+                if lift_ctx.stage == 1 and next_state == current_state:
                     p_cur_w, _ = _gb_pose_world()
-                    _ee_dp = p_cur_w - _lift_ee_p_start
+                    _ee_dp = p_cur_w - lift_ctx.ee_p_start
                     _ee_rise = float(_ee_dp[2])
                     try:
                         _obj_z_now = float(env.get_object_pos(args.object)[2])
                     except Exception:
                         _obj_z_now = float('nan')
                     _obj_rise = (
-                        _obj_z_now - _lift_obj_z_start
-                        if _lift_obj_z_start is not None and np.isfinite(_obj_z_now)
+                        _obj_z_now - lift_ctx.obj_z_start
+                        if lift_ctx.obj_z_start is not None and np.isfinite(_obj_z_now)
                         else float('nan'))
 
                     # CLOSE后先短暂静置，沿用已经验证过的窗口接触稳定性检查。
-                    if _lift_hold_remaining > 0:
-                        _arm_step(_lift_q_stage1_start.copy())
+                    if lift_ctx.hold_remaining > 0:
+                        _arm_step(lift_ctx.q_stage1_start.copy())
 
                         _tc_hold = _fingers_contact(args.object)
-                        _lift_hold_seen += 1
-                        _lift_hold_contacts[0] += int(_tc_hold["link7"])
-                        _lift_hold_contacts[1] += int(_tc_hold["link8"])
-                        _lift_hold_remaining -= 1
+                        lift_ctx.hold_seen += 1
+                        lift_ctx.hold_contacts[0] += int(_tc_hold["link7"])
+                        lift_ctx.hold_contacts[1] += int(_tc_hold["link8"])
+                        lift_ctx.hold_remaining -= 1
 
-                        if _lift_hold_remaining == 0:
-                            _den = max(_lift_hold_seen, 1)
-                            _r7 = float(_lift_hold_contacts[0]) / _den
-                            _r8 = float(_lift_hold_contacts[1]) / _den
+                        if lift_ctx.hold_remaining == 0:
+                            _den = max(lift_ctx.hold_seen, 1)
+                            _r7 = float(lift_ctx.hold_contacts[0]) / _den
+                            _r8 = float(lift_ctx.hold_contacts[1]) / _den
                             try:
                                 _obj_now = np.asarray(
                                     env.get_object_pos(args.object), dtype=np.float64)
                                 _hold_move = (
-                                    float(np.linalg.norm(_obj_now - _lift_hold_obj_p0))
-                                    if _lift_hold_obj_p0 is not None else float('nan'))
+                                    float(np.linalg.norm(_obj_now - lift_ctx.hold_obj_p0))
+                                    if lift_ctx.hold_obj_p0 is not None else float('nan'))
                             except Exception:
                                 _hold_move = float('nan')
 
@@ -2577,8 +2333,8 @@ def main():
                                     f"obj_move={_move_msg} -> ARM_INIT retry",
                                     flush=True)
                                 grasp_result = None
-                                _lift_stage = 0
-                                state = PipelineState.ARM_INIT
+                                lift_ctx.reset()
+                                next_state = PipelineState.ARM_INIT
                                 state_step = 0
                             else:
                                 _move_msg = (
@@ -2589,14 +2345,14 @@ def main():
                                     f"contact_rate={_r7:.2f}/{_r8:.2f}, "
                                     f"obj_move={_move_msg} -> j2/j3 lift",
                                     flush=True)
-                        if state == PipelineState.LIFT:
+                        if next_state == current_state:
                             state_step += 1
 
                     # 当前调轨迹阶段：Stage1 -> Stage2只看末端实际z上升20mm。
                     elif _ee_rise >= _LIFT_STAGE1_EE_RISE:
-                        _lift_stage = 2
-                        _lift_q_retract0 = cur_q.copy()
-                        _lift_stage2_step = 0
+                        lift_ctx.stage = 2
+                        lift_ctx.q_retract0 = cur_q.copy()
+                        lift_ctx.stage2_step = 0
                         state_step = 0
                         _obj_msg = (
                             f"{_obj_rise*1000.0:+.1f}mm"
@@ -2614,31 +2370,31 @@ def main():
                             f"ee_dxyz_mm={np.round(_ee_dp*1000.0,2)} "
                             f"-> ARM_INIT retry", flush=True)
                         grasp_result = None
-                        _lift_stage = 0
-                        state = PipelineState.ARM_INIT
+                        lift_ctx.reset()
+                        next_state = PipelineState.ARM_INIT
                         state_step = 0
 
                     else:
                         # Stage1：j1、j4~j6保持LIFT开始时角度；
                         # 仅j2/j3沿固定方向缓慢逼近ARM_SIDE。
-                        q_cmd = _lift_q_stage1_start.copy()
+                        q_cmd = lift_ctx.q_stage1_start.copy()
                         for _ji in (1, 2):
                             _remain = float(
-                                ARM_SIDE_ANGLES[_ji] - _lift_q_stage1_cmd[_ji])
+                                ARM_SIDE_ANGLES[_ji] - lift_ctx.q_stage1_cmd[_ji])
                             _step = float(np.clip(
                                 _remain, -_LIFT_STAGE1_MAX_DQ, _LIFT_STAGE1_MAX_DQ))
-                            _lift_q_stage1_cmd[_ji] += _step
-                            q_cmd[_ji] = _lift_q_stage1_cmd[_ji]
+                            lift_ctx.q_stage1_cmd[_ji] += _step
+                            q_cmd[_ji] = lift_ctx.q_stage1_cmd[_ji]
                         q_cmd = np.clip(q_cmd, _ARM_LO, _ARM_HI)
                         _arm_step(q_cmd)
-                        _lift_stage1_step += 1
+                        lift_ctx.stage1_step += 1
 
-                        if _lift_stage1_step == 1 or _lift_stage1_step % 25 == 0:
+                        if lift_ctx.stage1_step == 1 or lift_ctx.stage1_step % 25 == 0:
                             _obj_msg = (
                                 f"{_obj_rise*1000.0:+.1f}mm"
                                 if np.isfinite(_obj_rise) else "unavailable")
                             print(
-                                f"[DIAG] LIFT stage1 joint step {_lift_stage1_step}: "
+                                f"[DIAG] LIFT stage1 joint step {lift_ctx.stage1_step}: "
                                 f"ee_dxyz_mm={np.round(_ee_dp*1000.0,2)} "
                                 f"q2/q3=[{cur_q[1]:+.3f},{cur_q[2]:+.3f}] "
                                 f"cmd=[{q_cmd[1]:+.3f},{q_cmd[2]:+.3f}] "
@@ -2646,30 +2402,30 @@ def main():
                                 flush=True)
                         state_step += 1
 
-                elif _lift_stage == 2 and state == PipelineState.LIFT:
-                    _lift_stage2_step += 1
-                    a = min(1.0, _lift_stage2_step / max(_LIFT_RETRACT_STEPS, 1))
+                elif lift_ctx.stage == 2 and next_state == current_state:
+                    lift_ctx.stage2_step += 1
+                    a = min(1.0, lift_ctx.stage2_step / max(_LIFT_RETRACT_STEPS, 1))
                     a_s = a * a * (3.0 - 2.0 * a)
-                    q_cmd = _lift_q_retract0 + a_s * (ARM_SIDE_ANGLES - _lift_q_retract0)
+                    q_cmd = lift_ctx.q_retract0 + a_s * (ARM_SIDE_ANGLES - lift_ctx.q_retract0)
                     _arm_step(q_cmd)
                     state_step += 1
 
-                    if _lift_stage2_step % 50 == 0:
+                    if lift_ctx.stage2_step % 50 == 0:
                         p_now, _ = _gb_pose_world()
-                        _ee_dp2 = p_now - _lift_ee_p_start
+                        _ee_dp2 = p_now - lift_ctx.ee_p_start
                         try:
                             obj_z = float(env.get_object_pos(args.object)[2])
                         except Exception:
                             obj_z = float('nan')
                         obj_rise = (
-                            obj_z - _lift_obj_z_start
-                            if _lift_obj_z_start is not None and np.isfinite(obj_z)
+                            obj_z - lift_ctx.obj_z_start
+                            if lift_ctx.obj_z_start is not None and np.isfinite(obj_z)
                             else float('nan'))
                         _obj_msg = (
                             f"{obj_rise*1000.0:+.1f}mm"
                             if np.isfinite(obj_rise) else "unavailable")
                         print(
-                            f"[DIAG] LIFT stage2 {_lift_stage2_step}/{_LIFT_RETRACT_STEPS}: "
+                            f"[DIAG] LIFT stage2 {lift_ctx.stage2_step}/{_LIFT_RETRACT_STEPS}: "
                             f"ee_dxyz_mm={np.round(_ee_dp2*1000.0,2)} "
                             f"obj_rise={_obj_msg}", flush=True)
 
@@ -2678,10 +2434,10 @@ def main():
                             obj_z = float(env.get_object_pos(args.object)[2])
                         except Exception:
                             obj_z = 0.0
-                        obj_rise = (obj_z - _lift_obj_z_start
-                                    if _lift_obj_z_start is not None else 0.0)
+                        obj_rise = (obj_z - lift_ctx.obj_z_start
+                                    if lift_ctx.obj_z_start is not None else 0.0)
                         p_now, _ = _gb_pose_world()
-                        _ee_dp2 = p_now - _lift_ee_p_start
+                        _ee_dp2 = p_now - lift_ctx.ee_p_start
                         print(
                             f"[SM] LIFT trajectory done: "
                             f"ee_dxyz_mm={np.round(_ee_dp2*1000.0,2)}, "
@@ -2690,49 +2446,52 @@ def main():
 
                         # 最终抓取成功判据暂时沿用旧逻辑；它发生在完整Stage2之后，
                         # 不会阻止我们观察完整轨迹。Stage1->2已经只看EE高度。
-                        if _lift_obj_z_start is not None:
+                        if lift_ctx.obj_z_start is not None:
                             lift_success = (obj_rise > 0.04)
                         else:
                             lift_success = (obj_z > 0.75)
                         if lift_success:
-                            state = PipelineState.PAN_NEG_X
+                            next_state = PipelineState.PAN_NEG_X
                         else:
                             print(
                                 "[SM] Object not lifted after full LIFT trajectory! "
                                 "Retry ARM_INIT", flush=True)
                             env.disable_gripper_force_hold()
                             grasp_result = None
-                            state = PipelineState.ARM_INIT
-                        _lift_stage = 0
+                            next_state = PipelineState.ARM_INIT
+                        lift_ctx.reset()
                         state_step = 0
 
-            elif state == PipelineState.PAN_NEG_X:
-                # LIFT 后先沿世界 -X 平移约 0.5m，再交给 Nav2。
-                # 当前朝向约 +Y：body +vy = world -X，因此 world-X 误差映射到 vy 时取反。
+            elif current_state == PipelineState.PAN_NEG_X:
+                # LIFT 后沿世界 -X 平移约 0.5m，再交给 Nav2。与其他 PAN 一样直接
+                # 在世界系闭环，再根据实时 yaw 转成 body vx/vy。
                 if _pan_neg_x_goal is None:
                     _pan_neg_x_goal = float(pos_w[0]) - 0.5
                     print(f"[SM] PAN_NEG_X start: x={pos_w[0]:.3f} -> "
                           f"goal={_pan_neg_x_goal:.3f} (-0.5m)", flush=True)
                 _px_w = float(_pan_neg_x_goal) - float(pos_w[0])
-                cmd_vx, cmd_vy, cmd_wz, _pan_done, _pd = _pan_axis_control(
-                    PipelineState.PAN_NEG_X, _px_w, 'vy', -1.0, math.pi / 2,
+                cmd_vx, cmd_vy, cmd_wz, _pan_done, _pd = _pan_world_axis_control(
+                    PipelineState.PAN_NEG_X, _px_w, 'x', math.pi / 2,
                     pos_tol=0.03, resume_tol=0.08, kp=1.0, vmax=0.25,
-                    yaw_now=yaw, base_lin_vel=rs["lin_vel"])
+                    yaw_now=yaw, base_lin_vel=rs["lin_vel"],
+                    settle_use_vxy=True)
                 _gripper_step(close=True)
                 if state_step % 25 == 0:
-                    print(f"[SM] PAN_NEG_X step {state_step}: px_err={_pd['err']:.3f}m "
+                    print(f"[SM] PAN_NEG_X step {state_step}: px_err={_pd['signed_err']:+.3f}m "
                           f"cmd=({cmd_vx:+.3f},{cmd_vy:+.3f},{cmd_wz:+.3f}) "
-                          f"vxy={_pd['vxy']:.3f} settling={int(_pd['settling'])} "
+                          f"vx_world={_pd['axis_vel']:+.3f} vxy={_pd['vxy']:.3f} "
+                          f"yaw_err={math.degrees(_pd['yaw_err']):+.2f}deg "
+                          f"settling={int(_pd['settling'])} "
                           f"settle={_pd['settle_count']}/{_PAN_SETTLE_STEPS}", flush=True)
                 state_step += 1
-                if _pan_done or state_step >= 450:
+                if _pan_done or state_step >= PAN_NEG_X_MAX_STEPS:
                     _why = "settled" if _pan_done else "timeout"
                     print(f"[SM] PAN_NEG_X done ({_why}) -> NAV2_DEST", flush=True)
                     _pan_neg_x_goal = None
-                    state = PipelineState.NAV2_DEST
+                    next_state = PipelineState.NAV2_DEST
                     state_step = 0
 
-            elif state == PipelineState.NAV2_DEST:
+            elif current_state == PipelineState.NAV2_DEST:
                 # 发送 Nav2 目标到 destination，等待完成。
                 # 不覆盖 cmd：与 NAV 阶段一致，主循环开头 get_cmd_vel() 读到的
                 # Nav2 速度指令直接进 policy，机器人沿 Nav2 路径驶向 destination。
@@ -2744,16 +2503,16 @@ def main():
                     _dest_goal_sent = True
                     print(f"[SM] NAV2_DEST goal sent: {args.destination}",
                           flush=True)
-                _nd, _nf = bridge.get_nav_status()
+                _nd, _ = bridge.get_nav_status()
                 state_step += 1
-                if _nd or state_step >= 6000:
+                if _nd or state_step >= NAV2_DEST_MAX_STEPS:
                     _reason2 = "done" if _nd else "timeout"
                     print(f"[SM] NAV2_DEST {_reason2} -> ALIGN_YAW_2", flush=True)
                     _dest_goal_sent = False
-                    state = PipelineState.ALIGN_YAW_2
+                    next_state = PipelineState.ALIGN_YAW_2
                     state_step = 0
 
-            elif state == PipelineState.ALIGN_YAW_2:
+            elif current_state == PipelineState.ALIGN_YAW_2:
                 # 对齐到 -Y；与 ALIGN_YAW_1 使用同一套有效转速 + 停稳判定。
                 cmd_vx = 0.0; cmd_vy = 0.0
                 cmd_wz, _align_done, _ad = _align_yaw_control(
@@ -2766,13 +2525,13 @@ def main():
                           f"err={math.degrees(_ad['err']):+.2f}deg "
                           f"cmd_wz={cmd_wz:+.3f} actual_wz={_ad['wz_actual']:+.3f} "
                           f"settle={_ad['settle_count']}/{_ALIGN_SETTLE_STEPS}", flush=True)
-                if _align_done or state_step >= 600:
+                if _align_done or state_step >= ALIGN_YAW_MAX_STEPS:
                     _why = "settled" if _align_done else "timeout"
                     print(f"[SM] ALIGN_YAW_2 done ({_why}) -> PAN_DES_X", flush=True)
-                    state = PipelineState.PAN_DES_X
+                    next_state = PipelineState.PAN_DES_X
                     state_step = 0
 
-            elif state == PipelineState.PAN_DES_X:
+            elif current_state == PipelineState.PAN_DES_X:
                 # 第二张桌前精调世界 X。先在世界系生成纯 X 方向速度，再按实时 yaw
                 # 转到机体系 vx/vy；因此即使 yaw 与 -π/2 有小误差，实际轨迹仍沿 world X。
                 _pdx_w = float(args.destination[0]) - float(pos_w[0])
@@ -2791,7 +2550,7 @@ def main():
                           f"settling={int(_pd['settling'])} "
                           f"settle={_pd['settle_count']}/{_PAN_SETTLE_STEPS}", flush=True)
                 state_step += 1
-                if _pan_done or state_step >= 500:
+                if _pan_done or state_step >= PAN_MAX_STEPS:
                     _why = "settled" if _pan_done else "timeout"
                     print(f"[SM] PAN_DES_X done ({_why}) -> ROTATE", flush=True)
                     _rotate_j1_start = _get_arm_q(jpos)[0]
@@ -2801,10 +2560,10 @@ def main():
                         math.pi / 2, 1.8, -1.8,
                         ARM_SIDE_ANGLES[3], ARM_SIDE_ANGLES[4], ARM_SIDE_ANGLES[5]
                     ], dtype=np.float64)
-                    state = PipelineState.ROTATE
+                    next_state = PipelineState.ROTATE
                     state_step = 0
 
-            elif state == PipelineState.ROTATE:
+            elif current_state == PipelineState.ROTATE:
                 # 插值 j1→+π/2, j2→1.8, j3→-1.8 over 600 steps。
                 # 用余弦剖面（起步/收尾速度为零）而非线性：线性插值是恒角速度的
                 # 速度阶跃，臂 PD 跟踪快速斜坡产生的力矩反作用到未锁的躯干，
@@ -2813,19 +2572,19 @@ def main():
                 # 同时 ROTATE 期间底座已加物理锁（见 _set_base_physical_lock 调用处）。
                 cmd_vx = 0.0; cmd_vy = 0.0; cmd_wz = 0.0
                 _gripper_step(close=True)
-                _a_r = 0.5 * (1.0 - math.cos(math.pi * min(1.0, state_step / 600.0)))
+                _a_r = 0.5 * (1.0 - math.cos(math.pi * min(1.0, state_step / float(ROTATE_STEPS))))
                 _qr  = _get_arm_q(jpos).copy()
                 _qr[0] = _rotate_j1_start + _a_r * (_rotate_j_target[0] - _rotate_j1_start)
                 _qr[1] = _rotate_j2_start + _a_r * (_rotate_j_target[1] - _rotate_j2_start)
                 _qr[2] = _rotate_j3_start + _a_r * (_rotate_j_target[2] - _rotate_j3_start)
                 _arm_step(_qr)
                 state_step += 1
-                if state_step >= 600:
+                if state_step >= ROTATE_STEPS:
                     print("[SM] ROTATE done -> PUT_DOWN", flush=True)
-                    state = PipelineState.PUT_DOWN
+                    next_state = PipelineState.PUT_DOWN
                     state_step = 0
 
-            elif state == PipelineState.PUT_DOWN:
+            elif current_state == PipelineState.PUT_DOWN:
                 # 松开夹爪 100 步。进入放置阶段时退出恒力夹持，恢复位置PD张开。
                 if state_step == 0:
                     env.disable_gripper_force_hold()
@@ -2833,20 +2592,13 @@ def main():
                 _gripper_step(close=False)
                 state_step += 1
                 if state_step % 20 == 0:
-                    print(f"[SM] PUT_DOWN step {state_step}/100", flush=True)
-                if state_step >= 100:
+                    print(f"[SM] PUT_DOWN step {state_step}/{PUT_DOWN_STEPS}", flush=True)
+                if state_step >= PUT_DOWN_STEPS:
                     print("[SM] PUT_DOWN done -> DONE", flush=True)
-                    state = PipelineState.DONE
+                    next_state = PipelineState.DONE
 
             # ── 无机械臂控制的过渡阶段：每帧保持 ARM_INIT_ANGLES，防止机械臂下垂引起抖动 ──
-            _ARM_IDLE_STATES = {
-                PipelineState.ALIGN_YAW_1,
-                PipelineState.PAN_VX,
-                PipelineState.PAN_VY,
-                PipelineState.PAN_VX_FINAL,
-                PipelineState.ALIGN_YAW,
-            }
-            if state in _ARM_IDLE_STATES:
+            if current_state in _ARM_IDLE_STATES:
                 _arm_step(ARM_INIT_ANGLES)
 
             # ── 构造 obs，运行 policy ──
@@ -2856,44 +2608,36 @@ def main():
             )
             obs_t = torch.tensor(obs_np, dtype=torch.float32, device=device).unsqueeze(0)
 
-            # FREEZE_STATES_ACT：policy action 清零（与原版 navigate_to_goal_nav2_whole.py 完全一致）
-            # ALIGN_YAW_1/PAN_VX/PAN_VY/ALIGN_YAW 不在此集合中：
-            # 这些阶段 policy 完整输出 action，靠 obs 中的 cmd_vel 驱动旋转/平移。
-            _FREEZE_STATES_ACT = {
-                PipelineState.ARM_INIT, PipelineState.SCAN,
-                PipelineState.PRE_GRASP,
-                PipelineState.ORIENT, PipelineState.REACH,
-                PipelineState.CLOSE, PipelineState.LIFT,
-            }
+            # 机械臂/抓取阶段不需要 locomotion policy 驱动底盘：将 locomotion action 清零。
+            # 底盘位置本身由下方 MuJoCo equality weld 约束；这里清零只是避免腿/轮继续
+            # 执行上一阶段的运动动作，不承担“冻结位置”的职责。
             with torch.inference_mode():
                 action_t = policy(obs_t)
             action_np = action_t.cpu().numpy().flatten()[:16]
-            if state in _FREEZE_STATES_ACT:
+            if current_state in _LOCOMOTION_DISABLED_STATES:
                 action_np = np.zeros(16, dtype=np.float32)
             last_action = action_np.copy()
 
-            # ── CLOSE/LIFT：用 MuJoCo 物理 weld 固定底盘 ──
+            # ── 抓取阶段：统一用 MuJoCo 物理 weld 固定底盘 ──
             # 在 env.step 前同步状态，保证约束参与本轮每一个 physics substep。
-            # CLOSE -> LIFT 时保持同一个 weld/anchor，不重新捕获位姿；
-            # 一旦离开 LIFT（含失败回 ARM_INIT）则在下一次 physics step 前解除。
-            _set_base_physical_lock(
-                state in {PipelineState.CLOSE, PipelineState.LIFT,
-                          PipelineState.ROTATE}
-            )
+            # ARM_INIT 首次进入时捕获一次 anchor；SCAN/GRASP_PLAN/PRE_GRASP/ORIENT/
+            # REACH/CLOSE/LIFT 全程保持同一个 anchor，不在状态切换时重新捕获。
+            # 离开 LIFT 进入 PAN_NEG_X 时解除。ROTATE 仍独立使用相同物理锁机制。
+            _set_base_physical_lock(current_state in _BASE_LOCK_STATES)
 
             # ── 执行 env.step ──
             env.step(action_np)
 
             # CLOSE 深度 POST 诊断：真正执行完本轮 policy step（含全部 physics substeps）后读取。
-            # 即使 CLOSE 在本轮末尾已经把 state 切到 LIFT，也仍打印这最后一个 CLOSE step 的结果。
-            if _cl_deep_post_pending is not None:
+            # 即使 CLOSE 在本轮末尾已经请求切到 LIFT，也仍先打印这最后一个 CLOSE step 的结果。
+            if close_ctx.deep_post_pending is not None:
                 try:
-                    _pd = _cl_deep_post_pending
+                    _pd = close_ctx.deep_post_pending
                     _post_tc = _fingers_contact(args.object)
                     _post_tuple = (bool(_post_tc["link7"]), bool(_post_tc["link8"]))
                     _changed_during_step = (_post_tuple != tuple(_pd["pre_contact"]))
-                    _print_finger_deep_diag(
-                        "CPOST", int(_pd["step"]), args.object,
+                    _diag_print_finger_deep(
+                        env, "CPOST", int(_pd["step"]), args.object,
                         force_contacts=bool(_changed_during_step))
                     if _changed_during_step:
                         print(
@@ -2903,432 +2647,42 @@ def main():
                             flush=True)
                 except Exception as _de_post:
                     print(f"[CPOST] diagnostic error: {_de_post}", flush=True)
-                _cl_deep_post_pending = None
+                close_ctx.deep_post_pending = None
 
-            # 物理锁定残余漂移：CLOSE/LIFT 每 10 个状态步打印一次。
-            if _base_lock["active"] and state in {PipelineState.CLOSE, PipelineState.LIFT}:
-                if state_step % 10 == 0:
+            # 物理锁定残余漂移：抓取链路与 ROTATE 中每 25 个状态步打印一次。
+            if _base_lock["active"] and current_state in _BASE_LOCK_STATES:
+                if state_step % 25 == 0:
                     _print_base_lock_diag("BASE_LOCK")
+
+            # 本轮物理执行已经结束，现在才正式提交状态切换。
+            state = next_state
 
             time.sleep(0.005)  # 实时 1×：让 MuJoCo passive viewer 有时间处理鼠标/键盘事件
 
-            # FREEZE_STATES：旧 set_root_pose() 仅保留给抓取前阶段。
-            # CLOSE/LIFT 已改为 MuJoCo equality weld 物理固定，严禁在这两个阶段瞬移根节点。
-            _FREEZE_STATES = {
-                PipelineState.ARM_INIT, PipelineState.SCAN,
-                PipelineState.GRASP_PLAN,   # AnyGrasp 推理期间锁住底盘，防止漂移影响 IK
-                PipelineState.PRE_GRASP,
-                PipelineState.ORIENT,
-                PipelineState.REACH,        # 抓取推进阶段仍沿用原有冻结逻辑（本次不改）
-            }
-            if state in _FREEZE_STATES and _frozen_pos is not None:
-                env.set_root_pose(_frozen_pos, _frozen_quat)
-
-            # ── 【非阻塞状态块】GRASP_PLAN 异步化为一次性阻塞（在 step 之外执行）──
+            # ── GRASP_PLAN：在本轮 physics step 完成后同步执行一次抓取规划 ──
             if state == PipelineState.GRASP_PLAN and state_step == 0:
-                import subprocess as _subproc
-                cmd_vx = 0.0; cmd_vy = 0.0; cmd_wz = 0.0
-                depth_med = np.median(np.stack(depth_accum, axis=0), axis=0)
-                H, W = depth_med.shape
-                fx_c, fy_c = 616.0, 616.0
-                cx_c, cy_c = W / 2.0, H / 2.0
-                u_g, v_g = np.meshgrid(np.arange(W), np.arange(H))
-                z = depth_med
-                mask = (z > 0.05) & (z < 4.0)
-                z_v  = z[mask]
-                pts  = np.stack([
-                    (u_g[mask] - cx_c) * z_v / fx_c,
-                    (v_g[mask] - cy_c) * z_v / fy_c,
-                    z_v,    # 点云 Z 正值 = 物体方向，与 AnyGrasp 约定一致（AnyGrasp 期望 Z 正 = 前方）
-                ], axis=-1).astype(np.float32)
-                rgb_u = scan_rgb if scan_rgb is not None \
-                    else np.zeros((H, W, 3), np.uint8)
-                cols  = (rgb_u[mask] / 255.0).astype(np.float32)
-                print(f"[SM] GRASP_PLAN: 点云原始 {len(pts)} pts "
-                      f"(z min={z_v.min():.2f} max={z_v.max():.2f})", flush=True)
-
-                # ── 桌面点云保存（RANSAC 之前，供穿桌检测使用）──
-                try:
-                    import cv2 as _cv2_tb
-                    _cols_u8_tb = (cols * 255).astype(np.uint8).reshape(1, -1, 3)
-                    _hsv_tb = _cv2_tb.cvtColor(_cols_u8_tb, _cv2_tb.COLOR_RGB2HSV)[0]
-                    _table_mask_tb = (_hsv_tb[:, 1] < 40) & (_hsv_tb[:, 2] > 40) & (_hsv_tb[:, 2] < 160)
-                    _pts_table_cam = pts[_table_mask_tb]
-                    print(f'[SM] 桌面颜色点云: {len(_pts_table_cam)} pts', flush=True)
-                    if len(_pts_table_cam) > 50:
-                        from arm_ik_mujoco import fk_gripper as _fk_gb_tc, quat_to_rot as _q2r_tc, \
-                            _CAM_OFFSET_POS as _cop_tc, _CAM_OFFSET_ROT as _cor_tc
-                        _R_rob_tc    = _q2r_tc(_quat_w_at_scan.astype(np.float64))
-                        _arm_base_tc = _pos_w_at_scan + _R_rob_tc @ np.array([0., 0., 0.0888])
-                        _T_gb_tc     = _fk_gb_tc(_q_scan_at_scan.astype(np.float64))
-                        _R_c2w_tc    = _R_rob_tc @ _T_gb_tc[:3, :3] @ _cor_tc
-                        _t_cam_tc    = _R_rob_tc @ (_T_gb_tc[:3, :3] @ _cop_tc + _T_gb_tc[:3, 3]) + _arm_base_tc
-                        # 点云是光学系（x右 y下 z前），_R_c2w_tc 已是光学系->世界，无需翻转
-                        _pts_table_cam_c = _pts_table_cam.astype(np.float64).copy()
-                        _pts_table_world = (_pts_table_cam_c @ _R_c2w_tc.T) + _t_cam_tc
-                        # ── 平面过滤：颜色滤波会把白/灰色物体表面也筛进来（如白碗壁、
-                        # 苹果顶高光），它们高于桌面 → clip 取邻域 z 中位数时会误判桌面高度
-                        # （碗场景实测 h=0.7143=碗壁，导致下探提前截断、抓空）。
-                        # 这里只保留主平面（桌面）附近的点；主平面接近水平才采信，否则保留原样。
-                        try:
-                            _tb_nv, _tb_dv, _tb_inl = _ransac_fit_plane(
-                                _pts_table_world.astype(np.float64))
-                            if _tb_nv is None:
-                                print(f'[SM] 桌面点云平面拟合: 点太少({len(_pts_table_world)})，保留原样',
-                                      flush=True)
-                            elif abs(float(_tb_nv[2])) < 0.9:
-                                print(f'[SM] WARN: 桌面点云主平面非水平 '
-                                      f'(normal={np.round(_tb_nv, 3)})，保留原样', flush=True)
-                            else:
-                                _tb_keep = np.abs(_pts_table_world @ _tb_nv - _tb_dv) < 0.010
-                                if int(_tb_keep.sum()) < 50:
-                                    print(f'[SM] WARN: 桌面点云平面过滤后仅 '
-                                          f'{int(_tb_keep.sum())} pts，保留原样', flush=True)
-                                else:
-                                    print(f'[SM] 桌面点云平面过滤: {len(_pts_table_world)} -> '
-                                          f'{int(_tb_keep.sum())} pts '
-                                          f'(z中位={np.median(_pts_table_world[_tb_keep, 2]):.4f})，'
-                                          f'剔除物体表面点', flush=True)
-                                    _pts_table_world = _pts_table_world[_tb_keep]
-                        except Exception as _tb_pf_e:
-                            print(f'[SM] 桌面点云平面过滤失败: {_tb_pf_e}', flush=True)
-                        np.savez('/tmp/table_cloud.npz', points=_pts_table_world.astype(np.float32))
-                        print(f'[SM] 桌面点云已保存 /tmp/table_cloud.npz（{len(_pts_table_world)} pts）', flush=True)
-                    else:
-                        print(f'[SM] WARN: 桌面颜色点云过少({len(_pts_table_cam)} pts)，跳过保存', flush=True)
-                except Exception as _tb_e:
-                    print(f'[SM] 桌面点云保存失败: {_tb_e}', flush=True)
-
-                _keep = _ransac_remove_plane(pts)
-                # 物体点云（RANSAC 去桌面后）：不再喂 AnyGrasp，只用于"抓取点必须落在
-                # 物体上"的几何筛选（见下方 GRASP_PLAN 的落物体筛选）。
-                # AnyGrasp 现在吃**完整点云（含桌面）** —— 让它知道桌子存在，避免产生
-                # 指尖穿桌之类的不可行候选。
-                _pts_obj  = pts[_keep]
-                _cols_obj = cols[_keep]
-                _obj_filter_ok = (len(_pts_obj) >= 200)
-                print(f"[SM] GRASP_PLAN: 完整点云 {len(pts)} pts (喂 AnyGrasp, 含桌面), "
-                      f"物体点云 {len(_pts_obj)} pts (去桌面后)", flush=True)
-                if not _obj_filter_ok:
-                    print(f"[WARN] 物体点云不足 200 pts ({len(_pts_obj)}) "
-                          f"—— 跳过落物体筛选, 全部候选放行", flush=True)
-                if len(pts) < 200:
-                    print("[SM] Too few points — DONE.", flush=True)
-                    state = PipelineState.DONE
-                else:
-                    # 完整点云（含桌面）→ AnyGrasp；物体点云另存供筛选/诊断
-                    np.savez("/tmp/pointcloud.npz", points=pts, colors=cols)
-                    if _obj_filter_ok:
-                        np.savez("/tmp/object_cloud.npz",
-                                 points=_pts_obj, colors=_cols_obj)
-                        print(f"[SM] 物体点云已保存 /tmp/object_cloud.npz"
-                              f"（{len(_pts_obj)} pts）", flush=True)
-                    _worker = os.path.join(_HERE, "grasp_worker.py")
-                    _res = _subproc.run(
-                        [sys.executable, _worker,
-                         "--checkpoint", args.grasp_checkpoint,
-                         "--topk", "50"],
-                        timeout=120,
-                    )
-                    if _res.returncode != 0 or \
-                            not os.path.exists("/tmp/grasp_result.npz"):
-                        print("[SM] GraspNet failed — DONE.", flush=True)
-                        state = PipelineState.DONE
-                    else:
-                        _gr = np.load("/tmp/grasp_result.npz",
-                                      allow_pickle=True)
-                        if len(_gr["scores"]) == 0:
-                            print("[SM] No valid grasps — DONE.", flush=True)
-                            state = PipelineState.DONE
-                        else:
-                            # ── 诊断：任取第0个候选，打印各坐标系下的approach方向 ──
-                            try:
-                                from arm_ik_mujoco import (
-                                    quat_to_rot as _q2r_diag,
-                                    fk_gripper as _fkg_diag,
-                                    _CAM_OFFSET_ROT as _COR_diag,
-                                )
-                                _R_diag = _gr["rotations"][0]   # 相机系
-                                _app_cam = _R_diag[:, 0]
-                                _R_gb_diag = _fkg_diag(_q_scan_at_scan.astype(np.float64))[:3, :3]
-                                _app_gb    = _COR_diag @ _app_cam
-                                _R_rob_diag = _q2r_diag(_quat_w_at_scan.astype(np.float64))
-                                _app_base  = _R_rob_diag @ _R_gb_diag @ _app_gb
-                                _app_world = _app_base   # world z = base z（平地）
-                                print(f"[DIAG-APPROACH] cam  ={np.round(_app_cam,4)}", flush=True)
-                                print(f"[DIAG-APPROACH] gb   ={np.round(_app_gb,4)}", flush=True)
-                                print(f"[DIAG-APPROACH] world={np.round(_app_world,4)}", flush=True)
-                            except Exception as _diag_e:
-                                print(f"[DIAG-APPROACH] failed: {_diag_e}", flush=True)
-                            # ── 目标过滤：高饱和度过滤 S>=80（对齐原版 fallback 逻辑）──
-                            # 只作用在**物体点云**上（_pts_obj/_cols_obj）；AnyGrasp 吃的是
-                            # 完整点云，桌面候选主要由下方"落物体筛选"拦截，这里降级为
-                            # 颜色偏好叠加。
-                            _bmask = None
-                            _q_scan_saved    = _q_scan_at_scan.copy()
-                            _pos_w_scan_pre  = _pos_w_at_scan.copy()
-                            _quat_w_scan_pre = _quat_w_at_scan.copy()
-                            try:
-                                import cv2 as _cv2_f
-                                from scipy.spatial import cKDTree as _KDTree_f
-                                _cols_u8_ng = (_cols_obj * 255).astype(np.uint8).reshape(1, -1, 3)
-                                _hsv_ng = _cv2_f.cvtColor(_cols_u8_ng, _cv2_f.COLOR_RGB2HSV)[0]
-                                _vivid_mask = (_hsv_ng[:, 1] >= 80)
-                                _vivid_pts = _pts_obj[_vivid_mask]
-                                print(f"[SM] 高饱和过滤(S>=80): {len(_vivid_pts)} 鲜艳点", flush=True)
-                                # ── 保存 filter.png：三类过滤可视化 ──
-                                try:
-                                    if scan_rgb is not None:
-                                        _mask_flat_f = mask.ravel()                          # 深度有效 bool (H*W,)
-                                        _valid_idx_flat_f = np.where(_mask_flat_f)[0]         # 有效像素 flat 索引
-                                        _filter_img_f = scan_rgb.copy()
-                                        _filter_flat_f = _filter_img_f.reshape(-1, 3)
-                                        _filter_flat_f[~_mask_flat_f] = 0                    # 类A: 无效深度变黑
-                                        _filter_flat_f[_valid_idx_flat_f[~_keep]] = 0        # 类B: RANSAC 桌面点变黑
-                                        _filter_flat_f[_valid_idx_flat_f[_keep][~_vivid_mask]] = 0  # 类C: S<80 变黑
-                                        _filter_bgr_f = _cv2_f.cvtColor(
-                                            _filter_flat_f.reshape(H, W, 3), _cv2_f.COLOR_RGB2BGR)
-                                        _filter_dir = "/home/mojie/taskdog/custom_envs/tmp_pictures"
-                                        os.makedirs(_filter_dir, exist_ok=True)
-                                        _filter_path = os.path.join(_filter_dir, "filter.png")
-                                        _cv2_f.imwrite(_filter_path, _filter_bgr_f)
-                                        print(f"[SM] filter.png 已保存: {_filter_path}", flush=True)
-                                except Exception as _fe:
-                                    print(f"[SM] filter.png 保存失败: {_fe}", flush=True)
-                                if len(_vivid_pts) >= 20:
-                                    _kd_ng = _KDTree_f(_vivid_pts)
-                                    _dists_ng, _ = _kd_ng.query(_gr["translations"], k=1)
-                                    _bmask_ng = _dists_ng < 0.05
-                                    _n_ok_ng = int(_bmask_ng.sum())
-                                    print(f"[SM] 高饱和过滤: {_n_ok_ng}/{len(_gr['translations'])} 候选近鲜艳点", flush=True)
-                                    if _n_ok_ng > 0:
-                                        _bmask = _bmask_ng
-                                    else:
-                                        print("[SM] 高饱和过滤无候选 -> 全部候选进排序", flush=True)
-                                else:
-                                    print("[SM] 高饱和点不足 -> 全部候选进排序", flush=True)
-                            except Exception as _cfe:
-                                print(f"[SM] 目标过滤异常: {_cfe}", flush=True)
-
-                            # ── IK 预筛选 + 排序（对齐原版逻辑）──
-                            try:
-                                from arm_ik_mujoco import (
-                                    solve as _ik_solve_pos_gp,
-                                    cam_to_world as _ctw_gp,
-                                    world_pos_to_arm_frame as _w2a_gp,
-                                    compute_desired_ee_rot_in_arm as _cder_gp,
-                                    quat_to_rot as _q2r_gp,
-                                    fk_gripper as _fkg_gp,
-                                    _CAM_OFFSET_ROT as _COR_gp,
-                                )
-                                _R_rob_gp    = _q2r_gp(_quat_w_scan_pre)
-                                _R_gb_gp     = _fkg_gp(_q_scan_saved)[:3, :3]
-                                _R_cam2world = _R_rob_gp @ _R_gb_gp @ _COR_gp
-                                # _bmask=None 时全部候选进排序，否则只排序颜色过滤后的候选
-                                _banana_idxs_pre = list(np.where(_bmask)[0]) \
-                                    if _bmask is not None else list(range(len(_gr["scores"])))
-                                if not _banana_idxs_pre:
-                                    _banana_idxs_pre = list(range(len(_gr["scores"])))
-                                # ── 落物体筛选（主判据）──
-                                # C = 掌心 + d·a 是 AnyGrasp 认为的**指尖落点**；要求 C 距
-                                # 物体点云（已去桌面，光学系，与 AnyGrasp 输出同系）最近距离
-                                # < 1cm 才算"抓在物体上"。必须判 C 而不是掌心：掌心在物体外
-                                # d(2~6cm) 处，用掌心会误杀全部有效抓取。
-                                # 物体点云不可用/无候选/异常 -> 警告 + 全部放行（不阻断）。
-                                _GS_DIST_MAX = 0.08
-                                _gr_depths_pre = _gr["depths"] if "depths" in _gr else \
-                                    np.full(len(_gr["scores"]), 0.0658, dtype=np.float32)
-                                _gs_kd = None
-                                if _obj_filter_ok:
-                                    try:
-                                        from scipy.spatial import cKDTree as _KDTree_gs
-                                        _gs_kd = _KDTree_gs(_pts_obj.astype(np.float64))
-                                        print(f"[SM] 落物体筛选: KD树 {len(_pts_obj)} pts, "
-                                              f"阈值 {_GS_DIST_MAX * 100:.0f}cm", flush=True)
-                                    except Exception as _gs_e:
-                                        print(f"[WARN] 落物体筛选 KD树构建失败: {_gs_e} "
-                                              f"—— 全部候选放行", flush=True)
-                                        _gs_kd = None
-                                else:
-                                    print("[WARN] 落物体筛选未启用（物体点云不足）"
-                                          "—— 全部候选放行", flush=True)
-                                _gs_ok = {}
-                                if _gs_kd is not None:
-                                    for _ci in _banana_idxs_pre:
-                                        try:
-                                            _C_ci = (
-                                                np.asarray(_gr["translations"][_ci],
-                                                           dtype=np.float64)
-                                                + float(_gr_depths_pre[_ci])
-                                                * np.asarray(_gr["rotations"][_ci][:, 0],
-                                                             dtype=np.float64))
-                                            _gs_ok[_ci] = bool(
-                                                _gs_kd.query(_C_ci, k=1)[0] < _GS_DIST_MAX)
-                                        except Exception:
-                                            _gs_ok[_ci] = True   # 异常 -> 该候选放行
-                                    _n_gs_pass = int(sum(_gs_ok.values()))
-                                    print(f"[SM] 落物体筛选: {_n_gs_pass}/"
-                                          f"{len(_banana_idxs_pre)} 候选的抓取点距物体 "
-                                          f"<{_GS_DIST_MAX * 100:.0f}cm", flush=True)
-                                    if _n_gs_pass == 0:
-                                        print("[WARN] 落物体筛选后无候选 —— 全部候选放行",
-                                              flush=True)
-                                        _gs_ok = {}
-                                _banana_idxs_pre = [i for i in _banana_idxs_pre
-                                                    if _gs_ok.get(i, True)]
-                                _ranked_pre = []
-                                for _ci in _banana_idxs_pre:
-                                    _t_ci  = _gr["translations"][_ci]
-                                    _tw_ci = _ctw_gp(_t_ci, _q_scan_saved,
-                                                     _pos_w_scan_pre, _quat_w_scan_pre)
-                                    _ta_ci = _w2a_gp(_tw_ci, _pos_w_scan_pre,
-                                                     _quat_w_scan_pre)
-                                    try:
-                                        _q_pre = _ik_solve_pos_gp(
-                                            _ta_ci, target_rot=None,
-                                            initial_angles=_q_scan_saved)
-                                        _ik_ok_pre = (float(_q_pre[1]) < 2.8)
-                                    except Exception:
-                                        _ik_ok_pre = False
-                                    _R_cam_ci      = _gr["rotations"][_ci]
-                                    _app_world_ci  = _R_cam2world @ _R_cam_ci[:, 0]
-                                    _approach_z_ci = float(_app_world_ci[2])
-                                    _ranked_pre.append((
-                                        _ik_ok_pre,
-                                        float(abs(_approach_z_ci)),
-                                        float(_gr["scores"][_ci]),
-                                        _ci,
-                                        _approach_z_ci,
-                                    ))
-                                # 排序：IK可解优先，approach_z 越负越好，score 越高越好
-                                _ranked_pre.sort(
-                                    key=lambda x: (-int(x[0]), -x[2], x[4]))
-                                _ranked_idxs = [x[3] for x in _ranked_pre]
-                                print(
-                                    f"[SM] 候选排序({len(_ranked_idxs)}个): "
-                                    + " ".join(
-                                        f"[{r[3]}]{'✓' if r[0] else '✗'}"
-                                        f"s={r[2]:.2f}az={r[4]:.2f}"
-                                        for r in _ranked_pre[:6]
-                                    ),
-                                    flush=True,
-                                )
-                            except Exception as _rank_e:
-                                print(f"[SM] IK预筛选异常({_rank_e}),使用原始顺序",
-                                      flush=True)
-                                _ranked_idxs = list(range(len(_gr["scores"])))
-                            _best_gi = _ranked_idxs[0]
-                            try:
-                                _R_des_best = _cder_gp(
-                                    _gr["rotations"][_best_gi], _q_scan_saved)
-                            except Exception:
-                                _R_des_best = None
-                            # ── 每抓取 depth（AnyGrasp 约定：指尖 = 掌心 + depth·a）──
-                            # 旧版 npz 无 depths key → 回退 0.0658（= 旧行为），不崩
-                            _gr_depths = _gr["depths"] if "depths" in _gr else \
-                                np.full(len(_gr["scores"]), 0.0658, dtype=np.float32)
-                            print(f"[DIAG] best grasp R_cam approach(col0)={np.round(_gr['rotations'][_best_gi][:,0],4)} depth={float(_gr_depths[_best_gi]):.4f}", flush=True)
-                            # GraspNet 原始输出即光学系（x右 y下 z前），直接使用
-                            _R_cam_best = _gr["rotations"][_best_gi].copy()
-                            grasp_result = {
-                                "t_cam":   _gr["translations"][_best_gi],
-                                "R_cam":   _R_cam_best,
-                                "width":   float(_gr["widths"][_best_gi]),
-                                "score":   float(_gr["scores"][_best_gi]),
-                                "depth":   float(_gr_depths[_best_gi]),
-                                "R_desired_EE_in_arm": _R_des_best,
-                                "gr_translations": _gr["translations"],
-                                "gr_rotations":    _gr["rotations"],
-                                "gr_widths":       _gr["widths"],
-                                "gr_scores":       _gr["scores"],
-                                "gr_depths":       _gr_depths,
-                                "q_scan":      _q_scan_saved,
-                                "pos_w_scan":  _pos_w_scan_pre,
-                                "quat_w_scan": _quat_w_scan_pre,
-                                "ranked_candidate_idxs": _ranked_idxs,
-                                "tried_set":             {_best_gi},
-                            }
-                            print(f"[SM] GRASP_PLAN done: "
-                                  f"{len(_gr['scores'])} grasps, "
-                                  f"best=[{_best_gi}] score={grasp_result['score']:.3f}",
-                                  flush=True)
-                            # ── DIAG + approach sanity check（approach_z>0 时自动 flip）──
-                            try:
-                                from arm_ik_mujoco import (
-                                    cam_to_world as _c2w_d, quat_to_rot as _q2r_d,
-                                    _CAM_OFFSET_ROT as _COR_d, fk_gripper as _fkg_d,
-                                    compute_desired_ee_rot_in_arm as _cder_d,
-                                )
-                                _t_c_d = grasp_result["t_cam"]
-                                _R_c_d = grasp_result["R_cam"]
-                                _T_fk_d  = _fkg_d(grasp_result["q_scan"])
-                                _R_cw_d  = _q2r_d(quat_w) @ _T_fk_d[:3, :3] @ _COR_d
-                                _app_w_d = _R_cw_d @ _R_c_d[:, 0]
-                                _t_obj_w_d = _c2w_d(_t_c_d, grasp_result["q_scan"], pos_w, quat_w)
-                                print(f"[DIAG] t_cam={np.round(_t_c_d,4)} depth={_t_c_d[2]:.3f}m", flush=True)
-                                print(f"[DIAG] t_obj_world={np.round(_t_obj_w_d,4)} z={_t_obj_w_d[2]:.3f}m", flush=True)
-                                print(f"[DIAG] approach world={np.round(_app_w_d,3)}", flush=True)
-                                try:
-                                    _real_obj_pos = env.get_object_pos(args.object)
-                                    print(f"[DIAG] object real world={np.round(_real_obj_pos,4)} "
-                                          f"(delta from t_obj: {np.round(_real_obj_pos - _t_obj_w_d,4)})",
-                                          flush=True)
-                                except Exception:
-                                    pass
-                                _approach_world_z = float(_app_w_d[2])
-                                if _approach_world_z > 0.0:
-                                    print(f"[WARN] approach z={_approach_world_z:.3f}>0, flipping.", flush=True)
-                                    _R_flipped = grasp_result["R_cam"].copy()
-                                    _R_flipped[:, 0] = -_R_flipped[:, 0]
-                                    _R_flipped[:, 1] = -_R_flipped[:, 1]
-                                    grasp_result["R_cam"] = _R_flipped
-                                    grasp_result["R_desired_EE_in_arm"] = _cder_d(
-                                        _R_flipped, grasp_result["q_scan"])
-                                    print(f"[WARN] After flip z={float((_R_cw_d@_R_flipped[:,0])[2]):.3f}", flush=True)
-                                else:
-                                    print(f"[INFO] approach z={_approach_world_z:.3f}<0 (OK)", flush=True)
-                            except Exception as _de:
-                                print(f"[DIAG] failed: {_de}", flush=True)
-                            state = PipelineState.PRE_GRASP
-                            state_step = 0
-                            _pg_cmd = None
+                state, grasp_result = _run_grasp_plan(
+                    env=env,
+                    args=args,
+                    depth_accum=depth_accum,
+                    scan_rgb=scan_rgb,
+                    q_scan_at_scan=_q_scan_at_scan,
+                    pos_w_at_scan=_pos_w_at_scan,
+                    quat_w_at_scan=_quat_w_at_scan,
+                    pos_w=pos_w,
+                    quat_w=quat_w,
+                    ransac_fit_plane=_ransac_fit_plane,
+                    ransac_remove_plane=_ransac_remove_plane,
+                )
+                state_step = 0
+                _pg_cmd = None
 
     except KeyboardInterrupt:
         print("[MJ] KeyboardInterrupt")
     finally:
         bridge.stop()
-        if grasp_proc:
-            grasp_proc.terminate()
         env.close()
         print("[MJ] Done")
-
-
-def _handle_state(
-    state, state_step, pos_w, yaw, jpos, jvel,
-    grasp_pose, args, bridge, ik_solver,
-    grasp_result_q, env,
-):
-    """处理 PAN_VX 之后的所有状态，返回 (cmd_vx, cmd_vy, cmd_wz)。
-
-    注意：此函数通过 nonlocal 修改外部变量（state、state_step、grasp_pose 等）
-    不可行，故改为返回值 + env 直接操作的方式。
-    状态转移由调用方根据返回的 next_state 处理。
-
-    TODO: 此函数是占位实现，具体逻辑需按照 navigate_to_goal_nav2_whole.py
-    中对应状态的逻辑逐一移植。主要工作包括：
-      - PAN_VX/PAN_VY：PD 控制精调机器人 X/Y 坐标
-      - ALIGN_YAW：对齐偏航角
-      - ARM_INIT：机械臂插值到初始扫描姿态，同时 FREEZE 根节点
-      - SCAN：收集 RGB+depth 帧，发送给 grasp_worker
-      - GRASP_PLAN：等待 grasp_worker 返回抓取位姿
-      - PRE_GRASP/ORIENT/REACH：IK 求解 + 机械臂运动
-      - CLOSE：夹爪闭合
-      - LIFT：抬起物体
-      - PAN_NEG_X/NAV2_DEST/ALIGN_YAW_2/PAN_DES_X：放置前导航
-      - ROTATE/PUT_DOWN：旋转机械臂到放置位，松夹爪
-    """
-    # 默认：停止运动
-    return 0.0, 0.0, 0.0
 
 
 if __name__ == "__main__":
