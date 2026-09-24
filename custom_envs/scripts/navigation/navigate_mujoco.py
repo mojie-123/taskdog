@@ -1601,11 +1601,10 @@ def main():
 
             elif current_state == PipelineState.ORIENT:
                 # 只用 joint6 绕 gripper approach 轴旋转；j1~j5 锁定“进入 ORIENT 时的实际值”。
-                # 本版 ORIENT 不再精确复现 AnyGrasp closing 的小竖直倾角，而是：
-                #   1) 保持当前实际 approach 方向不变；
-                #   2) 将 closing 方向强制设为世界水平（world z 分量 = 0）；
-                #   3) 在两个水平解 ±closing 中选择最接近 AnyGrasp 原 closing 的一个。
-                # 因而 ORIENT 结束时两根平行手指在理想刚体几何下等高，后续 REACH 只保持该姿态前进。
+                # 目标不再强制把双指调平，而是尽量恢复 AnyGrasp 的 closing 方向：
+                #   1) 保持 MuJoCo 当前实际 approach 不变；
+                #   2) 将 AnyGrasp closing 投影到垂直于该 approach 的可实现平面；
+                #   3) closing 对平行夹爪具有 ± 对称性，选择 j6 转动最小的合法分支。
                 cmd_vx = 0.0; cmd_vy = 0.0; cmd_wz = 0.0
                 if grasp_result is None or "R_desired_EE_in_arm" not in grasp_result:
                     next_state = PipelineState.DONE
@@ -1614,66 +1613,99 @@ def main():
                     if state_step == 0:
                         from arm_ik_mujoco import (
                             extract_j6_angle,
+                            _IK_JOINT_LIMITS as _or_lims,
                             _RX_NEG90 as _RXN90_or,
                             quat_to_rot as _q2r_or_init,
                         )
 
-                        # AnyGrasp 原始目标（gripper_base，arm frame），只用于决定水平 closing 的 ± 方向。
+                        # AnyGrasp 原始目标姿态：转换为 gripper_base frame 后取 closing(+Y)。
                         _R_gb_anygrasp_or = (grasp_result["R_desired_EE_in_arm"]
                                              @ _RXN90_or)
 
-                        # 以 MuJoCo 当前真实姿态的 approach 作为固定旋转轴。
-                        # joint6 只绕该轴转，因此 ORIENT 不改变 approach。
+                        # joint6 只绕当前 gripper_base approach(+Z) 转，因此该实际 approach
+                        # 是 ORIENT 期间不可改变的旋转轴。
                         _, _R_or_init_w = _gb_pose_world()
                         _approach_w = np.asarray(_R_or_init_w[:, 2], dtype=np.float64)
                         _approach_w /= max(float(np.linalg.norm(_approach_w)), 1e-12)
 
-                        # AnyGrasp 原 closing 转到世界系，用来选择最接近的水平解。
+                        # AnyGrasp closing 转到世界系。
                         _R_robot_or_init = _q2r_or_init(np.asarray(quat_w, dtype=np.float64))
                         _R_anygrasp_w = _R_robot_or_init @ _R_gb_anygrasp_or
                         _closing_any_w = np.asarray(_R_anygrasp_w[:, 1], dtype=np.float64)
                         _closing_any_w /= max(float(np.linalg.norm(_closing_any_w)), 1e-12)
 
-                        # 水平且与 approach 垂直的 closing：c ∝ world_z × approach。
-                        # 若 approach 几乎竖直，world_z × approach 退化；此时直接使用
-                        # AnyGrasp closing 的水平投影（竖直 approach 下任意水平 closing 都与其正交）。
-                        _world_z = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-                        _closing_h = np.cross(_world_z, _approach_w)
-                        _closing_h_norm = float(np.linalg.norm(_closing_h))
-                        if _closing_h_norm < 1e-6:
-                            _closing_h = _closing_any_w.copy()
-                            _closing_h[2] = 0.0
-                            _closing_h_norm = float(np.linalg.norm(_closing_h))
-                            if _closing_h_norm < 1e-6:
-                                _closing_h = np.array([1.0, 0.0, 0.0], dtype=np.float64)
-                                _closing_h_norm = 1.0
-                        _closing_h /= _closing_h_norm
+                        # j6-only 的可实现集合要求 closing ⟂ 当前实际 approach。
+                        # 因而把 AnyGrasp closing 正交投影到该法平面；这就是在固定 approach
+                        # 前提下，与原 AnyGrasp closing 最近的可实现 closing。
+                        _closing_proj = (_closing_any_w
+                                         - float(np.dot(_closing_any_w, _approach_w))
+                                         * _approach_w)
+                        _closing_proj_norm = float(np.linalg.norm(_closing_proj))
+                        if _closing_proj_norm < 1e-6:
+                            # 极端退化：AnyGrasp closing 几乎平行于当前 approach。
+                            # 此时投影方向不可靠；保持当前实际 closing，避免产生任意大旋转。
+                            _closing_proj = np.asarray(_R_or_init_w[:, 1], dtype=np.float64).copy()
+                            _closing_proj_norm = float(np.linalg.norm(_closing_proj))
+                            print("[WARN] ORIENT AnyGrasp closing projection degenerate; "
+                                  "keep current feasible closing", flush=True)
+                        _closing_proj /= max(_closing_proj_norm, 1e-12)
 
-                        # closing 对平行夹爪有 ± 对称性；取与 AnyGrasp 原方向更接近的一支。
-                        if float(np.dot(_closing_h, _closing_any_w)) < 0.0:
-                            _closing_h = -_closing_h
+                        # 构造 +closing / -closing 两个物理等价目标，并分别求 j6。
+                        # 再考虑 2π 周期分支，在 joint6 限位内选择离当前 j6 最近的一支。
+                        _orient_candidates = []
+                        for _sign in (1.0, -1.0):
+                            _closing_cand_w = _sign * _closing_proj
+                            _binormal_cand_w = np.cross(_closing_cand_w, _approach_w)
+                            _binormal_cand_w /= max(
+                                float(np.linalg.norm(_binormal_cand_w)), 1e-12)
+                            _closing_cand_w = np.cross(_approach_w, _binormal_cand_w)
+                            _closing_cand_w /= max(
+                                float(np.linalg.norm(_closing_cand_w)), 1e-12)
+                            _R_gb_cand_w = np.column_stack((
+                                _binormal_cand_w, _closing_cand_w, _approach_w))
+                            _R_gb_cand_arm = _R_robot_or_init.T @ _R_gb_cand_w
+                            _j6_raw = float(extract_j6_angle(cur_q, _R_gb_cand_arm))
+                            for _k in (-1, 0, 1):
+                                _j6_cand = _j6_raw + _k * 2.0 * math.pi
+                                if _or_lims[5][0] <= _j6_cand <= _or_lims[5][1]:
+                                    _orient_candidates.append((
+                                        abs(_j6_cand - float(cur_q[5])),
+                                        _j6_cand,
+                                        _R_gb_cand_arm,
+                                        _closing_cand_w.copy(),
+                                    ))
 
-                        # 重新正交化，构造合法右手 gripper_base 旋转矩阵：
-                        # columns = [binormal(+X), closing(+Y), approach(+Z)].
-                        _binormal_h = np.cross(_closing_h, _approach_w)
-                        _binormal_h /= max(float(np.linalg.norm(_binormal_h)), 1e-12)
-                        _closing_h = np.cross(_approach_w, _binormal_h)
-                        _closing_h /= max(float(np.linalg.norm(_closing_h)), 1e-12)
-                        _R_gb_level_w = np.column_stack((_binormal_h, _closing_h, _approach_w))
-                        _R_gb_desired_or = _R_robot_or_init.T @ _R_gb_level_w
+                        if _orient_candidates:
+                            _, j6_target, _R_gb_desired_or, _closing_target_w = min(
+                                _orient_candidates, key=lambda x: x[0])
+                        else:
+                            # extract_j6_angle 正常应给出限位内解；若没有合法周期分支，
+                            # 保守地保持当前 j6，避免越限。
+                            j6_target = float(cur_q[5])
+                            _closing_target_w = np.asarray(
+                                _R_or_init_w[:, 1], dtype=np.float64).copy()
+                            _binormal_target_w = np.cross(_closing_target_w, _approach_w)
+                            _binormal_target_w /= max(
+                                float(np.linalg.norm(_binormal_target_w)), 1e-12)
+                            _R_gb_target_w = np.column_stack((
+                                _binormal_target_w, _closing_target_w, _approach_w))
+                            _R_gb_desired_or = _R_robot_or_init.T @ _R_gb_target_w
+                            print("[WARN] ORIENT no legal j6 candidate; keep current j6",
+                                  flush=True)
 
-                        # j1~j5 不动，只解 j6；因此实际动作就是绕 approach 轴把双指“调平”。
-                        j6_target = extract_j6_angle(cur_q, _R_gb_desired_or)
-                        _orient_q_fixed = cur_q.copy()   # 关键：实际姿态，而非 PRE 理论 q
+                        _orient_q_fixed = cur_q.copy()   # 实际姿态，而非 PRE 理论 q
                         _orient_j6_start = float(cur_q[5])
 
                         _closing_tilt_any = math.degrees(math.asin(float(np.clip(
                             abs(_closing_any_w[2]), 0.0, 1.0))))
                         _closing_tilt_target = math.degrees(math.asin(float(np.clip(
-                            abs(_closing_h[2]), 0.0, 1.0))))
-                        print(f"[SM] ORIENT level fingers: "
-                              f"AnyGrasp closing_tilt={_closing_tilt_any:.2f}deg -> "
-                              f"target={_closing_tilt_target:.2f}deg, "
+                            abs(_closing_target_w[2]), 0.0, 1.0))))
+                        _projection_err = math.degrees(math.acos(float(np.clip(abs(
+                            np.dot(_closing_any_w, _closing_target_w)), 0.0, 1.0))))
+                        print(f"[SM] ORIENT match AnyGrasp closing: "
+                              f"AnyGrasp_tilt={_closing_tilt_any:.2f}deg, "
+                              f"projected_tilt={_closing_tilt_target:.2f}deg, "
+                              f"projection_err={_projection_err:.2f}deg, "
                               f"j6_target={j6_target:.4f} rad "
                               f"({math.degrees(j6_target):.1f} deg), "
                               f"j6_start={_orient_j6_start:.4f} rad", flush=True)
@@ -1706,19 +1738,23 @@ def main():
                             _R_robot_or = _q2r_or_done(np.asarray(quat_w, dtype=np.float64))
                             _R_gb_desired_w = _R_robot_or @ _R_gb_desired_or
 
-                            # 用 MuJoCo 真值姿态检查，而不是再用 ikpy FK 自己验证自己。
-                            # closing axis 对平行夹爪有 ± 方向对称性，因此取绝对点积。
+                            # 用 MuJoCo 真值姿态检查，而不是再用 IK/FK 自己验证自己。
+                            # closing axis 对平行夹爪有 ± 方向对称性，因此比较“连线”时取绝对点积。
                             _app_dot = float(np.clip(
                                 np.dot(_R_or_actual_w[:, 2], _R_gb_desired_w[:, 2]), -1.0, 1.0))
                             _close_dot = float(np.clip(abs(
                                 np.dot(_R_or_actual_w[:, 1], _R_gb_desired_w[:, 1])), 0.0, 1.0))
+                            _close_any_dot = float(np.clip(abs(
+                                np.dot(_R_or_actual_w[:, 1], _closing_any_w)), 0.0, 1.0))
                             _app_err = math.acos(_app_dot)
                             _close_err = math.acos(_close_dot)
+                            _close_any_err = math.acos(_close_any_dot)
 
                             if _app_err > math.radians(10.0) or _close_err > math.radians(10.0):
                                 print(f"[WARN] ORIENT actual pose mismatch: "
                                       f"approach_err={math.degrees(_app_err):.1f}deg "
-                                      f"closing_err={math.degrees(_close_err):.1f}deg "
+                                      f"projected_closing_err={math.degrees(_close_err):.1f}deg "
+                                      f"AnyGrasp_closing_err={math.degrees(_close_any_err):.1f}deg "
                                       f"-> ARM_INIT retry", flush=True)
                                 grasp_result = None
                                 _pg_cmd = None
@@ -1731,7 +1767,8 @@ def main():
                                 print(f"[SM] ORIENT done: j6={_cur_q_orient_done[5]:.4f} "
                                       f"(target={j6_target:.4f}), "
                                       f"approach_err={math.degrees(_app_err):.2f}deg, "
-                                      f"closing_err={math.degrees(_close_err):.2f}deg, "
+                                      f"projected_closing_err={math.degrees(_close_err):.2f}deg, "
+                                      f"AnyGrasp_closing_err={math.degrees(_close_any_err):.2f}deg, "
                                       f"actual_closing_tilt={_closing_actual_tilt:.2f}deg -> REACH",
                                       flush=True)
                                 next_state = PipelineState.REACH
