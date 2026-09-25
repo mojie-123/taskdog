@@ -55,8 +55,7 @@ sys.path.insert(0, os.path.join(_HERE, "..", "..", "utils"))
 class PipelineState(enum.Enum):
     NAV          = "NAV"
     ALIGN_YAW_1  = "ALIGN_YAW_1"
-    PAN_VX       = "PAN_VX"
-    PAN_VY       = "PAN_VY"
+    PAN_XY       = "PAN_XY"
     ARM_INIT     = "ARM_INIT"
     SCAN         = "SCAN"
     GRASP_PLAN   = "GRASP_PLAN"
@@ -634,8 +633,7 @@ def main():
     # 每帧固定不变的状态集合只构造一次，避免主循环内重复创建。
     _ARM_IDLE_STATES = {
         PipelineState.ALIGN_YAW_1,
-        PipelineState.PAN_VX,
-        PipelineState.PAN_VY,
+        PipelineState.PAN_XY,
     }
     _LOCOMOTION_DISABLED_STATES = {
         PipelineState.ARM_INIT, PipelineState.SCAN,
@@ -905,6 +903,119 @@ def main():
                      world_vx_target=world_vx_target,
                      world_vy_target=world_vy_target))
 
+    def _pan_world_xy_control(
+        pan_state, err_x, err_y, target_yaw,
+        pos_tol=0.05, resume_tol=0.10,
+        kp_x=1.0, kp_y=0.8,
+        vmax_x=0.25, vmax_y=0.35,
+        yaw_now=0.0, base_lin_vel=None,
+    ):
+        """世界系 XY 同时闭环精定位。
+
+        完成条件不是欧式距离，而是两个轴分别满足：
+            |err_x| <= pos_tol 且 |err_y| <= pos_tol
+        并且水平速度、yaw 都已经稳定。
+
+        某一轴已经进入容差时，该轴目标速度置零；若随后被另一轴运动带出容差，
+        下一控制周期会自动重新纠正该轴。
+        """
+        nonlocal _pan_ctrl_state, _pan_cmd_vx, _pan_cmd_vy, _pan_cmd_wz
+        nonlocal _pan_settling, _pan_settle_count
+
+        if _pan_ctrl_state != pan_state:
+            _pan_ctrl_state = pan_state
+            _pan_cmd_vx = 0.0
+            _pan_cmd_vy = 0.0
+            _pan_cmd_wz = 0.0
+            _pan_settling = False
+            _pan_settle_count = 0
+
+        ex = float(err_x)
+        ey = float(err_y)
+        ax = abs(ex)
+        ay = abs(ey)
+
+        in_x = ax <= float(pos_tol)
+        in_y = ay <= float(pos_tol)
+        both_in = in_x and in_y
+
+        # 只有两个轴都进入 ±5 cm 才进入停车/稳定阶段。
+        if _pan_settling:
+            if ax > float(resume_tol) or ay > float(resume_tol):
+                _pan_settling = False
+                _pan_settle_count = 0
+        elif both_in:
+            _pan_settling = True
+            _pan_settle_count = 0
+
+        if _pan_settling:
+            world_vx_target = 0.0
+            world_vy_target = 0.0
+        else:
+            if in_x:
+                world_vx_target = 0.0
+            else:
+                mag_x = min(
+                    float(vmax_x),
+                    max(_PAN_MIN_MOVE_SPEED, float(kp_x) * ax),
+                )
+                world_vx_target = math.copysign(mag_x, ex)
+
+            if in_y:
+                world_vy_target = 0.0
+            else:
+                mag_y = min(
+                    float(vmax_y),
+                    max(_PAN_MIN_MOVE_SPEED, float(kp_y) * ay),
+                )
+                world_vy_target = math.copysign(mag_y, ey)
+
+        # world -> body: Rz(yaw)^T @ v_world
+        cy = math.cos(float(yaw_now))
+        sy = math.sin(float(yaw_now))
+        vx_target = cy * world_vx_target + sy * world_vy_target
+        vy_target = -sy * world_vx_target + cy * world_vy_target
+
+        _pan_cmd_vx = _slew(_pan_cmd_vx, vx_target, _PAN_DV_PER_STEP)
+        _pan_cmd_vy = _slew(_pan_cmd_vy, vy_target, _PAN_DV_PER_STEP)
+
+        yaw_err = _yaw_err_to(float(target_yaw), float(yaw_now))
+        wz_target = _yaw_target_with_min(
+            yaw_err, _PAN_YAW_KP, _PAN_YAW_MIN,
+            _PAN_YAW_MAX, _PAN_YAW_DEADBAND)
+        _pan_cmd_wz = _slew(_pan_cmd_wz, wz_target, _PAN_DW_PER_STEP)
+
+        if base_lin_vel is None:
+            _vworld = np.zeros(2, dtype=np.float64)
+        else:
+            _vworld = np.asarray(base_lin_vel, dtype=np.float64)[:2]
+        _vxy = float(np.linalg.norm(_vworld))
+
+        if (_pan_settling
+                and ax <= float(pos_tol)
+                and ay <= float(pos_tol)
+                and _vxy <= _PAN_SETTLE_SPEED
+                and abs(yaw_err) <= math.radians(3.0)):
+            _pan_settle_count += 1
+        else:
+            _pan_settle_count = 0
+
+        done = (_pan_settle_count >= _PAN_SETTLE_STEPS)
+
+        return (
+            _pan_cmd_vx, _pan_cmd_vy, _pan_cmd_wz, done,
+            dict(
+                err_x=ex, err_y=ey,
+                abs_err_x=ax, abs_err_y=ay,
+                in_x=in_x, in_y=in_y,
+                vxy=_vxy, yaw_err=yaw_err,
+                settling=_pan_settling,
+                settle_count=_pan_settle_count,
+                world_vx_target=world_vx_target,
+                world_vy_target=world_vy_target,
+            )
+        )
+
     def _arm_step(q6):
         """设置机械臂目标角（6维）。"""
         env.set_arm_target(np.asarray(q6, dtype=np.float64))
@@ -1140,55 +1251,63 @@ def main():
                           f"settle={_ad['settle_count']}/{_ALIGN_SETTLE_STEPS}", flush=True)
                 if _align_done or state_step >= ALIGN_YAW_MAX_STEPS:
                     _why = "settled" if _align_done else "timeout"
-                    print(f"[MJ] ALIGN_YAW_1 done ({_why}) -> PAN_VX", flush=True)
-                    next_state = PipelineState.PAN_VX
+                    print(f"[MJ] ALIGN_YAW_1 done ({_why}) -> PAN_XY", flush=True)
+                    next_state = PipelineState.PAN_XY
                     state_step = 0
 
-            elif current_state == PipelineState.PAN_VX:
-                # 世界 Y 精调：和 PAN_DES_X 一样直接在世界系闭环，实时 yaw 只负责坐标变换。
-                _dy_w = float(args.goal[1]) - float(pos_w[1])
-                cmd_vx, cmd_vy, cmd_wz, _pan_done, _pd = _pan_world_axis_control(
-                    PipelineState.PAN_VX, _dy_w, 'y', math.pi / 2,
-                    pos_tol=0.08, resume_tol=0.16, kp=0.8, vmax=0.35,
-                    yaw_now=yaw, base_lin_vel=rs["lin_vel"])
-                if state_step == 1:
-                    print(f"[SM] PAN_VX start dy_err={_pd['signed_err']:+.3f}m", flush=True)
+            elif current_state == PipelineState.PAN_XY:
+                # 最终二维精定位：
+                #   x_target = goal_x + 0.5m（保持原 PAN_VY 的目标）
+                #   y_target = goal_y        （保持原 PAN_VX 的目标）
+                # 每一步同时看 x/y 两个误差，避免修 x 时把已经调好的 y 再次带偏。
+                _x_target = float(args.goal[0]) + 0.5
+                _y_target = float(args.goal[1])
+                _ex_w = _x_target - float(pos_w[0])
+                _ey_w = _y_target - float(pos_w[1])
+
+                cmd_vx, cmd_vy, cmd_wz, _pan_done, _pd = _pan_world_xy_control(
+                    PipelineState.PAN_XY,
+                    _ex_w, _ey_w,
+                    target_yaw=math.pi / 2,
+                    pos_tol=0.05,       # x/y 分别都要求进入 ±5 cm
+                    resume_tol=0.10,    # 被耦合运动带出 ±10 cm 时明确退出停车状态
+                    kp_x=1.0, kp_y=0.8,
+                    vmax_x=0.25, vmax_y=0.35,
+                    yaw_now=yaw,
+                    base_lin_vel=rs["lin_vel"],
+                )
+
+                if state_step == 0:
+                    print(
+                        f"[SM] PAN_XY start target=({_x_target:.3f},{_y_target:.3f}) "
+                        f"err=({_pd['err_x']:+.3f},{_pd['err_y']:+.3f})m",
+                        flush=True)
+
                 if state_step % 25 == 0:
-                    print(f"[SM] PAN_VX step {state_step}: dy_err={_pd['signed_err']:+.3f}m "
-                          f"cmd=({cmd_vx:+.3f},{cmd_vy:+.3f},{cmd_wz:+.3f}) "
-                          f"vy_world={_pd['axis_vel']:+.3f} vxy={_pd['vxy']:.3f} "
-                          f"yaw_err={math.degrees(_pd['yaw_err']):+.2f}deg "
-                          f"settling={int(_pd['settling'])} "
-                          f"settle={_pd['settle_count']}/{_PAN_SETTLE_STEPS}", flush=True)
+                    print(
+                        f"[SM] PAN_XY step {state_step}: "
+                        f"ex={_pd['err_x']:+.3f}m ey={_pd['err_y']:+.3f}m "
+                        f"in_tol={int(_pd['in_x'])}/{int(_pd['in_y'])} "
+                        f"world_cmd=({_pd['world_vx_target']:+.3f},"
+                        f"{_pd['world_vy_target']:+.3f}) "
+                        f"body_cmd=({cmd_vx:+.3f},{cmd_vy:+.3f},{cmd_wz:+.3f}) "
+                        f"vxy={_pd['vxy']:.3f} "
+                        f"yaw_err={math.degrees(_pd['yaw_err']):+.2f}deg "
+                        f"settling={int(_pd['settling'])} "
+                        f"settle={_pd['settle_count']}/{_PAN_SETTLE_STEPS}",
+                        flush=True)
+
                 state_step += 1
                 if _pan_done or state_step >= PAN_MAX_STEPS:
                     _why = "settled" if _pan_done else "timeout"
-                    print(f"[SM] PAN_VX done ({_why}) -> PAN_VY", flush=True)
-                    next_state = PipelineState.PAN_VY
-                    state_step = 0
-
-            elif current_state == PipelineState.PAN_VY:
-                # 世界 X 精调：目标为 goal_x+0.5m。直接按 world X 闭环，再根据实时 yaw
-                # 转成 body vx/vy，避免依赖“yaw 必须恰好为 +pi/2”的固定符号假设。
-                _dx_w = float(args.goal[0]) + 0.5 - float(pos_w[0])
-                cmd_vx, cmd_vy, cmd_wz, _pan_done, _pd = _pan_world_axis_control(
-                    PipelineState.PAN_VY, _dx_w, 'x', math.pi / 2,
-                    pos_tol=0.10, resume_tol=0.20, kp=1.0, vmax=0.25,
-                    yaw_now=yaw, base_lin_vel=rs["lin_vel"],
-                    settle_use_vxy=True)
-                if state_step == 1:
-                    print(f"[SM] PAN_VY start dx_err={_pd['signed_err']:+.3f}m", flush=True)
-                if state_step % 25 == 0:
-                    print(f"[SM] PAN_VY step {state_step}: dx_err={_pd['signed_err']:+.3f}m "
-                          f"cmd=({cmd_vx:+.3f},{cmd_vy:+.3f},{cmd_wz:+.3f}) "
-                          f"vx_world={_pd['axis_vel']:+.3f} vxy={_pd['vxy']:.3f} "
-                          f"yaw_err={math.degrees(_pd['yaw_err']):+.2f}deg "
-                          f"settling={int(_pd['settling'])} "
-                          f"settle={_pd['settle_count']}/{_PAN_SETTLE_STEPS}", flush=True)
-                state_step += 1
-                if _pan_done or state_step >= PAN_MAX_STEPS:
-                    _why = "settled" if _pan_done else "timeout"
-                    print(f"[SM] PAN_VY done ({_why}) -> ARM_INIT", flush=True)
+                    _ex_final = _x_target - float(pos_w[0])
+                    _ey_final = _y_target - float(pos_w[1])
+                    print(
+                        f"[SM] PAN_XY done ({_why}): "
+                        f"final_pos=({float(pos_w[0]):.3f},{float(pos_w[1]):.3f}) "
+                        f"err=({_ex_final:+.3f},{_ey_final:+.3f})m "
+                        f"-> ARM_INIT",
+                        flush=True)
                     next_state = PipelineState.ARM_INIT
                     state_step = 0
 
