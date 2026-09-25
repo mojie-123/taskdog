@@ -49,9 +49,11 @@ def main():
         from geometry_msgs.msg import Pose, PoseStamped
         from shape_msgs.msg import SolidPrimitive
         from moveit_msgs.msg import (
+            AttachedCollisionObject,
             BoundingVolume,
             CollisionObject,
             Constraints,
+            JointConstraint,
             MoveItErrorCodes,
             OrientationConstraint,
             PlanningScene,
@@ -227,6 +229,28 @@ def main():
         obj.primitives.append(prim)
         obj.primitive_poses.append(p)
 
+    def add_box_pose(obj, pose_data, size_xyz):
+        prim = SolidPrimitive()
+        prim.type = SolidPrimitive.BOX
+        prim.dimensions = [float(v) for v in size_xyz]
+        obj.primitives.append(prim)
+        obj.primitive_poses.append(pose_msg(pose_data))
+
+    def joint_goal_constraints(names, positions, tolerance):
+        c = Constraints()
+        tol = max(float(tolerance), 1e-4)
+        out = []
+        for name, pos in zip(names, positions):
+            jc = JointConstraint()
+            jc.joint_name = str(name)
+            jc.position = float(pos)
+            jc.tolerance_above = tol
+            jc.tolerance_below = tol
+            jc.weight = 1.0
+            out.append(jc)
+        c.joint_constraints = out
+        return c
+
     def default_scene_objects():
         objects = []
 
@@ -273,6 +297,95 @@ def main():
                 return {"id": rid, "ok": ok, "type": kind,
                         "error": "" if ok else "apply_planning_scene failed"}
 
+            if kind == "attach_box":
+                req = ApplyPlanningScene.Request()
+                ps = PlanningScene()
+                ps.is_diff = True
+                ps.robot_state.is_diff = True
+
+                object_id = str(msg.get("object_id", "carried_object"))
+                link_name = str(msg.get("link_name", "grasp_tcp"))
+                size_xyz = [float(v) for v in msg["size_xyz"]]
+                pose_data = msg["pose"]
+                touch_links = list(msg.get(
+                    "touch_links",
+                    ["gripper_base", "grasp_tcp", "link6", "link7", "link8"]))
+
+                # 直接创建 attached collision object。
+                # 该物体来自 MuJoCo，此前并不存在于 MoveIt world scene 中，
+                # 因此这里不要先对一个不存在的 world object 发送 REMOVE。
+                co = CollisionObject()
+                co.header.frame_id = link_name
+                co.id = object_id
+                add_box_pose(co, pose_data, size_xyz)
+                co.operation = CollisionObject.ADD
+
+                aco = AttachedCollisionObject()
+                aco.link_name = link_name
+                aco.touch_links = touch_links
+                aco.object = co
+
+                ps.robot_state.attached_collision_objects = [aco]
+                req.scene = ps
+
+                try:
+                    res = wait_future(scene_cli.call_async(req), 5.0)
+                except Exception as exc:
+                    return {
+                        "id": rid,
+                        "ok": False,
+                        "type": kind,
+                        "error": f"attach_box service exception: {exc}",
+                        "object_id": object_id,
+                        "link_name": link_name,
+                        "size_xyz": size_xyz,
+                        "touch_links": touch_links,
+                    }
+
+                if res is None:
+                    return {
+                        "id": rid,
+                        "ok": False,
+                        "type": kind,
+                        "error": "attach_box apply_planning_scene timeout/no response",
+                        "object_id": object_id,
+                        "link_name": link_name,
+                        "size_xyz": size_xyz,
+                        "touch_links": touch_links,
+                    }
+
+                ok = bool(res.success)
+                return {
+                    "id": rid,
+                    "ok": ok,
+                    "type": kind,
+                    "error": "" if ok else (
+                        "apply_planning_scene returned success=False for attach_box"
+                    ),
+                    "object_id": object_id,
+                    "link_name": link_name,
+                    "size_xyz": size_xyz,
+                    "touch_links": touch_links,
+                }
+
+            if kind == "detach_object":
+                req = ApplyPlanningScene.Request()
+                ps = PlanningScene()
+                ps.is_diff = True
+                ps.robot_state.is_diff = True
+
+                aco = AttachedCollisionObject()
+                aco.link_name = str(msg.get("link_name", "grasp_tcp"))
+                aco.object.id = str(msg.get("object_id", "carried_object"))
+                aco.object.operation = CollisionObject.REMOVE
+                ps.robot_state.attached_collision_objects = [aco]
+
+                req.scene = ps
+                res = wait_future(scene_cli.call_async(req), 5.0)
+                ok = bool(res and res.success)
+                return {"id": rid, "ok": ok, "type": kind,
+                        "error": "" if ok else "detach_object failed"}
+
             if kind == "compute_ik":
                 req = GetPositionIK.Request()
                 ik = req.ik_request
@@ -296,6 +409,41 @@ def main():
                     "error_code": int(res.error_code.val),
                     "solution_names": list(sol.name),
                     "solution_positions": [float(x) for x in sol.position],
+                }
+
+            if kind == "plan_to_joint":
+                req = GetMotionPlan.Request()
+                mpr = req.motion_plan_request
+                mpr.group_name = str(msg.get("group_name", "piper_arm"))
+                mpr.start_state = robot_state(
+                    msg["start_joint_names"], msg["start_joint_positions"])
+                mpr.goal_constraints = [joint_goal_constraints(
+                    msg["target_joint_names"],
+                    msg["target_joint_positions"],
+                    msg.get("joint_tolerance", 0.02),
+                )]
+                mpr.num_planning_attempts = int(msg.get("planning_attempts", 4))
+                mpr.allowed_planning_time = float(msg.get("allowed_planning_time", 3.0))
+                mpr.planner_id = str(msg.get("planner_id", "RRTConnectkConfigDefault"))
+                if hasattr(mpr, "pipeline_id"):
+                    mpr.pipeline_id = "ompl"
+                if hasattr(mpr, "max_velocity_scaling_factor"):
+                    mpr.max_velocity_scaling_factor = float(msg.get("velocity_scaling", 0.20))
+                if hasattr(mpr, "max_acceleration_scaling_factor"):
+                    mpr.max_acceleration_scaling_factor = float(msg.get("acceleration_scaling", 0.20))
+
+                timeout = max(4.0, float(mpr.allowed_planning_time) + 2.0)
+                res = wait_future(plan_cli.call_async(req), timeout)
+                if res is None:
+                    return {"id": rid, "ok": False, "type": kind,
+                            "error": "joint planning timeout"}
+                ans = res.motion_plan_response
+                ok = moveit_success(ans.error_code)
+                return {
+                    "id": rid, "ok": ok, "type": kind,
+                    "error_code": int(ans.error_code.val),
+                    "planning_time": float(ans.planning_time),
+                    "trajectory": trajectory_to_dict(ans.trajectory) if ok else {},
                 }
 
             if kind == "plan_to_pose":

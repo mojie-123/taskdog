@@ -144,43 +144,45 @@ class LocalReachState:
 
 @dataclass
 class LiftState:
-    """LIFT 两阶段轨迹及 CLOSE 后 hold 检验的跨帧状态。"""
+    """CLOSE hold + MoveIt Cartesian lift + MoveIt retract。"""
     stage: int = 0
-    q_stage1_start: Any = None
-    q_stage1_cmd: Any = None
-    stage1_step: int = 0
-    ee_p_start: Any = None
-    fk_dxyz: Any = None
-    q_retract0: Any = None
-    stage2_step: int = 0
+    arm_q_hold: Any = None
     obj_z_start: Any = None
     hold_remaining: int = 0
     hold_seen: int = 0
-    hold_contacts: np.ndarray = field(
-        default_factory=lambda: np.zeros(2, dtype=np.int32))
+    hold_contacts: np.ndarray = field(default_factory=lambda: np.zeros(2, dtype=np.int32))
     hold_obj_p0: Any = None
+    attached: bool = False
+    attached_object_id: str = "mujoco_carried_object"
+    object_rel_tcp_p0: Any = None
+    lift_cmds: Any = None
+    lift_i: int = 0
+    lift_target_tcp_base: Any = None
+    retract_cmds: Any = None
+    retract_i: int = 0
+    contact_miss_steps: int = 0
 
     def reset(self):
         self.stage = 0
-        self.q_stage1_start = None
-        self.q_stage1_cmd = None
-        self.stage1_step = 0
-        self.ee_p_start = None
-        self.fk_dxyz = None
-        self.q_retract0 = None
-        self.stage2_step = 0
+        self.arm_q_hold = None
         self.obj_z_start = None
         self.hold_remaining = 0
         self.hold_seen = 0
         self.hold_contacts[:] = 0
         self.hold_obj_p0 = None
+        self.attached = False
+        self.object_rel_tcp_p0 = None
+        self.lift_cmds = None
+        self.lift_i = 0
+        self.lift_target_tcp_base = None
+        self.retract_cmds = None
+        self.retract_i = 0
+        self.contact_miss_steps = 0
 
-    def begin(self, cur_q, ee_p_start, hold_steps):
+    def begin(self, cur_q, hold_steps):
         self.reset()
         self.stage = 1
-        self.q_stage1_start = np.asarray(cur_q, dtype=np.float64).copy()
-        self.q_stage1_cmd = np.asarray(cur_q, dtype=np.float64).copy()
-        self.ee_p_start = np.asarray(ee_p_start, dtype=np.float64).copy()
+        self.arm_q_hold = np.asarray(cur_q, dtype=np.float64).copy()
         self.hold_remaining = int(hold_steps)
 
 
@@ -456,6 +458,19 @@ def main():
                         help="MoveIt Cartesian approach 最大笛卡尔步长(m)")
     parser.add_argument("--moveit_cart_fraction", type=float, default=0.95,
                         help="Cartesian approach 最低可接受完成比例")
+    parser.add_argument("--moveit_lift_distance", type=float, default=0.08,
+                        help="CLOSE后由MoveIt沿世界+Z Cartesian抬升距离(m)")
+    parser.add_argument("--moveit_lift_cart_fraction", type=float, default=0.95,
+                        help="MoveIt LIFT Cartesian path最低可接受完成比例")
+    parser.add_argument("--moveit_lift_joint_tolerance", type=float, default=0.04,
+                        help="MoveIt LIFT/RETRACT实际关节收敛阈值(rad)")
+    parser.add_argument("--moveit_lift_max_object_slip", type=float, default=0.015,
+                        help="LIFT期间物体相对TCP平移变化超过该值(m)则中止")
+    parser.add_argument("--moveit_lift_contact_miss_steps", type=int, default=8,
+                        help="LIFT期间连续多少步双指都无接触才判定抓取丢失")
+    parser.add_argument("--moveit_attached_object_size", nargs=3, type=float, default=None,
+                        metavar=("SX","SY","SZ"),
+                        help="MoveIt附着物体碰撞盒尺寸(m)；不填则按object使用默认近似")
     parser.add_argument("--moveit_exec_joint_tolerance", type=float, default=0.05,
                         help="MoveIt PRE轨迹播放结束后，实际关节到最终轨迹点的最大允许误差(rad)")
     parser.add_argument("--moveit_approach_joint_tolerance", type=float, default=0.025,
@@ -750,17 +765,66 @@ def main():
         return _out
 
 
+    def _object_pose_world(_obj_name):
+        return _mj_body_pose_world(env, _obj_name)
+
+    def _object_pose_in_tcp(_obj_name):
+        _T_w_tcp = _current_tcp_pose_world().matrix()
+        _T_w_obj = _object_pose_world(_obj_name).matrix()
+        _T_tcp_obj = _inv_T(_T_w_tcp) @ _T_w_obj
+        return _MoveItPose(_T_tcp_obj[:3, 3].copy(), _T_tcp_obj[:3, :3].copy())
+
+    def _default_attached_size(_obj_name):
+        _sizes = {
+            "cube":   np.array([0.050, 0.050, 0.050], dtype=np.float64),
+            "apple":  np.array([0.085, 0.085, 0.085], dtype=np.float64),
+            "bowl":   np.array([0.120, 0.120, 0.070], dtype=np.float64),
+            "banana": np.array([0.180, 0.060, 0.055], dtype=np.float64),
+        }
+        if args.moveit_attached_object_size is not None:
+            return np.asarray(args.moveit_attached_object_size, dtype=np.float64)
+        return _sizes.get(_obj_name, np.array([0.060, 0.060, 0.060], dtype=np.float64))
+
+    def _detach_lift_object_safely():
+        if not lift_ctx.attached:
+            return
+        try:
+            _rep = moveit_bridge.detach_object(
+                lift_ctx.attached_object_id, link_name="grasp_tcp", timeout=6.0)
+            if not _rep.get("ok", False):
+                print(f"[WARN] MoveIt detach carried object failed: {_rep}", flush=True)
+        except Exception as _e:
+            print(f"[WARN] MoveIt detach carried object exception: {_e}", flush=True)
+        lift_ctx.attached = False
+
+    def _lift_grasp_guard():
+        _tc = _fingers_contact(args.object)
+        if (not _tc["link7"]) and (not _tc["link8"]):
+            lift_ctx.contact_miss_steps += 1
+        else:
+            lift_ctx.contact_miss_steps = 0
+
+        if lift_ctx.contact_miss_steps >= max(
+                1, int(args.moveit_lift_contact_miss_steps)):
+            return False, (
+                f"both finger contacts missing for "
+                f"{lift_ctx.contact_miss_steps} steps")
+
+        if lift_ctx.object_rel_tcp_p0 is not None:
+            _p_rel = _object_pose_in_tcp(args.object).position
+            _slip = float(np.linalg.norm(_p_rel - lift_ctx.object_rel_tcp_p0))
+            if _slip > float(args.moveit_lift_max_object_slip):
+                return False, (
+                    f"object/TCP relative slip {_slip*1000:.1f}mm > "
+                    f"{float(args.moveit_lift_max_object_slip)*1000:.1f}mm")
+        return True, ""
+
     # PRE_GRASP 每步最大增量（与原版 navigate_to_goal_nav2_whole.py 一致）
     _PG_MAX_DELTA = np.array([0.03, 0.05, 0.05, 0.04, 0.04, 0.04], dtype=np.float64)
 
     _LIFT_HOLD_STEPS      = 20                     # CLOSE 后先静置约 0.4s，让接触/夹持力稳定
     # 新LIFT Stage1：不再强制末端走世界坐标竖直直线。先固定j1/j4~j6，
     # 仅让j2/j3朝ARM_SIDE方向缓慢移动；末端实际升高20mm后进入Stage2。
-    _LIFT_STAGE1_EE_RISE = 0.020                   # m；当前调轨迹阶段只看末端高度
-    _LIFT_STAGE1_MAX_DQ   = 0.003                   # rad/policy-step；j2/j3命令最大增量
-    _LIFT_STAGE1_TEST_DQ  = 0.010                   # rad；初始化时一次性FK方向试探步
-    _LIFT_STAGE1_FK_MIN_DZ= 1e-5                   # m；预测dz必须为正（留数值余量）
-    _LIFT_RETRACT_STEPS   = 400                     # Stage2全关节收回ARM_SIDE_ANGLES
 
     # ── 辅助函数 ──
     def _wrap_angle(a):
@@ -1995,11 +2059,14 @@ def main():
                     state_step = 0
 
             elif current_state == PipelineState.LIFT:
-                # 新LIFT：先用j2/j3把夹爪抬离桌面，再全关节收回ARM_SIDE。
-                # Stage1不再要求world x/y不变，也不做DLS/姿态保持。
+                # MoveIt LIFT:
+                # 1) CLOSE后hold稳定性检查
+                # 2) 将被抓物体作为attached collision object
+                # 3) Cartesian沿世界+Z抬升
+                # 4) MoveIt规划到ARM_SIDE安全运输姿态
+                # MoveIt只规划；MuJoCo PD执行，夹爪±2N恒力模式保持。
                 cmd_vx = 0.0; cmd_vy = 0.0; cmd_wz = 0.0
                 cur_q = _get_arm_q(jpos)
-                p_cur_w, _ = _gb_pose_world()
 
                 env.set_gripper_target(np.array([
                     close_ctx.finger_targets[0] if close_ctx.finger_targets[0] is not None else 0.0,
@@ -2007,235 +2074,333 @@ def main():
                 ], dtype=np.float64))
 
                 if lift_ctx.stage == 0:
-                    lift_ctx.begin(cur_q, p_cur_w, _LIFT_HOLD_STEPS)
-
+                    lift_ctx.begin(cur_q, _LIFT_HOLD_STEPS)
                     try:
-                        _lift_obj_p0 = np.asarray(
-                            env.get_object_pos(args.object), dtype=np.float64).copy()
-                        lift_ctx.obj_z_start = float(_lift_obj_p0[2])
-                        lift_ctx.hold_obj_p0 = _lift_obj_p0.copy()
+                        _obj_p0 = np.asarray(env.get_object_pos(args.object), dtype=np.float64).copy()
+                        lift_ctx.obj_z_start = float(_obj_p0[2])
+                        lift_ctx.hold_obj_p0 = _obj_p0.copy()
                     except Exception:
                         lift_ctx.obj_z_start = None
                         lift_ctx.hold_obj_p0 = None
+                    print(
+                        f"[SM] LIFT MoveIt init: hold={_LIFT_HOLD_STEPS} steps, "
+                        f"cartesian_dz={float(args.moveit_lift_distance)*1000:.1f}mm",
+                        flush=True)
 
-                    # 只在LIFT开始时做一次MuJoCo FK方向检查：
-                    # 沿j2/j3 -> ARM_SIDE各试探最多0.01rad，确认末端z会增加。
-                    _q_test = lift_ctx.q_stage1_start.copy()
-                    for _ji in (1, 2):
-                        _dq_to_side = float(ARM_SIDE_ANGLES[_ji] - _q_test[_ji])
-                        _q_test[_ji] += float(np.clip(
-                            _dq_to_side, -_LIFT_STAGE1_TEST_DQ, _LIFT_STAGE1_TEST_DQ))
-                    try:
-                        _p_fk0 = _gb_pos_for_arm_q(lift_ctx.q_stage1_start)
-                        _p_fk1 = _gb_pos_for_arm_q(_q_test)
-                        lift_ctx.fk_dxyz = _p_fk1 - _p_fk0
-                    except Exception as _e:
-                        lift_ctx.fk_dxyz = np.array([np.nan, np.nan, np.nan])
-                        print(f"[WARN] LIFT FK direction check failed: {_e} -> ARM_INIT retry",
-                              flush=True)
+                if lift_ctx.stage == 1 and next_state == current_state:
+                    _arm_step(lift_ctx.arm_q_hold)
+                    _tc_hold = _fingers_contact(args.object)
+                    lift_ctx.hold_seen += 1
+                    lift_ctx.hold_contacts[0] += int(_tc_hold["link7"])
+                    lift_ctx.hold_contacts[1] += int(_tc_hold["link8"])
+                    lift_ctx.hold_remaining -= 1
+                    state_step += 1
+
+                    if lift_ctx.hold_remaining <= 0:
+                        _den = max(lift_ctx.hold_seen, 1)
+                        _r7 = float(lift_ctx.hold_contacts[0]) / _den
+                        _r8 = float(lift_ctx.hold_contacts[1]) / _den
+                        try:
+                            _obj_now = np.asarray(env.get_object_pos(args.object), dtype=np.float64)
+                            _hold_move = (
+                                float(np.linalg.norm(_obj_now - lift_ctx.hold_obj_p0))
+                                if lift_ctx.hold_obj_p0 is not None else float("nan"))
+                        except Exception:
+                            _hold_move = float("nan")
+
+                        _contact_ok = (
+                            _r7 >= _LIFT_HOLD_CONTACT_RATIO and
+                            _r8 >= _LIFT_HOLD_CONTACT_RATIO)
+                        _motion_ok = (
+                            not np.isfinite(_hold_move) or
+                            _hold_move <= _LIFT_HOLD_MAX_OBJ_MOVE)
+
+                        if not (_contact_ok and _motion_ok):
+                            _move_msg = (
+                                f"{_hold_move*1000:.2f}mm"
+                                if np.isfinite(_hold_move) else "unavailable")
+                            print(
+                                f"[WARN] LIFT hold unstable: "
+                                f"contact_rate={_r7:.2f}/{_r8:.2f}, "
+                                f"obj_move={_move_msg} -> ARM_INIT retry",
+                                flush=True)
+                            env.disable_gripper_force_hold()
+                            grasp_result = None
+                            lift_ctx.reset()
+                            next_state = PipelineState.ARM_INIT
+                            state_step = 0
+                        else:
+                            _move_msg = (
+                                f"{_hold_move*1000:.2f}mm"
+                                if np.isfinite(_hold_move) else "unavailable")
+                            print(
+                                f"[SM] LIFT hold done: "
+                                f"contact_rate={_r7:.2f}/{_r8:.2f}, "
+                                f"obj_move={_move_msg} -> MoveIt attach + Cartesian lift",
+                                flush=True)
+
+                            try:
+                                _obj_tcp = _object_pose_in_tcp(args.object)
+                                lift_ctx.object_rel_tcp_p0 = _obj_tcp.position.astype(np.float64).copy()
+                                _size = _default_attached_size(args.object)
+                                _att = moveit_bridge.attach_box(
+                                    lift_ctx.attached_object_id,
+                                    _pose_to_ros(_obj_tcp),
+                                    _size,
+                                    link_name="grasp_tcp",
+                                    touch_links=["gripper_base", "grasp_tcp", "link6", "link7", "link8"],
+                                    timeout=6.0,
+                                )
+                                if not _att.get("ok", False):
+                                    raise RuntimeError(str(_att))
+                                lift_ctx.attached = True
+                                print(
+                                    f"[MOVEIT] attached {args.object} as box "
+                                    f"size={np.round(_size,3)}m to grasp_tcp",
+                                    flush=True)
+
+                                _T_w_b = _mj_body_pose_world(env, "base_link").matrix()
+                                _T_w_tcp = _current_tcp_pose_world().matrix()
+                                _T_w_tcp_target = _T_w_tcp.copy()
+                                _T_w_tcp_target[:3, 3] += np.array(
+                                    [0.0, 0.0, float(args.moveit_lift_distance)],
+                                    dtype=np.float64)
+                                _T_b_tcp_target = _inv_T(_T_w_b) @ _T_w_tcp_target
+                                _lift_target = _MoveItPose(
+                                    _T_b_tcp_target[:3, 3].copy(),
+                                    _T_b_tcp_target[:3, :3].copy())
+
+                                _names, _positions = _get_moveit_joint_state(jpos)
+                                _cart = moveit_bridge.compute_cartesian_path(
+                                    [_pose_to_ros(_lift_target)],
+                                    _names, _positions,
+                                    max_step=float(args.moveit_cart_step),
+                                    jump_threshold=0.0,
+                                    avoid_collisions=True,
+                                    velocity_scaling=0.15,
+                                    acceleration_scaling=0.15,
+                                    timeout=8.0,
+                                )
+                                _frac = float(_cart.get("fraction", 0.0))
+                                if (not _cart.get("ok", False) or
+                                        _frac < float(args.moveit_lift_cart_fraction)):
+                                    raise RuntimeError(
+                                        f"Cartesian lift rejected fraction={_frac:.3f} reply={_cart}")
+                                _dense = _dense_moveit_commands(_cart)
+                                if len(_dense) == 0:
+                                    raise RuntimeError("Cartesian lift returned empty trajectory")
+
+                                lift_ctx.lift_cmds = _dense
+                                lift_ctx.lift_i = 0
+                                lift_ctx.lift_target_tcp_base = _lift_target
+                                lift_ctx.stage = 2
+                                state_step = 0
+                                print(
+                                    f"[MOVEIT] LIFT Cartesian accepted "
+                                    f"fraction={_frac:.3f} commands={len(_dense)} "
+                                    f"dz={float(args.moveit_lift_distance)*1000:.1f}mm",
+                                    flush=True)
+                            except Exception as _e:
+                                print(
+                                    f"[WARN] MoveIt LIFT setup/planning failed: {_e} "
+                                    f"-> ARM_INIT retry", flush=True)
+                                _detach_lift_object_safely()
+                                env.disable_gripper_force_hold()
+                                grasp_result = None
+                                lift_ctx.reset()
+                                next_state = PipelineState.ARM_INIT
+                                state_step = 0
+
+                elif lift_ctx.stage == 2 and next_state == current_state:
+                    _idx = min(lift_ctx.lift_i, len(lift_ctx.lift_cmds) - 1)
+                    _arm_step(lift_ctx.lift_cmds[_idx])
+                    if lift_ctx.lift_i < len(lift_ctx.lift_cmds) - 1:
+                        lift_ctx.lift_i += 1
+
+                    _ok_guard, _guard_reason = _lift_grasp_guard()
+                    if not _ok_guard:
+                        print(
+                            f"[WARN] MoveIt LIFT grasp lost: {_guard_reason} "
+                            f"-> ARM_INIT retry", flush=True)
+                        _detach_lift_object_safely()
+                        env.disable_gripper_force_hold()
                         grasp_result = None
                         lift_ctx.reset()
                         next_state = PipelineState.ARM_INIT
                         state_step = 0
+                    else:
+                        _final_q = lift_ctx.lift_cmds[-1]
+                        _qerr = float(np.max(np.abs(_get_arm_q(jpos) - _final_q)))
+                        _pos_err, _rot_err = _tcp_target_error_base(
+                            lift_ctx.lift_target_tcp_base)
 
-                    if next_state == current_state:
-                        _fk_dz = float(lift_ctx.fk_dxyz[2])
-                        print(
-                            f"[SM] LIFT stage1 joint-lift init: "
-                            f"ee_world={np.round(lift_ctx.ee_p_start,4)}, "
-                            f"q_start={np.round(lift_ctx.q_stage1_start,3)}, "
-                            f"FK_test_dxyz_mm={np.round(lift_ctx.fk_dxyz*1000.0,3)}",
-                            flush=True)
-                        if (not np.isfinite(_fk_dz)) or _fk_dz <= _LIFT_STAGE1_FK_MIN_DZ:
+                        if state_step == 0 or state_step % 20 == 0:
+                            try:
+                                _obj_z_now = float(env.get_object_pos(args.object)[2])
+                                _obj_rise = (
+                                    _obj_z_now - lift_ctx.obj_z_start
+                                    if lift_ctx.obj_z_start is not None else float("nan"))
+                            except Exception:
+                                _obj_rise = float("nan")
+                            _obj_msg = (
+                                f"{_obj_rise*1000:+.1f}mm"
+                                if np.isfinite(_obj_rise) else "unavailable")
                             print(
-                                f"[WARN] LIFT j2/j3 -> ARM_SIDE direction does not raise EE: "
-                                f"pred_dz={_fk_dz*1000.0:.3f}mm -> ARM_INIT retry",
+                                f"[MOVEIT] LIFT execute "
+                                f"{min(lift_ctx.lift_i+1,len(lift_ctx.lift_cmds))}/"
+                                f"{len(lift_ctx.lift_cmds)} "
+                                f"qerr={_qerr:.3f}rad "
+                                f"tcp_pos_err={_pos_err*1000:.1f}mm "
+                                f"obj_rise={_obj_msg}",
                                 flush=True)
+
+                        state_step += 1
+                        _done_cmds = lift_ctx.lift_i >= len(lift_ctx.lift_cmds) - 1
+                        _settled = (
+                            _done_cmds and
+                            _qerr <= float(args.moveit_lift_joint_tolerance) and
+                            _pos_err <= 0.020 and
+                            _rot_err <= math.radians(12.0))
+
+                        if _settled:
+                            print(
+                                f"[MOVEIT] Cartesian LIFT settled: "
+                                f"qerr={_qerr:.3f}rad pos={_pos_err*1000:.1f}mm "
+                                f"-> plan ARM_SIDE retract",
+                                flush=True)
+                            try:
+                                _names, _positions = _get_moveit_joint_state(jpos)
+                                _plan = moveit_bridge.plan_to_joint(
+                                    ARM_JOINT_NAMES,
+                                    ARM_SIDE_ANGLES,
+                                    _names,
+                                    _positions,
+                                    joint_tolerance=0.02,
+                                    allowed_planning_time=max(3.0, float(args.moveit_plan_time)),
+                                    planning_attempts=4,
+                                    velocity_scaling=0.18,
+                                    acceleration_scaling=0.18,
+                                    timeout=9.0,
+                                )
+                                if not _plan.get("ok", False):
+                                    raise RuntimeError(str(_plan))
+                                _dense = _dense_moveit_commands(_plan)
+                                if len(_dense) == 0:
+                                    raise RuntimeError("ARM_SIDE plan returned empty trajectory")
+                                lift_ctx.retract_cmds = _dense
+                                lift_ctx.retract_i = 0
+                                lift_ctx.stage = 3
+                                state_step = 0
+                                print(
+                                    f"[MOVEIT] ARM_SIDE retract plan accepted "
+                                    f"commands={len(_dense)}", flush=True)
+                            except Exception as _e:
+                                print(
+                                    f"[WARN] MoveIt retract planning failed: {_e} "
+                                    f"-> ARM_INIT retry", flush=True)
+                                _detach_lift_object_safely()
+                                env.disable_gripper_force_hold()
+                                grasp_result = None
+                                lift_ctx.reset()
+                                next_state = PipelineState.ARM_INIT
+                                state_step = 0
+
+                        elif state_step >= max(350, len(lift_ctx.lift_cmds) + 220):
+                            print(
+                                f"[WARN] MoveIt Cartesian LIFT execution timeout "
+                                f"qerr={_qerr:.3f}rad pos={_pos_err*1000:.1f}mm "
+                                f"-> ARM_INIT retry", flush=True)
+                            _detach_lift_object_safely()
+                            env.disable_gripper_force_hold()
                             grasp_result = None
                             lift_ctx.reset()
                             next_state = PipelineState.ARM_INIT
                             state_step = 0
 
-                if lift_ctx.stage == 1 and next_state == current_state:
-                    p_cur_w, _ = _gb_pose_world()
-                    _ee_dp = p_cur_w - lift_ctx.ee_p_start
-                    _ee_rise = float(_ee_dp[2])
-                    try:
-                        _obj_z_now = float(env.get_object_pos(args.object)[2])
-                    except Exception:
-                        _obj_z_now = float('nan')
-                    _obj_rise = (
-                        _obj_z_now - lift_ctx.obj_z_start
-                        if lift_ctx.obj_z_start is not None and np.isfinite(_obj_z_now)
-                        else float('nan'))
+                elif lift_ctx.stage == 3 and next_state == current_state:
+                    _idx = min(lift_ctx.retract_i, len(lift_ctx.retract_cmds) - 1)
+                    _arm_step(lift_ctx.retract_cmds[_idx])
+                    if lift_ctx.retract_i < len(lift_ctx.retract_cmds) - 1:
+                        lift_ctx.retract_i += 1
 
-                    # CLOSE后先短暂静置，沿用已经验证过的窗口接触稳定性检查。
-                    if lift_ctx.hold_remaining > 0:
-                        _arm_step(lift_ctx.q_stage1_start.copy())
-
-                        _tc_hold = _fingers_contact(args.object)
-                        lift_ctx.hold_seen += 1
-                        lift_ctx.hold_contacts[0] += int(_tc_hold["link7"])
-                        lift_ctx.hold_contacts[1] += int(_tc_hold["link8"])
-                        lift_ctx.hold_remaining -= 1
-
-                        if lift_ctx.hold_remaining == 0:
-                            _den = max(lift_ctx.hold_seen, 1)
-                            _r7 = float(lift_ctx.hold_contacts[0]) / _den
-                            _r8 = float(lift_ctx.hold_contacts[1]) / _den
-                            try:
-                                _obj_now = np.asarray(
-                                    env.get_object_pos(args.object), dtype=np.float64)
-                                _hold_move = (
-                                    float(np.linalg.norm(_obj_now - lift_ctx.hold_obj_p0))
-                                    if lift_ctx.hold_obj_p0 is not None else float('nan'))
-                            except Exception:
-                                _hold_move = float('nan')
-
-                            _contact_ok = (
-                                _r7 >= _LIFT_HOLD_CONTACT_RATIO and
-                                _r8 >= _LIFT_HOLD_CONTACT_RATIO)
-                            _motion_ok = (
-                                not np.isfinite(_hold_move) or
-                                _hold_move <= _LIFT_HOLD_MAX_OBJ_MOVE)
-                            if not (_contact_ok and _motion_ok):
-                                _move_msg = (
-                                    f"{_hold_move*1000:.2f}mm"
-                                    if np.isfinite(_hold_move) else "unavailable")
-                                print(
-                                    f"[WARN] LIFT hold unstable: "
-                                    f"contact_rate={_r7:.2f}/{_r8:.2f}, "
-                                    f"obj_move={_move_msg} -> ARM_INIT retry",
-                                    flush=True)
-                                grasp_result = None
-                                lift_ctx.reset()
-                                next_state = PipelineState.ARM_INIT
-                                state_step = 0
-                            else:
-                                _move_msg = (
-                                    f"{_hold_move*1000:.2f}mm"
-                                    if np.isfinite(_hold_move) else "unavailable")
-                                print(
-                                    f"[SM] LIFT hold done: "
-                                    f"contact_rate={_r7:.2f}/{_r8:.2f}, "
-                                    f"obj_move={_move_msg} -> j2/j3 lift",
-                                    flush=True)
-                        if next_state == current_state:
-                            state_step += 1
-
-                    # 当前调轨迹阶段：Stage1 -> Stage2只看末端实际z上升20mm。
-                    elif _ee_rise >= _LIFT_STAGE1_EE_RISE:
-                        lift_ctx.stage = 2
-                        lift_ctx.q_retract0 = cur_q.copy()
-                        lift_ctx.stage2_step = 0
-                        state_step = 0
-                        _obj_msg = (
-                            f"{_obj_rise*1000.0:+.1f}mm"
-                            if np.isfinite(_obj_rise) else "unavailable")
+                    _ok_guard, _guard_reason = _lift_grasp_guard()
+                    if not _ok_guard:
                         print(
-                            f"[SM] LIFT stage1 done: "
-                            f"ee_dxyz_mm={np.round(_ee_dp*1000.0,2)}, "
-                            f"obj_rise={_obj_msg} -> stage2 all-joint retract",
-                            flush=True)
-
-                    elif state_step >= BUDGET[PipelineState.LIFT]:
-                        _arm_step(cur_q.copy())
-                        print(
-                            f"[WARN] LIFT stage1 timeout: "
-                            f"ee_dxyz_mm={np.round(_ee_dp*1000.0,2)} "
+                            f"[WARN] MoveIt RETRACT grasp lost: {_guard_reason} "
                             f"-> ARM_INIT retry", flush=True)
+                        _detach_lift_object_safely()
+                        env.disable_gripper_force_hold()
                         grasp_result = None
                         lift_ctx.reset()
                         next_state = PipelineState.ARM_INIT
                         state_step = 0
-
                     else:
-                        # Stage1：j1、j4~j6保持LIFT开始时角度；
-                        # 仅j2/j3沿固定方向缓慢逼近ARM_SIDE。
-                        q_cmd = lift_ctx.q_stage1_start.copy()
-                        for _ji in (1, 2):
-                            _remain = float(
-                                ARM_SIDE_ANGLES[_ji] - lift_ctx.q_stage1_cmd[_ji])
-                            _step = float(np.clip(
-                                _remain, -_LIFT_STAGE1_MAX_DQ, _LIFT_STAGE1_MAX_DQ))
-                            lift_ctx.q_stage1_cmd[_ji] += _step
-                            q_cmd[_ji] = lift_ctx.q_stage1_cmd[_ji]
-                        q_cmd = np.clip(q_cmd, _ARM_LO, _ARM_HI)
-                        _arm_step(q_cmd)
-                        lift_ctx.stage1_step += 1
+                        _final_q = lift_ctx.retract_cmds[-1]
+                        _qerr = float(np.max(np.abs(_get_arm_q(jpos) - _final_q)))
 
-                        if lift_ctx.stage1_step == 1 or lift_ctx.stage1_step % 25 == 0:
+                        if state_step == 0 or state_step % 30 == 0:
+                            try:
+                                _obj_z_now = float(env.get_object_pos(args.object)[2])
+                                _obj_rise = (
+                                    _obj_z_now - lift_ctx.obj_z_start
+                                    if lift_ctx.obj_z_start is not None else float("nan"))
+                            except Exception:
+                                _obj_rise = float("nan")
                             _obj_msg = (
-                                f"{_obj_rise*1000.0:+.1f}mm"
+                                f"{_obj_rise*1000:+.1f}mm"
                                 if np.isfinite(_obj_rise) else "unavailable")
                             print(
-                                f"[DIAG] LIFT stage1 joint step {lift_ctx.stage1_step}: "
-                                f"ee_dxyz_mm={np.round(_ee_dp*1000.0,2)} "
-                                f"q2/q3=[{cur_q[1]:+.3f},{cur_q[2]:+.3f}] "
-                                f"cmd=[{q_cmd[1]:+.3f},{q_cmd[2]:+.3f}] "
-                                f"obj_rise={_obj_msg}",
+                                f"[MOVEIT] RETRACT execute "
+                                f"{min(lift_ctx.retract_i+1,len(lift_ctx.retract_cmds))}/"
+                                f"{len(lift_ctx.retract_cmds)} "
+                                f"qerr={_qerr:.3f}rad obj_rise={_obj_msg}",
                                 flush=True)
+
                         state_step += 1
+                        _done_cmds = lift_ctx.retract_i >= len(lift_ctx.retract_cmds) - 1
+                        if (_done_cmds and
+                                _qerr <= float(args.moveit_lift_joint_tolerance)):
+                            try:
+                                _obj_z_now = float(env.get_object_pos(args.object)[2])
+                            except Exception:
+                                _obj_z_now = 0.0
+                            _obj_rise = (
+                                _obj_z_now - lift_ctx.obj_z_start
+                                if lift_ctx.obj_z_start is not None else 0.0)
+                            _lift_success = (
+                                _obj_rise > 0.04
+                                if lift_ctx.obj_z_start is not None else _obj_z_now > 0.75)
 
-                elif lift_ctx.stage == 2 and next_state == current_state:
-                    lift_ctx.stage2_step += 1
-                    a = min(1.0, lift_ctx.stage2_step / max(_LIFT_RETRACT_STEPS, 1))
-                    a_s = a * a * (3.0 - 2.0 * a)
-                    q_cmd = lift_ctx.q_retract0 + a_s * (ARM_SIDE_ANGLES - lift_ctx.q_retract0)
-                    _arm_step(q_cmd)
-                    state_step += 1
-
-                    if lift_ctx.stage2_step % 50 == 0:
-                        p_now, _ = _gb_pose_world()
-                        _ee_dp2 = p_now - lift_ctx.ee_p_start
-                        try:
-                            obj_z = float(env.get_object_pos(args.object)[2])
-                        except Exception:
-                            obj_z = float('nan')
-                        obj_rise = (
-                            obj_z - lift_ctx.obj_z_start
-                            if lift_ctx.obj_z_start is not None and np.isfinite(obj_z)
-                            else float('nan'))
-                        _obj_msg = (
-                            f"{obj_rise*1000.0:+.1f}mm"
-                            if np.isfinite(obj_rise) else "unavailable")
-                        print(
-                            f"[DIAG] LIFT stage2 {lift_ctx.stage2_step}/{_LIFT_RETRACT_STEPS}: "
-                            f"ee_dxyz_mm={np.round(_ee_dp2*1000.0,2)} "
-                            f"obj_rise={_obj_msg}", flush=True)
-
-                    if a >= 1.0 or state_step >= BUDGET[PipelineState.LIFT]:
-                        try:
-                            obj_z = float(env.get_object_pos(args.object)[2])
-                        except Exception:
-                            obj_z = 0.0
-                        obj_rise = (obj_z - lift_ctx.obj_z_start
-                                    if lift_ctx.obj_z_start is not None else 0.0)
-                        p_now, _ = _gb_pose_world()
-                        _ee_dp2 = p_now - lift_ctx.ee_p_start
-                        print(
-                            f"[SM] LIFT trajectory done: "
-                            f"ee_dxyz_mm={np.round(_ee_dp2*1000.0,2)}, "
-                            f"obj_z={obj_z:.3f}m rise={obj_rise*1000:.1f}mm",
-                            flush=True)
-
-                        # 最终抓取成功判据暂时沿用旧逻辑；它发生在完整Stage2之后，
-                        # 不会阻止我们观察完整轨迹。Stage1->2已经只看EE高度。
-                        if lift_ctx.obj_z_start is not None:
-                            lift_success = (obj_rise > 0.04)
-                        else:
-                            lift_success = (obj_z > 0.75)
-                        if lift_success:
-                            next_state = PipelineState.PAN_NEG_X
-                        else:
                             print(
-                                "[SM] Object not lifted after full LIFT trajectory! "
-                                "Retry ARM_INIT", flush=True)
+                                f"[SM] MoveIt LIFT+RETRACT done: "
+                                f"qerr={_qerr:.3f}rad obj_z={_obj_z_now:.3f}m "
+                                f"rise={_obj_rise*1000:.1f}mm",
+                                flush=True)
+                            _detach_lift_object_safely()
+
+                            if _lift_success:
+                                next_state = PipelineState.PAN_NEG_X
+                            else:
+                                print(
+                                    "[WARN] Object did not rise enough after MoveIt LIFT "
+                                    "-> ARM_INIT retry", flush=True)
+                                env.disable_gripper_force_hold()
+                                grasp_result = None
+                                next_state = PipelineState.ARM_INIT
+                            lift_ctx.reset()
+                            state_step = 0
+
+                        elif state_step >= max(600, len(lift_ctx.retract_cmds) + 300):
+                            print(
+                                f"[WARN] MoveIt RETRACT execution timeout "
+                                f"qerr={_qerr:.3f}rad -> ARM_INIT retry",
+                                flush=True)
+                            _detach_lift_object_safely()
                             env.disable_gripper_force_hold()
                             grasp_result = None
+                            lift_ctx.reset()
                             next_state = PipelineState.ARM_INIT
-                        lift_ctx.reset()
-                        state_step = 0
+                            state_step = 0
 
             elif current_state == PipelineState.PAN_NEG_X:
                 # LIFT 后沿世界 -X 平移约 0.5m，再交给 Nav2。与其他 PAN 一样直接

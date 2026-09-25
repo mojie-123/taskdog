@@ -61,7 +61,7 @@ class MoveItROS2Bridge:
                 raise RuntimeError(
                     "MoveIt bridge init failed; inspect stderr and verify MoveIt 2 Humble is installed")
             if msg.get("ready"):
-                print("[MoveItBridge] ready: joint_states + compute_ik + planning + cartesian path", flush=True)
+                print("[MoveItBridge] ready: joint_states + IK + pose/joint planning + cartesian path + attached objects", flush=True)
                 return
             if "id" in msg:
                 self._pending[str(msg["id"])] = msg
@@ -99,6 +99,39 @@ class MoveItROS2Bridge:
     # ------------------------------------------------------------------
     # MoveIt calls
     # ------------------------------------------------------------------
+    def attach_box(
+        self,
+        object_id: str,
+        pose: dict,
+        size_xyz,
+        link_name: str = "grasp_tcp",
+        touch_links=None,
+        timeout: Optional[float] = None,
+    ) -> dict:
+        """Attach a box-shaped carried object to the robot PlanningScene."""
+        if touch_links is None:
+            touch_links = ["gripper_base", "grasp_tcp", "link7", "link8", "link6"]
+        return self._request({
+            "type": "attach_box",
+            "object_id": str(object_id),
+            "pose": pose,
+            "size_xyz": [float(x) for x in size_xyz],
+            "link_name": str(link_name),
+            "touch_links": list(touch_links),
+        }, timeout=timeout)
+
+    def detach_object(
+        self,
+        object_id: str,
+        link_name: str = "grasp_tcp",
+        timeout: Optional[float] = None,
+    ) -> dict:
+        return self._request({
+            "type": "detach_object",
+            "object_id": str(object_id),
+            "link_name": str(link_name),
+        }, timeout=timeout)
+
     def compute_ik(
         self,
         pose: dict,
@@ -150,6 +183,36 @@ class MoveItROS2Bridge:
             "start_joint_positions": [float(x) for x in start_joint_positions],
             "position_tolerance": float(position_tolerance),
             "orientation_tolerance": float(orientation_tolerance),
+            "allowed_planning_time": float(allowed_planning_time),
+            "planning_attempts": int(planning_attempts),
+            "velocity_scaling": float(velocity_scaling),
+            "acceleration_scaling": float(acceleration_scaling),
+            "planner_id": str(planner_id),
+        }, timeout=timeout or max(self.request_timeout, allowed_planning_time + 4.0))
+
+    def plan_to_joint(
+        self,
+        target_joint_names,
+        target_joint_positions,
+        start_joint_names,
+        start_joint_positions,
+        group_name: str = "piper_arm",
+        joint_tolerance: float = 0.02,
+        allowed_planning_time: float = 3.0,
+        planning_attempts: int = 4,
+        velocity_scaling: float = 0.20,
+        acceleration_scaling: float = 0.20,
+        planner_id: str = "RRTConnectkConfigDefault",
+        timeout: Optional[float] = None,
+    ) -> dict:
+        return self._request({
+            "type": "plan_to_joint",
+            "group_name": str(group_name),
+            "target_joint_names": list(target_joint_names),
+            "target_joint_positions": [float(x) for x in target_joint_positions],
+            "start_joint_names": list(start_joint_names),
+            "start_joint_positions": [float(x) for x in start_joint_positions],
+            "joint_tolerance": float(joint_tolerance),
             "allowed_planning_time": float(allowed_planning_time),
             "planning_attempts": int(planning_attempts),
             "velocity_scaling": float(velocity_scaling),
