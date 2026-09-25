@@ -1,0 +1,36 @@
+<?xml version="1.0"?>
+<robot name="M20_Piper_MoveIt">
+  <!-- Arm planning group. The planning tip is grasp_tcp, not joint7. -->
+  <group name="piper_arm">
+    <chain base_link="arm_base_link" tip_link="grasp_tcp"/>
+  </group>
+
+  <!-- Gripper group is kept separate; first integration plans joint1..joint6 only. -->
+  <group name="piper_gripper">
+    <joint name="joint7"/>
+    <joint name="joint8"/>
+  </group>
+
+  <group_state name="home" group="piper_arm">
+    <joint name="joint1" value="0.0"/>
+    <joint name="joint2" value="0.5"/>
+    <joint name="joint3" value="-1.0"/>
+    <joint name="joint4" value="0.0"/>
+    <joint name="joint5" value="0.5"/>
+    <joint name="joint6" value="0.0"/>
+  </group_state>
+
+  <!-- Adjacent bodies overlap by construction; do not treat those as self collisions. -->
+  <disable_collisions link1="base_link" link2="arm_base_link" reason="Adjacent"/>
+  <disable_collisions link1="arm_base_link" link2="link1" reason="Adjacent"/>
+  <disable_collisions link1="link1" link2="link2" reason="Adjacent"/>
+  <disable_collisions link1="link2" link2="link3" reason="Adjacent"/>
+  <disable_collisions link1="link3" link2="link4" reason="Adjacent"/>
+  <disable_collisions link1="link4" link2="link5" reason="Adjacent"/>
+  <disable_collisions link1="link5" link2="link6" reason="Adjacent"/>
+  <disable_collisions link1="link6" link2="gripper_base" reason="Adjacent"/>
+  <disable_collisions link1="gripper_base" link2="link7" reason="Adjacent"/>
+  <disable_collisions link1="gripper_base" link2="link8" reason="Adjacent"/>
+  <disable_collisions link1="gripper_base" link2="grasp_tcp" reason="Adjacent"/>
+  <disable_collisions link1="gripper_base" link2="wrist_camera_optical_frame" reason="Adjacent"/>
+</robot>
