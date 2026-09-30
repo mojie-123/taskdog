@@ -166,13 +166,15 @@ current `grasp_tcp` pose.
 ```bash
 python custom_envs/scripts/navigation/navigate_mujoco_moveit.py \
     --policy_path deps/rl_training/logs/rsl_rl/deeprobotics_m20_flat/2026-07-18_10-57-32/model_4999.pt \
-    --map custom_envs/maps/map_whole.npz \
     --goal 4.0 6.0 \
     --grasp_checkpoint /home/mojie/anygrasp_sdk/grasp_detection/log/checkpoint_detection.tar \
     --object cube \
     --destination 7.5 5.8 \
     --render
 ```
+
+实际导航地图由前一步 `nav2_moveit_mujoco.launch.py` 的
+`map:=...yaml` 参数加载。脚本的 `--map` 只为旧命令兼容而保留，可以省略。
 
 ## What to look for in the first full run
 

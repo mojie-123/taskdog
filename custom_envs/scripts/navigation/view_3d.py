@@ -45,7 +45,7 @@ def main():
     import plotly.graph_objects as go
 
     # Main point cloud (colour by height)
-    traces = [go.Scatter3d(
+    cloud_trace = go.Scatter3d(
         x=pts[:, 0], y=pts[:, 1], z=pts[:, 2],
         mode="markers",
         marker=dict(
@@ -56,29 +56,9 @@ def main():
             colorbar=dict(title="Z (m)"),
         ),
         name="LiDAR hits",
-    )]
+    )
 
-    # Spawn marker
-    traces.append(go.Scatter3d(
-        x=[0], y=[0], z=[0.58],
-        mode="markers+text",
-        marker=dict(size=10, color="lime"),
-        text=["Spawn"],
-        textposition="top center",
-        name="Spawn",
-    ))
-
-    # Target marker
-    traces.append(go.Scatter3d(
-        x=[5], y=[5], z=[0.85],
-        mode="markers+text",
-        marker=dict(size=10, color="orange"),
-        text=["Table+Banana"],
-        textposition="top center",
-        name="Target",
-    ))
-
-    fig = go.Figure(data=traces)
+    fig = go.Figure(data=[cloud_trace])
     fig.update_layout(
         title="LiDAR Point Cloud — drag to rotate · scroll to zoom · right‑drag to pan",
         scene=dict(

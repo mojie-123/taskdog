@@ -103,7 +103,10 @@ def generate_launch_description():
                 name='behavior_server',
                 output='screen',
                 parameters=[configured_params],
-                arguments=['--ros-args', '--log-level', log_level]),
+                arguments=['--ros-args', '--log-level', log_level],
+                # 恢复行为和控制器使用同一个平滑器输入；否则 Spin/BackUp
+                # 默认发布到 /cmd_vel，而 MuJoCo bridge 收不到恢复速度。
+                remappings=[('cmd_vel', 'cmd_vel_nav')]),
             Node(
                 package='nav2_bt_navigator',
                 executable='bt_navigator',
@@ -126,6 +129,9 @@ def generate_launch_description():
                 parameters=[configured_params],
                 arguments=['--ros-args', '--log-level', log_level],
                 remappings=[
+                    # Humble 的 velocity_smoother 输入名固定为 cmd_vel，需在
+                    # launch 中重映射；YAML 里的 input_topic 参数不会生效。
+                    ('cmd_vel', 'cmd_vel_nav'),
                     ('cmd_vel_smoothed', 'cmd_vel'),
                 ]),
 

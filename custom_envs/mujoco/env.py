@@ -88,13 +88,16 @@ class MuJoCoEnv:
         camera_width: int = 640,
         camera_height: int = 480,
         render: bool = False,
+        key_callback=None,
+        scene_path: str = None,
     ):
         self._substeps   = substeps
         self._cam_w      = camera_width
         self._cam_h      = camera_height
         self._render_gui = render
+        self._scene_path = os.path.abspath(scene_path or SCENE_XML)
 
-        self._model = mujoco.MjModel.from_xml_path(SCENE_XML)
+        self._model = mujoco.MjModel.from_xml_path(self._scene_path)
         self._data  = mujoco.MjData(self._model)
 
         # 建立关节名 -> qpos/dof 地址表
@@ -182,7 +185,11 @@ class MuJoCoEnv:
 
         self._viewer = None
         if self._render_gui:
-            self._viewer = mujoco.viewer.launch_passive(self._model, self._data)
+            self._viewer = mujoco.viewer.launch_passive(
+                self._model,
+                self._data,
+                key_callback=key_callback,
+            )
 
     # ──────────────────────────────────────────
     # reset
@@ -475,6 +482,18 @@ class MuJoCoEnv:
     def dt(self):
         """每个 policy step 的时间步长（秒）。"""
         return self._model.opt.timestep * self._substeps
+
+    @property
+    def scene_path(self):
+        return self._scene_path
+
+    @property
+    def viewer(self):
+        return self._viewer
+
+    def viewer_is_running(self):
+        """Whether the passive viewer is open (headless envs return True)."""
+        return self._viewer is None or self._viewer.is_running()
 
     def get_object_pos(self, name: str) -> np.ndarray:
         """返回场景中 freejoint 物体的世界位置 (x, y, z)。

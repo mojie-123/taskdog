@@ -19,6 +19,7 @@ Protocol: newline-delimited JSON on stdin/stdout.
 
 All diagnostic prints go to stderr (visible in parent terminal).
 """
+import argparse
 import json
 import os
 import sys
@@ -53,6 +54,17 @@ def _eprint(*args, **kw) -> None:   # 在终端打印输出诊断信息（报错
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser("TaskDog ROS 2 bridge subprocess")
+    parser.add_argument(
+        "--cmd-vel-timeout",
+        type=float,
+        default=0.1,
+        help="seconds to retain the last cmd_vel before forcing zero",
+    )
+    args = parser.parse_args()
+    if args.cmd_vel_timeout <= 0.0:
+        parser.error("--cmd-vel-timeout must be positive")
+
     # -----------------------------------------------------------------------
     # Import ROS / Nav2 packages
     # -----------------------------------------------------------------------
@@ -110,7 +122,7 @@ def main() -> None:
     _task_active = False
     _stop        = False
     _pending_goal: list = []
-    CMD_TIMEOUT = 0.5
+    CMD_TIMEOUT = float(args.cmd_vel_timeout)
     # 上次发射给父进程的 nav 状态（None = 还没发过，保证首条必发）。
     # 主循环只在本对值变化时才发 nav_done/nav_failed：否则 NAV1 完成后
     # _nav_done=True 会被无限重复发射，堆积在父进程队列里，导致下一个
@@ -124,7 +136,9 @@ def main() -> None:
             _vx         = float(msg.linear.x)
             _omega_z    = float(msg.angular.z)
             _last_cmd_t = time.monotonic()
-    node.create_subscription(Twist, "/cmd_vel_nav", _cmd_cb, 10)   # 订阅速度指令
+    # 只接收 velocity_smoother 的最终输出。controller_server 与
+    # behavior_server 都先发布到 /cmd_vel_nav，再由平滑器输出 /cmd_vel。
+    node.create_subscription(Twist, "/cmd_vel", _cmd_cb, 10)   # 订阅平滑后的速度指令
 
     # -----------------------------------------------------------------------
     # BasicNavigator — do NOT call waitUntilNav2Active() here because TF
@@ -317,7 +331,19 @@ def main() -> None:
             om.twist.twist.angular.z = float(ba[2])
             odom_pub.publish(om)
 
-        # Poll Nav2 task completion
+        # Emit cmd_vel BEFORE polling task completion.  BasicNavigator's
+        # isTaskComplete() internally spins for up to 0.10 s.  Emitting after
+        # that blocking call made a command sampled as fresh above cross the
+        # 0.10 s CMD_TIMEOUT boundary, so the parent received (0, 0) even while
+        # the diagnostic line correctly showed a fresh non-zero command.
+        with _lock:
+            stale  = (time.monotonic() - _last_cmd_t) > CMD_TIMEOUT
+            vx_out = 0.0 if stale else _vx
+            oz_out = 0.0 if stale else _omega_z
+        _emit({"vx": vx_out, "omega_z": oz_out})
+
+        # Poll Nav2 task completion.  This may block for up to 0.10 s; only
+        # navigation status reporting belongs after it.
         with _lock:
             task_active = _task_active
             nav_done    = _nav_done
@@ -337,14 +363,10 @@ def main() -> None:
             except Exception:
                 pass
 
-        # Emit cmd_vel + nav status to stdout
+        # Emit nav status to stdout.
         with _lock:
-            stale  = (time.monotonic() - _last_cmd_t) > CMD_TIMEOUT
-            vx_out = 0.0 if stale else _vx
-            oz_out = 0.0 if stale else _omega_z
             nd_out = _nav_done
             nf_out = _nav_failed
-        _emit({"vx": vx_out, "omega_z": oz_out})
         # nav 状态只在变化时发射：避免上一个任务的 nav_done=true 被无限重复发送，
         # 让父进程下个任务在 send_goal 后读到陈旧状态而秒完成。
         if (nd_out, nf_out) != (_last_nd_out, _last_nf_out):
@@ -367,4 +389,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

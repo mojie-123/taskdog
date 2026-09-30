@@ -40,8 +40,26 @@ import numpy as np
 class IsaacROS2Bridge:
     """Starts /usr/bin/python3.10 bridge subprocess; talks JSON over stdio."""
 
-    def __init__(self, cmd_vel_timeout: float = 0.5) -> None:
-        self._cmd_vel_timeout = cmd_vel_timeout
+    def __init__(
+        self,
+        cmd_vel_timeout: float = 0.1,
+        feedback_timeout: float = 0.35,
+    ) -> None:
+        """Create the bridge with two deliberately separate watchdogs.
+
+        ``cmd_vel_timeout`` runs in the ROS subprocess and measures the age of
+        the real smoothed ``/cmd_vel`` callback.  ``feedback_timeout`` runs here in
+        the MuJoCo process and only detects a stalled/dead subprocess.  The
+        subprocess currently reports at about 10 Hz while a navigation task is
+        active, so using the 0.1 s ROS timeout for both checks makes valid
+        commands flicker to zero at the parent side.
+        """
+        if cmd_vel_timeout <= 0.0:
+            raise ValueError("cmd_vel_timeout must be positive")
+        if feedback_timeout <= 0.0:
+            raise ValueError("feedback_timeout must be positive")
+        self._cmd_vel_timeout = float(cmd_vel_timeout)
+        self._feedback_timeout = float(feedback_timeout)
         self._proc: Optional[subprocess.Popen] = None
         self._stdin_lock = threading.Lock()
         self._feedback_q: queue.Queue = queue.Queue()
@@ -50,7 +68,7 @@ class IsaacROS2Bridge:
         self._omega_z:    float = 0.0
         self._nav_done:   bool  = False
         self._nav_failed: bool  = False
-        self._last_cmd_time: float = 0.0
+        self._last_feedback_time: float = 0.0
 
     # ------------------------------------------------------------------
     # Public API
@@ -65,7 +83,12 @@ class IsaacROS2Bridge:
         env = os.environ.copy()# 复制当前进程的环境变量（包括 ROS_DOMAIN_ID、AMENT_PREFIX_PATH 等）。确保子进程能够找到 ROS 2 的库和节点。
 
         self._proc = subprocess.Popen(
-            ["/usr/bin/python3.10", bridge_script],   # 启动 ros2_bridge_process.py 作为子进程（用python3.10运行）
+            [
+                "/usr/bin/python3.10",
+                bridge_script,
+                "--cmd-vel-timeout",
+                str(self._cmd_vel_timeout),
+            ],   # 启动 ROS 子进程，并让子进程使用同一速度指令超时
             stdin=subprocess.PIPE,   # 父进程可以写入 stdin
             stdout=subprocess.PIPE,    # 父进程可以读取 stdout
             stderr=sys.stderr,   # bridge stderr -> parent stderr (visible)  子进程的 stderr 直接输出到终端（方便调试）
@@ -139,9 +162,15 @@ class IsaacROS2Bridge:
         self._send({"type": "goal", "x": float(x), "y": float(y)})
 
     def get_cmd_vel(self) -> Tuple[float, float]:   # 从Nav2获取速度指令cmd_vel 
-        """Return (vx, omega_z). Returns (0, 0) if stale."""
+        """Return the subprocess-filtered command, or zero if feedback stalls.
+
+        The ROS subprocess has already replaced stale Nav2 commands with zero
+        according to ``cmd_vel_timeout``.  This second, longer timeout is only
+        a transport/process watchdog.
+        """
         self._drain_feedback()
-        if (time.monotonic() - self._last_cmd_time) > self._cmd_vel_timeout:   # 超时返回0
+        if ((time.monotonic() - self._last_feedback_time)
+                > self._feedback_timeout):
             return 0.0, 0.0
         return self._vx, self._omega_z
 
@@ -185,7 +214,7 @@ class IsaacROS2Bridge:
             if "vx" in msg:
                 self._vx      = float(msg["vx"])
                 self._omega_z = float(msg["omega_z"])
-                self._last_cmd_time = time.monotonic()
+                self._last_feedback_time = time.monotonic()
             if "nav_done" in msg:
                 self._nav_done   = bool(msg["nav_done"])
                 self._nav_failed = bool(msg["nav_failed"])

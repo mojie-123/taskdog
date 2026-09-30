@@ -23,7 +23,6 @@ Usage:
 
 import argparse
 import os
-import sys
 
 import numpy as np
 
@@ -71,13 +70,12 @@ def write_yaml(yaml_path: str, pgm_filename: str,
         yaml_path:    output .yaml file path.
         pgm_filename: relative path to the PGM file (just the filename).
         resolution:   meters per pixel.
-        origin:       (ox, oy) world coordinate of grid[0,0] (top-left corner).
+        origin:       (ox, oy) world coordinate of the map's lower-left corner.
     """
     # Nav2 map_server origin = [x, y, theta] of the lower-left pixel corner.
-    # Our OccupancyGrid stores origin = world coord of grid[row=0, col=0] = top-left.
-    # With negate=0 and image stored row=0 at top:
-    #   nav2 bottom-left Y = origin_y (grid row=0 is top; PGM stores top-down)
-    # We pass origin as-is and set negate=0 so nav2 reads the image correctly.
+    # OccupancyGrid row=0 is minimum world Y, whereas image row=0 is displayed
+    # at the top.  log_odds_to_pgm_pixel() performs the required vertical flip,
+    # so the lower-left world origin is passed through unchanged.
     ox, oy = float(origin[0]), float(origin[1])
     content = (
         "image: {}\n"
@@ -95,16 +93,21 @@ def write_yaml(yaml_path: str, pgm_filename: str,
         resolution, ox, oy), flush=True)
 
 
-def convert(npz_path: str, out_prefix: str) -> None:
+def convert(npz_path: str, out_prefix: str) -> tuple[str, str]:
     """Run the full conversion pipeline.
 
     Args:
         npz_path:   path to the input .npz map file.
         out_prefix: output path prefix (without extension).
+
+    Returns:
+        ``(pgm_path, yaml_path)``.
     """
     if not os.path.exists(npz_path):
-        print("[ERROR] Map file not found: {}".format(npz_path))
-        sys.exit(1)
+        raise FileNotFoundError("Map file not found: {}".format(npz_path))
+
+    out_dir = os.path.dirname(os.path.abspath(out_prefix))
+    os.makedirs(out_dir, exist_ok=True)
 
     data = np.load(npz_path)
     log_odds = data["grid"].astype(np.float32)  # (H, W)
@@ -134,6 +137,7 @@ def convert(npz_path: str, out_prefix: str) -> None:
     print("  ros2 run nav2_map_server map_server --ros-args \\", flush=True)
     print("    -p yaml_filename:={} \\".format(os.path.abspath(yaml_path)), flush=True)
     print("    -p use_sim_time:=false", flush=True)
+    return pgm_path, yaml_path
 
 
 def main():
@@ -153,7 +157,10 @@ def main():
     if out_dir and not os.path.exists(out_dir):
         os.makedirs(out_dir, exist_ok=True)
 
-    convert(npz_path, out_prefix)
+    try:
+        convert(npz_path, out_prefix)
+    except FileNotFoundError as exc:
+        parser.error(str(exc))
 
 
 if __name__ == "__main__":

@@ -6,7 +6,6 @@
 
 用法示例：
   python custom_envs/scripts/navigation/navigate_mujoco.py \\
-      --map maps/my_map.npz \\
       --goal 4.5 5.0 \\
       --policy_path /path/to/model_4999.pt \\
       --grasp_checkpoint /home/mojie/anygrasp_sdk/grasp_detection/log/checkpoint_detection.tar \\
@@ -190,97 +189,6 @@ class LiftState:
         self.q_stage1_cmd = np.asarray(cur_q, dtype=np.float64).copy()
         self.ee_p_start = np.asarray(ee_p_start, dtype=np.float64).copy()
         self.hold_remaining = int(hold_steps)
-
-
-def load_policy(policy_path: str, device: str = "cuda"):
-    """用 OnPolicyRunner + MockVecEnv 加载 rsl_rl checkpoint。
-
-    从与 policy_path 同目录的 params/agent.yaml 读取网络配置，
-    自动从 checkpoint 的 state_dict 推断 obs/action 维度，
-    通过 OnPolicyRunner 官方 API 构建网络并加载权重。
-    以后更换网络只需换 checkpoint 和 params/agent.yaml，无需改此函数。
-
-    返回 act_inference callable：obs_tensor -> action_tensor
-    """
-    import copy
-
-    import yaml
-
-    try:
-        from rsl_rl.runners import OnPolicyRunner
-    except ImportError:
-        raise ImportError("请安装 rsl_rl")
-
-    # 1. 读取与 checkpoint 同目录的 params/agent.yaml
-    run_dir = os.path.dirname(os.path.abspath(policy_path))
-    agent_yaml = os.path.join(run_dir, "params", "agent.yaml")
-    if not os.path.isfile(agent_yaml):
-        raise FileNotFoundError(
-            f"找不到 agent.yaml: {agent_yaml}\n"
-            f"请确保 params/agent.yaml 与 checkpoint 在同一 run 目录下。"
-        )
-    with open(agent_yaml) as _f:
-        train_cfg = yaml.safe_load(_f)
-
-    # 2. 从 checkpoint state_dict 自动推断网络维度
-    _ckpt = torch.load(policy_path, map_location="cpu", weights_only=False)
-    _sd   = _ckpt["model_state_dict"]
-    # actor 第一层输入 = num_actor_obs；最大序号层输出 = num_actions
-    _num_actor_obs  = int(_sd["actor.0.weight"].shape[1])
-    _num_critic_obs = int(_sd["critic.0.weight"].shape[1])
-    _actor_last_key = max(
-        (k for k in _sd if k.startswith("actor.") and k.endswith(".weight")),
-        key=lambda k: int(k.split(".")[1])
-    )
-    _num_actions = int(_sd[_actor_last_key].shape[0])
-
-    # 3. 构建最小 Mock VecEnv（OnPolicyRunner.__init__ 只调用 get_observations()）
-    _dev = device
-    _na  = _num_actions
-    _nao = _num_actor_obs
-    _nco = _num_critic_obs
-
-    class _MockEnv:
-        num_envs           = 1
-        num_actions        = _na
-        max_episode_length = 1000
-        episode_length_buf = torch.zeros(1, dtype=torch.long)
-        device             = _dev
-        cfg                = {}
-
-        def get_observations(self):
-            return {
-                "policy": torch.zeros(1, _nao),
-                "critic": torch.zeros(1, _nco),
-            }
-
-        def step(self, actions):
-            obs = self.get_observations()
-            return obs, torch.zeros(1), torch.zeros(1), {}
-
-    # 4. OnPolicyRunner 构建网络（会 pop class_name，需深拷贝）
-    runner = OnPolicyRunner(
-        _MockEnv(),
-        copy.deepcopy(train_cfg),
-        log_dir=None,
-        device=device,
-    )
-
-    # 5. 加载权重（不加载 optimizer，推理用）
-    runner.load(policy_path, load_optimizer=False)
-    _raw_policy = runner.get_inference_policy(device=device)
-
-    # 6. 包装适配器：新版 act_inference 期望 obs 是 dict{"policy": tensor}
-    #    navigate_mujoco.py 调用处传的是普通 tensor，此处自动转换
-    def policy(obs_tensor):
-        return _raw_policy({"policy": obs_tensor})
-
-    print(
-        f"[MJ] Policy loaded from {policy_path} "
-        f"(actor_obs={_num_actor_obs}, critic_obs={_num_critic_obs}, "
-        f"actions={_num_actions})"
-    )
-    return policy
 
 
 def _run_grasp_plan(
@@ -647,7 +555,10 @@ def _run_grasp_plan(
 
 def main():
     parser = argparse.ArgumentParser("Navigate MuJoCo")
-    parser.add_argument("--map",            required=True)
+    parser.add_argument(
+        "--map", default=None,
+        help="兼容旧命令；Nav2实际地图由ros2 launch的map:=...参数加载",
+    )
     parser.add_argument("--goal",           nargs=2, type=float, required=True)
     parser.add_argument("--policy_path",    required=True, help="model_4999.pt 路径")
     parser.add_argument("--grasp_checkpoint", default=None)
@@ -662,11 +573,24 @@ def main():
     parser.add_argument("--device",         default="cuda")
     parser.add_argument("--render",         action="store_true",
                         help="启动 MuJoCo viewer（需要 display）")
+    parser.add_argument("--scene", default=None,
+                        help="MJCF场景路径；默认custom_envs/mujoco/scene.xml")
     parser.add_argument("--robot_x",        type=float, default=0.0,
                         help="机器人初始世界 X（对应 Isaac Lab 场景坐标）")
     parser.add_argument("--robot_y",        type=float, default=0.0,
                         help="机器人初始世界 Y")
+    parser.add_argument("--robot_yaw",      type=float, default=0.0,
+                        help="机器人初始偏航角(rad，绕世界+Z；默认0)")
     args = parser.parse_args()
+
+    if args.map:
+        if not os.path.isfile(args.map):
+            parser.error(f"--map file does not exist: {args.map}")
+        print(
+            "[MJ] NOTE: --map is retained for compatibility only; "
+            "Nav2 loads the map passed to ros2 launch as map:=...",
+            flush=True,
+        )
 
     device = args.device if torch.cuda.is_available() else "cpu"
 
@@ -676,19 +600,28 @@ def main():
 
     env = MuJoCoEnv(
         robot_init_pos=(args.robot_x, args.robot_y, 0.58),
+        robot_init_quat=(
+            math.cos(0.5 * args.robot_yaw), 0.0, 0.0,
+            math.sin(0.5 * args.robot_yaw),
+        ),
         render=args.render,
+        scene_path=args.scene,
     )
     print("[MJ] MuJoCo env loaded, dt={:.4f}s/step".format(env.dt))
 
     # ── 加载策略网络 ──
-    policy = load_policy(args.policy_path, device=device)
+    from custom_envs.mujoco.policy_loader import load_locomotion_policy
+    policy = load_locomotion_policy(args.policy_path, device=device)
 
     # ── IK 求解器：arm_ik 为纯函数模块，无需实例化 ──
     # solve_for_gripper_base / compute_desired_ee_rot_in_arm 等在状态机内懒导入
 
     # ── 启动 ROS2 bridge ──
     from custom_envs.utils.ros2_bridge import IsaacROS2Bridge
-    bridge = IsaacROS2Bridge(cmd_vel_timeout=0.5)
+    bridge = IsaacROS2Bridge(
+        cmd_vel_timeout=0.1,   # ROS /cmd_vel（平滑后）freshness watchdog
+        feedback_timeout=0.35, # subprocess transport watchdog (feedback is ~10 Hz)
+    )
     bridge.start(timeout=30.0)
     print("[MJ] ROS2 bridge started")
 

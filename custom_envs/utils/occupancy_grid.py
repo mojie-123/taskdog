@@ -4,7 +4,6 @@ Based on Probabilistic Robotics (Thrun et al., 2005), Ch. 9.
 """
 
 import numpy as np
-import cv2
 
 
 class OccupancyGrid:
@@ -19,15 +18,23 @@ class OccupancyGrid:
             width, height: grid dimensions in cells.
             resolution:    meters per cell (default 0.05 → 5 cm).
         """
+        if int(width) <= 0 or int(height) <= 0:
+            raise ValueError("width and height must be positive")
+        if not np.isfinite(resolution) or float(resolution) <= 0.0:
+            raise ValueError("resolution must be a positive finite number")
         # 地图的宽、高、分辨率
-        self.width = width
-        self.height = height
-        self.resolution = resolution
-        self.grid = np.zeros((height, width), dtype=np.float32)   # 初始化栅格数组，全0（未知/空闲），越接近1越可能是障碍物
-        self.origin = (0.0, 0.0)  # world coordinate of grid[0, 0]   栅格[0, 0]在世界坐标(0, 0)
+        self.width = int(width)
+        self.height = int(height)
+        self.resolution = float(resolution)
+        self.grid = np.zeros((self.height, self.width), dtype=np.float32)   # 初始化栅格数组，全0（未知/空闲），越接近1越可能是障碍物
+        # World coordinate of the map's lower-left corner.  Array row 0 is
+        # therefore the minimum world-Y row and column 0 is the minimum
+        # world-X column.  This convention matches nav_msgs/OccupancyGrid and
+        # the YAML origin consumed by Nav2 map_server.
+        self.origin = (0.0, 0.0)
 
         # persistent hit counter for mark_elevated (accumulates across calls)
-        self._elevated_count = np.zeros((height, width), dtype=np.int32)   # 记录每个栅格被"高处点"命中的累计次数
+        self._elevated_count = np.zeros((self.height, self.width), dtype=np.int32)   # 记录每个栅格被"高处点"命中的累计次数
 
     # ------------------------------------------------------------------
     # Public API
@@ -51,10 +58,61 @@ class OccupancyGrid:
                 continue
             self._ray_cast(rx, ry, hx, hy)   # 记录每一条射线最终打中的栅格
 
+    def integrate_scan(
+        self,
+        sensor_origin_w: np.ndarray,
+        lidar_hits_w: np.ndarray,
+        obstacle_min_z: float = 0.15,
+        obstacle_max_z: float | None = None,
+        min_hits: int = 1,
+    ):
+        """Integrate a world-frame LiDAR scan into the map.
+
+        Unlike :meth:`update`, this API ray-casts from the actual sensor
+        origin instead of the robot root.  It is shared by the IsaacLab and
+        MuJoCo mapping entry points.
+
+        Args:
+            sensor_origin_w: ``(3,)`` LiDAR origin in world coordinates.
+            lidar_hits_w: ``(N, 3)`` world-frame hit coordinates.  Non-finite
+                rows are ignored.
+            obstacle_min_z: Minimum absolute world Z treated as an obstacle.
+            obstacle_max_z: Optional maximum obstacle Z.
+            min_hits: Persistent hit count required before a cell is occupied.
+
+        Returns:
+            The finite hits that were integrated, shaped ``(M, 3)``.
+        """
+        origin = np.asarray(sensor_origin_w, dtype=np.float64).reshape(-1)
+        hits = np.asarray(lidar_hits_w, dtype=np.float64)
+        if origin.shape != (3,):
+            raise ValueError(
+                f"sensor_origin_w must have shape (3,), got {origin.shape}")
+        if not np.isfinite(origin).all():
+            raise ValueError("sensor_origin_w must contain only finite values")
+        if hits.ndim != 2 or hits.shape[1] != 3:
+            raise ValueError(
+                f"lidar_hits_w must have shape (N, 3), got {hits.shape}")
+        if int(min_hits) <= 0:
+            raise ValueError("min_hits must be positive")
+
+        finite = hits[np.isfinite(hits).all(axis=1)]
+        for hx, hy, _ in finite:
+            self._ray_cast(float(origin[0]), float(origin[1]),
+                           float(hx), float(hy))
+
+        elevated_mask = finite[:, 2] > float(obstacle_min_z)
+        if obstacle_max_z is not None:
+            elevated_mask &= finite[:, 2] <= float(obstacle_max_z)
+        elevated = finite[elevated_mask]
+        if len(elevated) > 0:
+            self.mark_elevated(elevated[:, :2], min_hits=min_hits)
+        return finite
+
     def world_to_grid(self, wx: float, wy: float):   # 将世界坐标转换为栅格地图的行列索引
         """World (m) → grid (row, col).  May return out-of-bounds indices."""
-        col = int(round((wx - self.origin[0]) / self.resolution))   # round()：四舍五入到最近的整数栅格
-        row = int(round((wy - self.origin[1]) / self.resolution))
+        col = int(np.floor((wx - self.origin[0]) / self.resolution))
+        row = int(np.floor((wy - self.origin[1]) / self.resolution))
         return (row, col)
 
     def grid_to_world(self, row: int, col: int):
@@ -106,6 +164,7 @@ class OccupancyGrid:
             resolution=self.resolution,   # 栅格分辨率（米/格）
             width=self.width,   # 地图宽度（栅格数）
             height=self.height,   # 地图高度（栅格数）
+            elevated_count=self._elevated_count,
         )
 
     @classmethod
@@ -119,6 +178,9 @@ class OccupancyGrid:
         )   # 调用构造函数创建新的 OccupancyGrid 对象（cls 是类方法的第一参数，代表类本身）
         obj.grid = data["grid"]   # 恢复栅格数据
         obj.origin = tuple(data["origin"])   # 恢复原点坐标
+        if "elevated_count" in data:
+            obj._elevated_count = data["elevated_count"].astype(
+                np.int32, copy=True)
         return obj
 
     # ------------------------------------------------------------------
@@ -136,17 +198,57 @@ class OccupancyGrid:
         只标记空闲区域，不标记障碍物（障碍物由 mark_elevated 处理）
         """
 
-        # 将起点和终点的世界坐标转换为栅格索引
-        sc, sr = self.world_to_grid(sx, sy)
-        ec, er = self.world_to_grid(ex, ey)
-        # 边界裁剪
-        sr, sc = max(0, min(sr, self.height-1)), max(0, min(sc, self.width-1))
-        er, ec = max(0, min(er, self.height-1)), max(0, min(ec, self.width-1))
+        clipped = self._clip_segment_to_map(sx, sy, ex, ey)
+        if clipped is None:
+            return
+        sx, sy, ex, ey = clipped
+
+        # world_to_grid() returns (row, col).  Keep that ordering throughout;
+        # the previous sc/sr assignment transposed every free-space ray.
+        sr, sc = self.world_to_grid(sx, sy)
+        er, ec = self.world_to_grid(ex, ey)
+        sr = int(np.clip(sr, 0, self.height - 1))
+        sc = int(np.clip(sc, 0, self.width - 1))
+        er = int(np.clip(er, 0, self.height - 1))
+        ec = int(np.clip(ec, 0, self.width - 1))
 
         for r, c in self._bresenham(sr, sc, er, ec):
             if 0 <= r < self.height and 0 <= c < self.width:
                 self.grid[r, c] -= 0.4   # free   每个栅格值减去 0.4（降低占用概率，表示空闲）
-            self.grid[r, c] = float(np.clip(self.grid[r, c], -10.0, 10.0))   # 将栅格值限制在 [-10.0, 10.0] 范围内，这使用的是对数几率（log-odds）表示法
+                self.grid[r, c] = float(np.clip(self.grid[r, c], -10.0, 10.0))   # 将栅格值限制在 [-10.0, 10.0] 范围内，这使用的是对数几率（log-odds）表示法
+
+    def _clip_segment_to_map(self, sx, sy, ex, ey):
+        """Liang-Barsky clip of a world-space segment to map bounds."""
+        xmin, ymin = map(float, self.origin)
+        xmax = xmin + self.width * self.resolution
+        ymax = ymin + self.height * self.resolution
+        dx, dy = float(ex - sx), float(ey - sy)
+        u0, u1 = 0.0, 1.0
+
+        for p, q in ((-dx, sx - xmin), (dx, xmax - sx),
+                     (-dy, sy - ymin), (dy, ymax - sy)):
+            if abs(p) < 1e-15:
+                if q < 0.0:
+                    return None
+                continue
+            t = q / p
+            if p < 0.0:
+                if t > u1:
+                    return None
+                u0 = max(u0, t)
+            else:
+                if t < u0:
+                    return None
+                u1 = min(u1, t)
+
+        # Upper bounds are exclusive under floor-based world_to_grid().
+        x_hi = np.nextafter(xmax, xmin)
+        y_hi = np.nextafter(ymax, ymin)
+        csx = float(np.clip(sx + u0 * dx, xmin, x_hi))
+        csy = float(np.clip(sy + u0 * dy, ymin, y_hi))
+        cex = float(np.clip(sx + u1 * dx, xmin, x_hi))
+        cey = float(np.clip(sy + u1 * dy, ymin, y_hi))
+        return csx, csy, cex, cey
 
     # ------------------------------------------------------------------
     # Elevated-hit projection
@@ -163,6 +265,8 @@ class OccupancyGrid:
                      above-ground LiDAR hits.
             min_hits: minimum number of hits in a cell to confirm occupancy.
         """
+        if int(min_hits) <= 0:
+            raise ValueError("min_hits must be positive")
         for x, y in hits_xy:   # 累积命中计数
             r, c = self.world_to_grid(x, y)
             if 0 <= r < self.height and 0 <= c < self.width:

@@ -73,7 +73,6 @@ def main():
         from custom_envs.tasks.deeprobotics_m20_pro.piper_env_cfg import setup_piper_sync
 
     from custom_envs.utils.occupancy_grid import OccupancyGrid
-    from custom_envs.utils.nav_utils import euler_from_quat
 
     from isaaclab.devices import Se2Keyboard, Se2KeyboardCfg
 
@@ -225,17 +224,17 @@ def main():
                         hits = lidar.data.ray_hits_w[0].cpu().numpy()
                         # keep only finite hits
                         finite = hits[np.isfinite(hits).all(axis=1)]
-                        pos = robot.data.root_pos_w[0].cpu().numpy()
-                        quat = robot.data.root_quat_w[0].cpu().numpy()
-                        yaw = euler_from_quat(quat)
                         if len(finite) > 0:
                             # 2D grid:
                             #   All hits → mark free space along rays (Bresenham).
                             #   Elevated hits → mark occupied cells (obstacles).
-                            grid.update((pos[0], pos[1], yaw), finite)
-                            elevated = finite[np.abs(finite[:, 2]) > 0.15]
-                            if len(elevated) > 0:
-                                grid.mark_elevated(elevated[:, :2], min_hits=1)
+                            sensor_origin = lidar.data.pos_w[0].cpu().numpy()
+                            grid.integrate_scan(
+                                sensor_origin,
+                                finite,
+                                obstacle_min_z=0.15,
+                                min_hits=1,
+                            )
                             # 3D cloud: keep all finite hits (no z filter).
                             # Save everything; use viz_map.py --no_ground later.
                             if len(finite) > 0:

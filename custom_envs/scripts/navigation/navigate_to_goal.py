@@ -2128,7 +2128,8 @@ def _save_nav_png(grid, path_world, robot_pose, goal_world, step):
     viz_rgb = viz[:, :, ::-1]
 
     fig, ax = plt.subplots(figsize=(8, 8))
-    ax.imshow(viz_rgb, origin="upper")
+    # OccupancyGrid row 0 is minimum world Y, so display it at the bottom.
+    ax.imshow(viz_rgb, origin="lower")
 
     if path_world is not None:
         px, py = [], []

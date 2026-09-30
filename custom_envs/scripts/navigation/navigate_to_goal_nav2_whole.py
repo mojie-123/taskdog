@@ -20,7 +20,7 @@ Pre-requisites
        --task Flat-Deeprobotics-M20Pro-Piper-Single-v0 \\
        --policy_task Flat-Deeprobotics-M20-v0 \\
        --load_run 2026-07-18_10-57-32 --checkpoint model_4999.pt \\
-       --map maps/my_map.npz --goal 4.5 4.9 \\
+       --goal 4.5 4.9 \\
        --grasp_checkpoint /home/mojie/anygrasp_sdk/grasp_detection/log/checkpoint_detection.tar
 """
 
@@ -62,7 +62,12 @@ class PipelineState(enum.Enum):
 def main():
     parser = argparse.ArgumentParser("Navigate to Goal (Nav2)")
     parser.add_argument("--task", default="Flat-Deeprobotics-M20Pro-Lidar-v0")
-    parser.add_argument("--map", required=True)
+    parser.add_argument(
+        "--map",
+        default=None,
+        help=("兼容旧命令的可选参数；本脚本不读取 NPZ，Nav2 使用 launch 命令中 "
+              "map:=... 指定的 YAML 地图"),
+    )
     parser.add_argument("--goal", nargs=2, type=float, required=True)
     parser.add_argument("--num_envs", type=int, default=1)
     parser.add_argument("--target_speed", type=float, default=0.8)
@@ -83,6 +88,14 @@ def main():
         help="抓取目标物体，决定 YOLO 识别的类别 (default: banana)",
     )
     args, unknown = parser.parse_known_args()
+    if args.map is not None:
+        if not os.path.isfile(args.map):
+            parser.error(f"--map 文件不存在: {args.map}")
+        print(
+            "[INFO] --map 仅用于兼容旧命令；实际导航地图由 Nav2 launch 的 "
+            "map:=<map.yaml> 决定。",
+            flush=True,
+        )
 
     # ---- Isaac Sim launch ----
     from isaaclab.app import AppLauncher
@@ -102,7 +115,6 @@ def main():
     if _piper_mode:
         from custom_envs.tasks.deeprobotics_m20_pro.piper_env_cfg import setup_piper_sync
 
-    from custom_envs.utils.occupancy_grid import OccupancyGrid
     from custom_envs.utils.nav_utils import euler_from_quat, is_goal_reached
 
     # ---- 目标物体 → COCO class id 映射 ----
@@ -110,7 +122,6 @@ def main():
     _target_cls_id = _OBJECT_CLASS_ID[args.object]
     print(f"[INFO] 抓取目标: {args.object} (COCO class {_target_cls_id})", flush=True)
 
-    grid = OccupancyGrid.load(args.map)
     goal_world = (args.goal[0], args.goal[1])
 
     from isaaclab_tasks.utils.parse_cfg import load_cfg_from_registry
@@ -1637,4 +1648,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -8,7 +8,7 @@ def world_to_grid(wx: float, wy: float, origin: tuple, resolution: float):
 
     Args:
         wx, wy:   world position in meters.
-        origin:   (ox, oy) world position of grid cell (0, 0).
+        origin:   (ox, oy) lower-left corner of grid cell (0, 0).
         resolution: meters per grid cell.
 
     Returns:
@@ -16,8 +16,8 @@ def world_to_grid(wx: float, wy: float, origin: tuple, resolution: float):
 
     将世界坐标系中的位置（米）转换为 occupancy grid（占据栅格地图）中的网格索引（行、列）
     """
-    col = int((wx - origin[0]) / resolution)
-    row = int((wy - origin[1]) / resolution)
+    col = int(np.floor((wx - origin[0]) / resolution))
+    row = int(np.floor((wy - origin[1]) / resolution))
     return (row, col)
 
 
