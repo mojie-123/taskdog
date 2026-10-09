@@ -1,3 +1,5 @@
+# move_group 的 OMPL planning pipeline。navigate_mujoco_moveit.py 默认请求
+# RRTConnectkConfigDefault，为 pre-grasp/retract 等生成无碰撞关节路径。
 planning_plugin: ompl_interface/OMPLPlanner
 request_adapters: >-
   default_planner_request_adapters/AddTimeOptimalParameterization
@@ -11,7 +13,7 @@ start_state_max_bounds_error: 0.1
 planner_configs:
   RRTConnectkConfigDefault:
     type: geometric::RRTConnect
-    range: 0.0
+    range: 0.0  # 0 表示让 OMPL 自动选择扩展步长
 
 piper_arm:
   planner_configs:

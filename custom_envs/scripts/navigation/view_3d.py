@@ -1,5 +1,8 @@
 #!/usr/bin/env python
-"""Interactive 3D point cloud viewer — opens in your web browser.
+"""交互式查看建图 ``_cloud.npy`` 的纯诊断工具，不参与导航或抓取。
+
+点坐标直接来自雷达世界系命中，因此它比二维 PGM 更适合判断障碍是否被投射到
+正确位置。当前图中只显示 LiDAR hits，不再叠加 banana/table 等人工标记点。
 
 Usage:
     python scripts/navigation/view_3d.py maps/my_map_cloud.npy

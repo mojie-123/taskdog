@@ -1,4 +1,9 @@
-"""Start the existing Nav2 stack and the new planning-only MoveIt stack."""
+"""完整 MuJoCo 任务的终端 1 入口：同时启动 Nav2 与 planning-only MoveIt。
+
+本文件只组合两个 launch，不启动 MuJoCo。Nav2 地图由这里向
+``nav2_isaac.launch.py`` 转发的 ``map`` 参数决定；MoveIt 则加载项目固定的
+URDF/SRDF/OMPL 配置。两个栈保持运行，终端 2 可多次启动和退出。
+"""
 
 import os
 

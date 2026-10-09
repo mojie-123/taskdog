@@ -1,4 +1,9 @@
-"""Piper arm inverse kinematics using ikpy.
+"""旧 ``navigate_mujoco.py`` 使用的 Piper/ikpy 运动学工具。
+
+MoveIt 版本不使用本文件求 pre-grasp/approach 路径，而是使用
+``mujoco_moveit_frames.py`` + MoveIt services + ``mujoco_local_servo.py``。
+本模块保留给非 MoveIt 流程和旧诊断脚本；函数大多是纯几何/运动学工具，不直接
+推进 MuJoCo，也不发布 ROS 2 数据。
 
 Chain: base_link -> arm_base_link -> link1..link6 -> gripper_base
 Joint limits from SOURCE_M20_Piper.urdf:

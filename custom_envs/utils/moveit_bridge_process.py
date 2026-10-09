@@ -1,5 +1,5 @@
 #!/usr/bin/env python3.10
-"""ROS 2 Humble subprocess used by moveit_bridge.py.
+"""``moveit_bridge.py`` 使用的 ROS 2 Humble / Python 3.10 子进程。
 
 The process exposes a tiny JSON RPC surface around MoveIt move_group services:
 - /compute_ik
@@ -9,6 +9,10 @@ The process exposes a tiny JSON RPC surface around MoveIt move_group services:
 and continuously republishes the latest MuJoCo joint state on /joint_states.
 
 All logs go to stderr. stdout is reserved for one-line JSON replies.
+
+``move_group`` 在终端 1 中运行；本进程只是 service client 和 joint-state
+publisher。返回的 trajectory 不在 ROS 侧执行，而是交回 MuJoCo 主进程加密后由
+``env.set_arm_target`` 执行。``default_scene_objects`` 目前只近似原双桌场景。
 """
 
 from __future__ import annotations
@@ -77,7 +81,10 @@ def main():
     executor = SingleThreadedExecutor()
     executor.add_node(node)
 
+    # /joint_states 是 MuJoCo 当前状态的镜像，让 move_group 的 CurrentStateMonitor
+    # 与 robot_state_publisher 使用真实关节角；它不是控制命令。
     joint_pub = node.create_publisher(JointState, "/joint_states", 20)
+    # 四个 service 都由终端1中的 move_group 提供。
     ik_cli = node.create_client(GetPositionIK, "/compute_ik")
     plan_cli = node.create_client(GetMotionPlan, "/plan_kinematic_path")
     cart_cli = node.create_client(GetCartesianPath, "/compute_cartesian_path")
@@ -252,6 +259,11 @@ def main():
         return c
 
     def default_scene_objects():
+        """Return collision geometry for scene.xml's two tables and floor.
+
+        这里没有解析当前 ``--scene``；新增/替换 MJCF 场景时必须另行同步 MoveIt
+        PlanningScene，否则 MoveIt 的碰撞检查和 MuJoCo 物理世界并不一致。
+        """
         objects = []
 
         table1 = CollisionObject()

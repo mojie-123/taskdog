@@ -3,6 +3,10 @@
 No ros2_control controller is started here.  move_group computes IK / collision
 checks / trajectories; navigate_mujoco_moveit.py executes those joint paths using
 the existing MuJoCo PD controller.
+
+``robot_state_publisher`` consumes the MuJoCo mirror on ``/joint_states`` and
+publishes URDF link transforms. ``move_group`` provides planning services and
+maintains PlanningScene. Neither node owns a MuJoCo actuator.
 """
 
 import os

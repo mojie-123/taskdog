@@ -1,6 +1,17 @@
 #!/usr/bin/env python3.10
-"""ROS 2 Bridge subprocess — launched by IsaacROS2Bridge via subprocess.Popen.
-在 Python 3.10 环境中运行 ROS 2 节点，实现 Isaac Sim 与 Nav2 之间的双向通信
+"""ROS 2/Nav2 bridge 子进程，由 ``IsaacROS2Bridge`` 启动。
+
+它在系统 Python 3.10 中运行 rclpy，把 MuJoCo/IsaacLab 主进程的 JSON 转成
+标准 ROS 2 接口，并把 Nav2 输出转回 JSON。节点名 ``isaac_ros2_bridge`` 同样是
+历史名称，不影响 MuJoCo 使用。
+
+ROS 侧职责：
+
+* 发布静态 ``map -> odom`` 单位变换；
+* 以 50 Hz 发布仿真真值 ``odom -> base_link`` TF 和 ``/odom``；
+* 用 ``BasicNavigator`` 发送 NavigateToPose action；
+* 订阅 velocity_smoother 的最终 ``/cmd_vel``；
+* 对陈旧速度命令做 watchdog 归零。
 
 This script MUST be executed with /usr/bin/python3.10 so that rclpy
 C-extensions (compiled for CPython 3.10) import correctly.
@@ -87,6 +98,7 @@ def main() -> None:
 
     _eprint("[BridgeProc] imports OK, init rclpy...")
     rclpy.init()   # 初始化ROS2客户端库
+    # 节点名为了兼容已有日志和调试命令保留 isaac 前缀；功能与仿真后端无关。
     node = Node("isaac_ros2_bridge")  # 创建节点
     tf_bcast     = TransformBroadcaster(node)   # 发布坐标变换
     static_bcast = StaticTransformBroadcaster(node)   # 发布里程计数据
@@ -97,8 +109,8 @@ def main() -> None:
         history=QoSHistoryPolicy.KEEP_LAST, depth=10)   # 保留最新10条
     odom_pub = node.create_publisher(Odometry, "/odom", qos)
 
-    # Static map->odom identity transform (ground-truth localisation)
-    # 在 ROS 2 的坐标变换树（TF Tree）中发布静态变换，因为 Isaac Sim 提供真实位姿，map 和 odom 坐标系重合。
+    # Static map->odom identity transform (ground-truth localisation)。仿真世界、
+    # Nav2 map 和 odom 使用同一坐标；动态 odom->base_link 由下方主循环发布。
     stf = TransformStamped()   # 创建一个用于存储坐标变换信息的消息对象
     stf.header.stamp    = node.get_clock().now().to_msg()   # 设置时间戳为当前 ROS 时间
     stf.header.frame_id = "map"
@@ -375,13 +387,29 @@ def main() -> None:
 
         time.sleep(0.001)
 
-    # Clean up
+    # Clean up only resources owned by this bridge process.  Nav2 itself is
+    # launched and managed by the separate terminal-1 launch process, so
+    # calling BasicNavigator.lifecycleShutdown() here would incorrectly send
+    # SHUTDOWN to every Nav2 lifecycle node and leave that stack "finalized".
+    with _lock:
+        cancel_active_task = _task_active and not _nav_done and not _nav_failed
+    if cancel_active_task:
+        try:
+            navigator.cancelTask()
+        except Exception as exc:
+            _eprint(f"[BridgeProc] warning: failed to cancel active Nav2 task: {exc}")
     try:
-        navigator.lifecycleShutdown()
-    except Exception:
-        pass
+        navigator.destroyNode()
+    except Exception as exc:
+        _eprint(f"[BridgeProc] warning: failed to destroy navigator node: {exc}")
     try:
-        rclpy.shutdown()
+        executor.remove_node(node)
+        node.destroy_node()
+    except Exception as exc:
+        _eprint(f"[BridgeProc] warning: failed to destroy bridge node: {exc}")
+    try:
+        if rclpy.ok():
+            rclpy.shutdown()
     except Exception:
         pass
     _eprint("[BridgeProc] shutdown complete.")

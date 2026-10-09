@@ -1,0 +1,49 @@
+{
+  "seed": 42,
+  "dataset": {
+    "path": "custom_envs/scripts/N2M/data/n2m_dataset/d30_o100_v1",
+    "num_points": 8192,
+    "cache_size": 64,
+    "rotation_degrees": 30.0,
+    "translation_radius_m": 0.25
+  },
+  "model": {
+    "encoder": {
+      "name": "PointBERT",
+      "ckpt": "custom_envs/scripts/N2M/checkpoints/pointbert/PointTransformer_ModelNet8192points.pth",
+      "freeze": false,
+      "config": {
+        "trans_dim": 384,
+        "depth": 12,
+        "drop_path_rate": 0.1,
+        "num_heads": 6,
+        "group_size": 32,
+        "num_group": 512,
+        "encoder_dims": 256
+      }
+    },
+    "decoder": {
+      "num_gaussians": 1,
+      "output_dim": 3,
+      "layers": [512, 512, 256],
+      "dropout": 0.1
+    }
+  },
+  "loss": {
+    "weight_entropy_coefficient": 0.0,
+    "mode_separation_coefficient": 0.0,
+    "separation_scale": 0.25,
+    "jitter": 0.00001
+  },
+  "training": {
+    "output": "custom_envs/scripts/N2M/data/training/d30_o100_k1_v1",
+    "batch_size": 8,
+    "num_workers": 4,
+    "epochs": 150,
+    "learning_rate": 0.0001,
+    "weight_decay": 0.0001,
+    "grad_clip": 1.0,
+    "amp": true,
+    "early_stopping_patience": 20
+  }
+}

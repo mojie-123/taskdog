@@ -1,3 +1,6 @@
+# MoveIt 规划阶段使用的速度/加速度上限。当前项目不启动 ros2_control，
+# trajectory 时间戳也不直接驱动 MuJoCo；主程序只取轨迹几何并加密后交给 PD。
+# 这些限制仍会影响 MoveIt 的时间参数化和返回轨迹信息。
 joint_limits:
   joint1:
     has_velocity_limits: true

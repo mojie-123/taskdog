@@ -1,4 +1,9 @@
-"""Shared loader for locomotion policies used by the MuJoCo entry points."""
+"""MuJoCo 建图和导航入口共用的 rsl_rl 行走策略加载器。
+
+``OnPolicyRunner`` 原本期望一个训练环境；这里的 ``_MockEnv`` 只提供网络维度和
+最小接口，使 checkpoint 能被官方 runner 正确还原。它不推进仿真，真实观测由
+``obs_builder.py`` 构造，真实执行由 ``MuJoCoEnv.step`` 完成。
+"""
 
 import copy
 import os

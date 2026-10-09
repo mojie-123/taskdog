@@ -1,4 +1,9 @@
 <mujoco model="taskdog_scene">
+  <!-- MuJoCo 默认双桌物理场景，也是 MuJoCoEnv 未传 --scene 时加载的文件。
+       本文件是物理真值：机器人关节/actuator、物体质量和接触、wrist_cam、
+       base_lock_anchor/base_lock_weld 都在这里定义。Nav2 不直接读取 MJCF；它读取
+       对该场景离线建图得到的 PGM/YAML。MoveIt 也不读取本文件，而使用独立 URDF
+       和 moveit_bridge_process.py 中的 PlanningScene 近似，改几何时要注意同步。 -->
   <compiler angle="radian" meshdir="/home/mojie/taskdog/deps/deep_robotics_model/M20_Piper/mjcf/meshes/" />
   <!-- condim=4(第四轮): 默认 3 只有滑动摩擦, 物体 friction 里的扭转/滚动系数是死值。
        官方文档: 接触 condim = max(双方), 摩擦 = 逐元素 max, priority 高者覆盖。

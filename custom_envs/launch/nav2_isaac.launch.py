@@ -1,7 +1,9 @@
-# Custom Nav2 launch file for Isaac Sim ground-truth localisation.
+# Custom Nav2 launch for simulator ground-truth localisation.
+# 文件名中的 isaac 是历史名称；MuJoCo 与 IsaacLab 当前共用本 launch。
 # Differences from nav2_bringup/navigation_launch.py:
 #   1. NO /tf -> tf remapping: bridge publishes to absolute /tf and /tf_static
-#      标准 Nav2 中，AMCL 发布 map → odom 变换，而机器人驱动发布 odom → base_link 变换。而这里Isaac Sim 的 ROS 2 Bridge 直接发布完整的坐标变换链：map → odom → base_link
+#      标准 Nav2 中 AMCL 常发布 map→odom，驱动发布 odom→base_link；本项目
+#      由仿真 bridge 直接发布 ground-truth map→odom→base_link，因此不启动 AMCL。
 #   2. Adds map_server (no AMCL): bridge provides ground-truth TF directly
 #   3. controller_server publishes cmd_vel_nav; velocity_smoother reads cmd_vel_nav
 #      and publishes cmd_vel (remapped from cmd_vel_smoothed); bridge subscribes /cmd_vel
@@ -66,7 +68,7 @@ def generate_launch_description():
 
         GroupAction(actions=[
 
-            # --- Map server (no AMCL; Isaac bridge provides ground-truth TF) ---
+            # --- Map server（无 AMCL；MuJoCo/IsaacLab bridge 提供真值 TF）---
             Node(   # 启动一个ROS2节点
                 package='nav2_map_server',   # ROS2包名
                 executable='map_server',   # 可执行文件名

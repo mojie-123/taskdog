@@ -329,7 +329,7 @@ python custom_envs/scripts/navigation/navigate_to_goal_nav2_whole.py \
 
 | 文件 | 作用 |
 | --- | --- |
-| custom_envs/mujoco/lidar.py | 默认生成完整 Mid-360 规则扫描配置的 14400 条射线（40 通道、水平 1°），批量调用 MuJoCo ray cast，并排除机器人自身碰撞体。 |
+| custom_envs/mujoco/lidar.py | 默认生成 14400 条射线（40 通道、水平 1°），批量调用 MuJoCo ray cast，并排除机器人自身碰撞体。 |
 | custom_envs/mujoco/policy_loader.py | MuJoCo 建图和两套导航脚本共用的 rsl_rl 策略加载器。 |
 | custom_envs/mujoco/teleop_viewer.py | 建图专用 GLFW viewer，提供按下/松开事件并隔离 MuJoCo 内置快捷键。 |
 | custom_envs/scripts/navigation/teleop_mapping_mujoco.py | MuJoCo 键盘运动、雷达扫描、栅格融合、点云累计及地图保存入口。 |

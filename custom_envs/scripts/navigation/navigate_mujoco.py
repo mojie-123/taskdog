@@ -1,8 +1,15 @@
 #!/usr/bin/env python
-"""navigate_mujoco.py — MuJoCo 版全流程导航抓取脚本。
+"""MuJoCo + Nav2 + AnyGrasp + 自定义 IK 的旧完整流程。
 
 对应 navigate_to_goal_nav2_whole.py，替换所有 Isaac Lab API，
 复用 ROS2 bridge、grasp_worker、arm_ik 等纯 Python 模块。
+
+它与 ``navigate_mujoco_moveit.py`` 共用 MuJoCo、行走策略、Nav2 bridge 和大部分
+抓取/搬运状态，但机械臂可达性与路径由 ``arm_ik_mujoco.py`` 和脚本内几何逻辑
+处理，不调用 move_group。新功能优先维护 MoveIt 版本；本文件保留作旧方案、对照
+诊断和 MoveIt 不可用时的备用入口。
+
+和 MoveIt 版本一样，``--map`` 不会选择 Nav2 地图；地图由终端 1 的 launch 加载。
 
 用法示例：
   python custom_envs/scripts/navigation/navigate_mujoco.py \\

@@ -1,8 +1,28 @@
 #!/usr/bin/env python
-"""navigate_mujoco_moveit.py — MuJoCo + Nav2 + AnyGrasp + MoveIt 全流程脚本。
+"""MuJoCo + Nav2 + AnyGrasp + MoveIt 的推荐完整任务入口。
 
-对应 navigate_to_goal_nav2_whole.py，替换所有 Isaac Lab API，
-复用现有 ROS2 Nav2 bridge、grasp_worker 与 MuJoCo 控制层；抓取规划改由 MoveIt 负责。
+这是编排层，不是另一个物理或 ROS server。每个主循环帧都从 MuJoCo 读取真值，
+同步 Nav2 位姿和 MoveIt 关节状态，根据状态机选择底盘/机械臂/夹爪目标，最后只由
+``MuJoCoEnv.step`` 推进一步物理。
+
+组件边界：
+
+* Nav2：完成 ``NAV``/``NAV2_DEST`` 的全局规划与 ``vx/wz`` 跟踪；
+* rsl_rl policy：把 ``vx/vy/wz`` 变成腿轮动作；
+* AnyGrasp：从腕部深度点云提出抓取候选；
+* MoveIt：筛选候选并规划 pre-grasp、approach、lift/retract 路径；
+* MuJoCo：执行所有底盘和关节控制并计算接触；
+* 本状态机：负责精定位、坐标变换、规划结果执行、夹持和阶段切换。
+
+主状态流：
+
+``NAV -> ALIGN_YAW_1 -> PAN_XY -> ARM_INIT -> SCAN -> GRASP_PLAN``
+``-> MOVEIT_PRE_GRASP -> MOVEIT_APPROACH -> LOCAL_REACH -> CLOSE -> LIFT``
+``-> PAN_NEG_X -> NAV2_DEST -> ALIGN_YAW_2 -> PAN_DES_X -> ROTATE``
+``-> PUT_DOWN -> DONE``。
+
+脚本的 ``--map`` 只兼容旧命令；实际 Nav2 地图由终端 1 launch 的 ``map:=``
+参数决定。``--scene`` 则真正决定本进程加载的 MuJoCo 物理世界。
 
 用法示例：
   python custom_envs/scripts/navigation/navigate_mujoco_moveit.py \\
@@ -524,6 +544,7 @@ def main():
     # 使用最小有效转速，并要求“角度 + 实际角速度”连续稳定后才进入 PAN。
     _align_ctrl_state   = None
     _align_cmd_wz       = 0.0
+    _align_settling     = False
     _align_settle_count = 0
     _dest_goal_sent  = False # NAV2_DEST 是否已发送 goal
     _rotate_j_target = None  # ROTATE 目标关节角
@@ -784,9 +805,10 @@ def main():
     _ALIGN_YAW_MIN         = 0.40    # rad/s；专门避开“给了 wz 但 policy 几乎不转”的区间
     _ALIGN_YAW_MAX         = 0.90
     _ALIGN_YAW_DW_PER_STEP = 0.08
-    _ALIGN_YAW_TOL         = math.radians(1.5)
-    _ALIGN_YAW_RATE_TOL    = 0.08    # rad/s，实际机体角速度也必须基本停住
-    _ALIGN_SETTLE_STEPS    = 8
+    _ALIGN_YAW_ENTER_TOL   = math.radians(2.0)  # 进入停车保持区
+    _ALIGN_YAW_RESUME_TOL  = math.radians(3.0)  # 漂出此范围才重新纠偏，形成滞回
+    _ALIGN_YAW_RATE_TOL    = 0.15    # rad/s；容纳学习策略停车后的低速余振
+    _ALIGN_SETTLE_STEPS    = 6       # 连续稳定约0.12s后切状态
 
     def _slew(cur, target, max_delta):
         return float(cur + np.clip(float(target) - float(cur), -max_delta, max_delta))
@@ -800,19 +822,39 @@ def main():
         return math.copysign(mag, float(err))
 
     def _align_yaw_control(align_state, target_yaw, yaw_now, ang_vel_z):
-        """ALIGN_YAW 专用：有效转速转向 + 停稳判定，避免一碰阈值就立刻切状态。"""
-        nonlocal _align_ctrl_state, _align_cmd_wz, _align_settle_count
+        """ALIGN_YAW 专用：有效转速转向 + 带滞回的停车/停稳判定。"""
+        nonlocal _align_ctrl_state, _align_cmd_wz
+        nonlocal _align_settling, _align_settle_count
         if _align_ctrl_state != align_state:
             _align_ctrl_state = align_state
             _align_cmd_wz = 0.0
+            _align_settling = False
             _align_settle_count = 0
 
         err = _yaw_err_to(float(target_yaw), float(yaw_now))
-        wz_target = _yaw_target_with_min(
-            err, _ALIGN_YAW_KP, _ALIGN_YAW_MIN, _ALIGN_YAW_MAX, _ALIGN_YAW_TOL)
+        abs_err = abs(err)
+
+        # 一旦进入较小的角度误差范围，就保持零目标等待机体余振消失；
+        # 只有明显漂出更宽的范围才重新启转，避免在单一阈值附近反复触发
+        # 0 <-> 最小有效转速而形成极限环。
+        if _align_settling:
+            if abs_err > _ALIGN_YAW_RESUME_TOL:
+                _align_settling = False
+                _align_settle_count = 0
+        elif abs_err <= _ALIGN_YAW_ENTER_TOL:
+            _align_settling = True
+            _align_settle_count = 0
+
+        if _align_settling:
+            wz_target = 0.0
+        else:
+            wz_target = _yaw_target_with_min(
+                err, _ALIGN_YAW_KP, _ALIGN_YAW_MIN, _ALIGN_YAW_MAX,
+                _ALIGN_YAW_ENTER_TOL)
         _align_cmd_wz = _slew(_align_cmd_wz, wz_target, _ALIGN_YAW_DW_PER_STEP)
 
-        if (abs(err) <= _ALIGN_YAW_TOL
+        if (_align_settling
+                and abs_err <= _ALIGN_YAW_RESUME_TOL
                 and abs(float(ang_vel_z)) <= _ALIGN_YAW_RATE_TOL
                 and abs(_align_cmd_wz) <= _ALIGN_YAW_DW_PER_STEP):
             _align_settle_count += 1
@@ -821,6 +863,7 @@ def main():
         done = (_align_settle_count >= _ALIGN_SETTLE_STEPS)
         return _align_cmd_wz, done, dict(
             err=err, wz_actual=float(ang_vel_z),
+            settling=_align_settling,
             settle_count=_align_settle_count)
 
     def _pan_world_axis_control(
@@ -1245,6 +1288,7 @@ def main():
                           f"yaw={math.degrees(yaw):+.2f}deg "
                           f"err={math.degrees(_ad['err']):+.2f}deg "
                           f"cmd_wz={cmd_wz:+.3f} actual_wz={_ad['wz_actual']:+.3f} "
+                          f"holding={int(_ad['settling'])} "
                           f"settle={_ad['settle_count']}/{_ALIGN_SETTLE_STEPS}", flush=True)
                 if _align_done or state_step >= ALIGN_YAW_MAX_STEPS:
                     _why = "settled" if _align_done else "timeout"
@@ -2397,6 +2441,7 @@ def main():
                           f"yaw={math.degrees(yaw):+.2f}deg "
                           f"err={math.degrees(_ad['err']):+.2f}deg "
                           f"cmd_wz={cmd_wz:+.3f} actual_wz={_ad['wz_actual']:+.3f} "
+                          f"holding={int(_ad['settling'])} "
                           f"settle={_ad['settle_count']}/{_ALIGN_SETTLE_STEPS}", flush=True)
                 if _align_done or state_step >= ALIGN_YAW_MAX_STEPS:
                     _why = "settled" if _align_done else "timeout"

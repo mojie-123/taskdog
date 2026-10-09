@@ -1,22 +1,37 @@
-"""env.py — MuJoCo 环境封装，替代 Isaac Lab env/robot 接口。
+"""MuJoCo 物理与执行层，是所有 MuJoCo 入口的共同底座。
 
-职责：
-  1. 加载 scene.xml（机器人 + 桌子 + 物体）
-  2. reset()           — 初始化机器人姿态
-  3. step(action)      — PD 控制 + mj_step × substeps
-  4. get_robot_state() — 读取位置/四元数/速度/关节角
-  5. set_arm_target()  — 机械臂关节目标角
-  6. render_camera()   — RGB + depth（供 AnyGrasp/YOLO）
-  7. set_root_pose()   — 强制设置根节点位姿（FREEZE 用）
+职责边界
+--------
+``MuJoCoEnv`` 拥有唯一的 ``MjModel/MjData``，因此它是机器人真实位姿、
+关节状态、接触和相机数据的来源，也是最终施加控制量的地方。Nav2 只会把
+``vx/wz`` 送到行走策略，MoveIt 只会把关节路径送回主状态机；两者都不会直接
+修改 MuJoCo 状态。
 
-PD 参数（对应 Isaac Lab actuator cfg）：
-  腿：kp=80, kd=2 | 轮：kd=0.6 | 臂j1-4：kp=8000,kd=400
-  臂j5：kp=15000,kd=600 | 臂j6：kp=8000,kd=400 | 夹爪：kp=30000,kd=20
+主要调用者：
+
+* ``teleop_mapping_mujoco.py``：键盘行走、雷达建图；
+* ``navigate_mujoco.py``：Nav2 + 自定义 IK 的旧抓取流程；
+* ``navigate_mujoco_moveit.py``：Nav2 + MoveIt 的推荐完整流程；
+* 各类 MoveIt/抓取诊断脚本。
+
+主要接口：
+
+1. ``reset()`` 初始化根位姿、关节和控制器状态；
+2. ``get_robot_state()`` 返回策略、ROS bridge 和状态机需要的真值；
+3. ``step(action)`` 解码 16 维行走动作，计算腿/轮/臂/夹爪控制并推进物理；
+4. ``set_arm_target()`` / ``set_gripper_target()`` 接收高层目标；
+5. ``render_camera()`` 输出 AnyGrasp 使用的腕部 RGB/depth；
+6. 根位姿和 equality-weld 接口支持抓取阶段的底盘固定。
 
 Action 解码：
-  action[0:12]  → 腿 pos target = action*scale + default
-  action[12:16] → 轮 vel target = action*5.0
-  hipx scale=0.125，hipy/knee scale=0.25
+
+* ``action[0:12]``：腿位置目标 = ``action * scale + default``；
+* ``action[12:16]``：轮速目标 = ``action * 5.0``；
+* hip-x scale=0.125，hip-y/knee scale=0.25。
+
+MuJoCo actuator 是直接力矩入口。当前代码在每个 physics substep 计算显式 PD，
+实际增益请以本文件下方 ``_KP_*``/``_KD_*`` 常量为准，而不是 IsaacLab 隐式
+actuator 的原始数值。
 """
 
 import os
@@ -78,7 +93,7 @@ _INIT_HEIGHT = 0.58
 
 
 class MuJoCoEnv:
-    """MuJoCo 环境封装，提供和 Isaac Lab 相似的接口。"""
+    """把 MJCF、策略执行、机械臂控制和传感器读取封装为稳定接口。"""
 
     def __init__(
         self,

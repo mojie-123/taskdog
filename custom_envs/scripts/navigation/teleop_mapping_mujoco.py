@@ -1,9 +1,17 @@
 #!/usr/bin/env python
-"""Keyboard teleoperation and occupancy mapping in the MuJoCo scene.
+"""MuJoCo 离线建图入口：键盘行走、射线扫描、栅格融合和 Nav2 地图导出。
 
-The locomotion policy remains the low-level controller.  Keyboard commands
-provide the same vx/vy/wz observations used by the IsaacLab mapper, while a
-MuJoCo ``mj_multiRay`` Mid-360 supplies world-frame scan hits.
+这一步不启动 ROS 2。键盘只生成期望 ``vx/vy/wz``，低层 rsl_rl policy 仍负责
+把速度目标变成 16 维腿/轮动作。每到 ``scan_period``，``MuJoCoMid360`` 产生
+世界系击中点，``OccupancyGrid`` 从真实传感器原点清理自由空间并标记高于地面的
+障碍端点。
+
+数据流：
+
+``keyboard -> policy observation -> policy -> MuJoCo -> LiDAR hits``
+``-> OccupancyGrid -> .npz/.npy -> convert_map -> Nav2 .pgm/.yaml``
+
+生成的 YAML 只有在随后终端 1 的 Nav2 launch 中通过 ``map:=...`` 传入才会生效。
 """
 
 import argparse
@@ -133,6 +141,7 @@ class VoxelPointAccumulator:
 
 
 def save_mapping_outputs(grid, cloud, maps_dir, map_name, auto_convert=True):
+    """保存内部栅格、诊断点云，并按需生成 Nav2 PGM/YAML。"""
     os.makedirs(maps_dir, exist_ok=True)
     npz_path = os.path.join(maps_dir, map_name + ".npz")
     cloud_path = os.path.join(maps_dir, map_name + "_cloud.npy")
@@ -199,6 +208,9 @@ def parse_args():
 def main():
     args = parse_args()
     device = args.device if torch.cuda.is_available() else "cpu"
+
+    # 1) 仿真、低层策略、虚拟雷达和独立 viewer。viewer 不安装 MuJoCo
+    # 默认按键回调，因此 W/S/A/D/Q/E 只会影响 TeleopController。
     keyboard = TeleopController(
         args.linear_speed, args.lateral_speed, args.yaw_speed)
     env = MuJoCoEnv(
@@ -217,6 +229,8 @@ def main():
         if args.render else None
     )
 
+    # 2) 建图坐标域。默认 origin 使正方形地图以世界原点为中心；对 House
+    # 这类只使用正坐标的场景通常显式传 --origin_x 0 --origin_y 0。
     grid = OccupancyGrid(
         width=args.grid_size,
         height=args.grid_size,
@@ -258,6 +272,8 @@ def main():
             if quit_requested:
                 break
 
+            # 3) 键盘速度不是直接轮速：它进入训练时一致的 57 维观测，policy
+            # 输出的 16 维 action 才由 MuJoCoEnv 解码为腿位置/轮速度目标。
             state = env.get_robot_state()
             obs_np = build_policy_obs(
                 state["joint_pos"],
@@ -280,6 +296,7 @@ def main():
             if viewer is not None:
                 viewer.render()
 
+            # 4) 使用仿真时间控制扫描周期，避免渲染快慢改变雷达采样间隔。
             if env.data.time + 1e-12 >= next_scan_time:
                 scan = lidar.scan(env.data)
                 finite = grid.integrate_scan(

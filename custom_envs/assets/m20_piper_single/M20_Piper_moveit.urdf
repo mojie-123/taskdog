@@ -1,5 +1,10 @@
 <?xml version='1.0' encoding='utf-8'?>
 <robot name="M20_Piper_MoveIt">
+  <!-- MoveIt 的 planning model，不是 MuJoCo 物理模型。
+       move_group 用它做 FK/IK、自碰撞和路径碰撞检查；实际质量、接触和 actuator
+       仍由 custom_envs/mujoco/scene*.xml 决定。两份模型的 joint1..joint8、
+       base_link->arm 和 grasp_tcp 几何必须同步，可用 verify_moveit_fk.py 检查。
+       mesh 当前使用绝对路径，迁移仓库位置时也要同步修改。 -->
   <link name="base_link">
     <inertial>
       <origin xyz="0.00355105878308153 0.0016507579200937 -0.00346462146571654" rpy="0 0 0" />

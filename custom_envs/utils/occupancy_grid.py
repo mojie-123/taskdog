@@ -1,6 +1,14 @@
-"""2D Occupancy Grid Map with Bresenham ray-casting.
+"""建图阶段使用的二维 log-odds 占用栅格与 Bresenham 射线融合。
 
-Based on Probabilistic Robotics (Thrun et al., 2005), Ch. 9.
+坐标契约必须在所有调用者中保持一致：``grid[row, col]``，row 对应世界 Y，
+col 对应世界 X，``origin=(x_min, y_min)`` 是左下角。内部 row=0 因而是世界
+最小 Y；只有导出图像时 ``convert_map.py`` 才会把数组上下翻转。
+
+``integrate_scan`` 先从真实雷达原点沿每条射线降低自由格的 log-odds，再把满足
+高度条件的端点提高为障碍格。类本身不依赖 ROS 2，保存的 NPZ 是项目内部格式；
+Nav2 需要由 ``convert_map.py`` 生成的 PGM/YAML。
+
+算法参考 Probabilistic Robotics (Thrun et al., 2005), Ch. 9。
 """
 
 import numpy as np

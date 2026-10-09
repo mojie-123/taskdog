@@ -1,0 +1,50 @@
+{
+  "seed": 42,
+  "dataset": {
+    "path": "custom_envs/scripts/N2M/data/n2m_dataset/smoke",
+    "num_points": 256,
+    "cache_size": 8,
+    "rotation_degrees": 0.0,
+    "translation_radius_m": 0.0
+  },
+  "model": {
+    "encoder": {
+      "name": "PointBERT",
+      "ckpt": null,
+      "freeze": false,
+      "config": {
+        "trans_dim": 32,
+        "depth": 2,
+        "drop_path_rate": 0.0,
+        "num_heads": 4,
+        "group_size": 8,
+        "num_group": 16,
+        "encoder_dims": 32
+      }
+    },
+    "decoder": {
+      "num_gaussians": 1,
+      "output_dim": 3,
+      "layers": [64, 32],
+      "dropout": 0.0
+    }
+  },
+  "loss": {
+    "weight_entropy_coefficient": 0.0,
+    "mode_separation_coefficient": 0.0,
+    "separation_scale": 0.25,
+    "jitter": 0.00001
+  },
+  "training": {
+    "output": "custom_envs/scripts/N2M/data/training/smoke",
+    "batch_size": 2,
+    "num_workers": 0,
+    "epochs": 20,
+    "learning_rate": 0.001,
+    "weight_decay": 0.0,
+    "grad_clip": 1.0,
+    "amp": false,
+    "early_stopping_patience": 20
+  }
+}
+

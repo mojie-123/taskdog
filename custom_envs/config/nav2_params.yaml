@@ -1,12 +1,14 @@
-# Nav2 parameters for M20Pro + Piper integration (Isaac Sim ground-truth localization)
+# Nav2 parameters for M20Pro + Piper integration (MuJoCo/IsaacLab ground-truth localization)
 # ROS 2 Humble / Nav2 1.1.x
-# NOTE: AMCL is intentionally omitted. The Isaac ROS2 Bridge broadcasts ground-truth
+# NOTE: AMCL is intentionally omitted. The simulator ROS2 Bridge broadcasts ground-truth
 #       /tf (地图坐标系map->里程计坐标系odom->机器人基座坐标系base_link), so Nav2 gets perfect localization for free.
+# NOTE: 当前 local/global costmap 只有 static_layer + inflation_layer，没有在线
+#       obstacle_layer；导航使用离线 PGM/YAML，MuJoCo 雷达不会在导航时实时更新障碍。
 
 bt_navigator:
   ros__parameters:
     use_sim_time: false   # 使用系统真实时间
-    global_frame: map   # 全局参考坐标系，通常由 AMCL 或（在本项目中）Isaac Sim 的真实位姿提供 map → odom 的变换
+    global_frame: map   # 全局参考坐标系；本项目由仿真真值 bridge 提供 map → odom
     robot_base_frame: base_link   # Nav2会计算base_link在map坐标系中的位姿
     odom_topic: /odom   # 发布 odom → base_link 的坐标变换
     bt_loop_duration: 10   # 行为树循环周期10ms
@@ -66,15 +68,15 @@ global_costmap:   # 全局代价地图。它主要基于预先构建好的静态
       footprint_padding: 0.02
       resolution: 0.05
       track_unknown_space: true   # 保留“这个地方没有扫描过”的信息，仅决定代价地图如何"表示"未知区域
-      plugins: ["static_layer", "inflation_layer"]   # 比局部代价地图多一个static_layer（加载建图时的.pgm文件）
+      plugins: ["static_layer", "inflation_layer"]   # 静态PGM障碍 + 膨胀代价
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
         map_subscribe_transient_local: true   # 确保能拿到地图
         enabled: true
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 2.0
-        inflation_radius: 0.65
+        cost_scaling_factor: 4.0
+        inflation_radius: 0.55
       always_send_full_costmap: true   # 每次发送完整地图数据
 
 map_server:  # 地图服务器。加载预先构建好的静态地图（通常是 .pgm 图像和 .yaml 配置文件），并将其发布为 ROS 2 话题，供全局代价地图（global_costmap）和路径规划器使用。
@@ -117,29 +119,28 @@ controller_server:   # 控制器服务器。跟踪全局路径，实时计算机
       yaw_goal_tolerance: 3.14159   # 不限制最终朝向do not enforce final yaw — ALIGN_YAW handles it
     FollowPath:
       plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"   # 在路径上找一个"前瞻点"，计算机器人转向该点所需的曲率和速度
-      desired_linear_vel: 0.5   # 期望线速度0.8
+      desired_linear_vel: 0.5   # 直线路径上的期望线速度(m/s)
       lookahead_dist: 0.6   # 非速度自适应时的备用前瞻距离
-      min_lookahead_dist: 0.55   # 静止起步也保留足够前瞻，避免栅格路径产生过大曲率
-      max_lookahead_dist: 0.70   # 限制高速时前瞻，避免跨过狭门转折
-      lookahead_time: 1.2   # 前瞻距离约为当前速度乘1.2s，并被上下限截断
+      min_lookahead_dist: 0.65   # 静止起步也保留足够前瞻，避免栅格路径产生过大曲率
+      max_lookahead_dist: 0.85   # 限制高速时前瞻，避免跨过狭门转折
+      lookahead_time: 1.4   # 前瞻距离约为当前速度乘1.4s，并被上下限截断
       rotate_to_heading_angular_vel: 0.8   # 落在学习运动策略已验证的0.40~0.90rad/s有效转向区间
       transform_tolerance: 0.5   # 如果最新的坐标变换（TF）数据超过 0.5 秒未更新，控制器会拒绝执行，防止使用过时的位姿数据
-      use_velocity_scaled_lookahead_dist: true   # 按速度在0.35~0.70m范围内调整前瞻距离
+      use_velocity_scaled_lookahead_dist: true   # 按速度在0.65~0.85m范围内调整前瞻距离
       min_approach_linear_velocity: 0.45   # 保持在学习运动策略的稳定前进速度区间
       approach_velocity_scaling_dist: 0.8   # 接近速度缩放距离（当机器人距离目标点小于 0.8 米时，开始线性减速，从 desired_linear_vel 降到 min_approach_linear_velocity）
       use_collision_detection: true   # 是否器用碰撞检测。true：检查从机器人到前瞻点之间是否有障碍物，如果有则减速或停止。
       max_allowed_time_to_collision_up_to_carrot: 1.5   # 提前检查碰撞，给学习运动策略留出停车时间
       use_regulated_linear_velocity_scaling: true   # 基于曲率的速度调节，曲率越大，速度越慢
-      use_fixed_curvature_lookahead: false   # 使用动态前瞻距离计算曲率
-      curvature_lookahead_dist: 0.8   # 仅use_fixed_curvature_lookahead: true时生效
       use_cost_regulated_linear_velocity_scaling: false   # 没有基于代价地图的速度调节
-      regulated_linear_scaling_min_radius: 0.9   # 曲率小于0.9m时开始减速
-      regulated_linear_scaling_min_speed: 0.45   # 转弯减速时也保持运动策略的最小有效速度
+      regulated_linear_scaling_min_radius: 1.2   # 转弯半径小于1.2m时开始曲率减速
+      regulated_linear_scaling_min_speed: 0.4   # 转弯减速时也保持运动策略的最小有效速度
       use_rotate_to_heading: true   # 大角度转折先原地对齐，避免低速前进同时大角速度
       allow_reversing: false   # 不允许倒车
       rotate_to_heading_min_angle: 0.35   # 航向误差超过约20°时先原地转向
       max_angular_accel: 10.0   # 20Hz下首周期可给出0.5rad/s，跨过运动策略的有效转向阈值
       max_robot_pose_search_dist: 10.0   # 最大机器人位姿搜索距离。超过此距离则认为机器人偏离路径太远
+      use_interpolation: true
 
 velocity_smoother:   # 速度平滑器。避免速度突变
   ros__parameters:

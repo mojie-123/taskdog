@@ -1,9 +1,14 @@
-"""MuJoCo ray-cast implementation of the project's Mid-360 LiDAR.
+"""MuJoCo ray-cast implementation of the project's Mid-360-like LiDAR.
 
-The default scan pattern mirrors ``get_mid360_lidar_pattern()``: 40 vertical
-channels, a 59 degree vertical field of view, and 1 degree horizontal
-resolution (14,400 rays total).  Results are returned in world coordinates so
-both simulators can share OccupancyGrid.
+The defaults are 40 vertical channels over a 59 degree vertical field of view
+and 1 degree horizontal resolution: ``40 * 360 = 14,400`` rays per scan. These
+values are intentionally kept in sync with the mapping regression test and the
+high-density configuration used by the project.
+
+``scan()`` transforms every ray into the MuJoCo world frame before calling
+``mj_multiRay`` and returns world-frame hit points. This keeps the mapping
+layer independent of MuJoCo body coordinates and lets it share the same
+``OccupancyGrid`` contract as the IsaacLab mapper.
 """
 
 from dataclasses import dataclass
@@ -33,9 +38,9 @@ class MuJoCoMid360:
         model: mujoco.MjModel,
         base_body_name: str = "base_link",
         offset: Sequence[float] = (0.30, 0.0, 0.55),
-        channels: int = 16,    # 40
+        channels: int = 40,
         vertical_fov_deg: Sequence[float] = (-7.0, 52.0),
-        horizontal_resolution_deg: float = 2.0,    # 1.0
+        horizontal_resolution_deg: float = 1.0,
         max_distance: float = 70.0,
         geomgroup: Optional[Sequence[int]] = None,
         robot_raycast_group: int = 4,

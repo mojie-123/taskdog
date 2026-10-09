@@ -1,4 +1,11 @@
 <mujoco model="taskdog_scene">
+  <!-- House 版 MuJoCo 物理场景。建图和执行时都必须显式传
+       -scene custom_envs/mujoco/scene_house.xml，并让终端1加载由本场景生成的
+       *_nav2.yaml。它保持与默认场景相同的机器人 body/joint/actuator、wrist_cam
+       和 base_lock weld 名称，供 MuJoCoEnv 与抓取状态机复用。
+
+       注意：当前 MoveIt default_scene_objects() 仍只近似默认双桌场景，不会自动
+       导入这里的墙、门框和家具；Nav2 House 地图正确不等于 MoveIt 碰撞世界已同步。 -->
   <compiler angle="radian" meshdir="/home/mojie/taskdog/deps/deep_robotics_model/M20_Piper/mjcf/meshes/" />
   <!-- condim=4(第四轮): 默认 3 只有滑动摩擦, 物体 friction 里的扭转/滚动系数是死值。
        官方文档: 接触 condim = max(双方), 摩擦 = 逐元素 max, priority 高者覆盖。

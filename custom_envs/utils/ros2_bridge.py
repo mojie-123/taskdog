@@ -1,7 +1,11 @@
-"""ROS 2 Bridge launcher (Python 3.11 side).
-在 Python 3.11（Isaac Lab 主进程）和 Python 3.10（Nav2 ROS 2 进程）之间建立通信通道
-用子进程 + JSON 通信的方式桥接两个进程（ROS 2 Humble 和 Isaac Lab）
-Python 3.11 (Isaac Lab)                    Python 3.10 (Nav2 进程)
+"""ROS 2/Nav2 bridge 的仿真主进程一侧（通常是 conda Python 3.11）。
+
+类名 ``IsaacROS2Bridge`` 是历史名称；当前 MuJoCo 和 IsaacLab 两套入口都使用
+它。ROS 2 Humble 的 rclpy C 扩展针对系统 Python 3.10 编译，因此不能直接加载到
+主进程：本模块启动 ``/usr/bin/python3.10 ros2_bridge_process.py``，双方只通过
+换行分隔 JSON 通信。
+
+Python 3.11 (MuJoCo/IsaacLab)              Python 3.10 (ROS 2 client)
        │                                              │
        │  IsaacROS2Bridge 类                          │  ros2_bridge_process.py
        │                                              │
@@ -10,8 +14,9 @@ Python 3.11 (Isaac Lab)                    Python 3.10 (Nav2 进程)
        │<─── stdout (JSON) ───────────────────────────┤  接收 cmd_vel、导航状态
        │                                              │
 
-Launches /usr/bin/python3.10 ros2_bridge_process.py as a real subprocess.
-Communicates via newline-delimited JSON on stdin/stdout.
+主进程发送 MuJoCo 真值位姿和 Nav2 goal；子进程返回平滑后的 ``vx/wz`` 与导航
+状态。终端 1 的 Nav2 server 不属于这个子进程，``stop()`` 只关闭 bridge 客户端，
+不会关闭或 finalized 终端 1 的 Nav2 lifecycle 节点。
 
 Public API:
     bridge = IsaacROS2Bridge()
@@ -125,8 +130,8 @@ class IsaacROS2Bridge:
         raise RuntimeError(
             f"[IsaacROS2Bridge] not ready within {timeout}s")   # 超时抛出异常
 
-    def stop(self) -> None:   # 关闭 Nav2进程
-        """Ask subprocess to shut down gracefully."""
+    def stop(self) -> None:   # 关闭本 bridge 子进程，不关闭终端1的 Nav2 栈
+        """Ask the owned bridge subprocess to shut down gracefully."""
         self._send({"type": "stop"})
         if self._proc is not None:
             try:
@@ -151,7 +156,7 @@ class IsaacROS2Bridge:
             "quat":    list(map(float, quat_w)),
             "lin_vel": list(map(float, lv)),
             "ang_vel": list(map(float, av)),
-        })   # 发送机器人位姿、速度、加速度。Isaac Sim -> Nav2，Nav2接收后发布到/tf话题供代价地图和规划器使用
+        })   # 仿真 -> bridge；子进程再发布 /tf 和 /odom 供 Nav2 使用
         self._drain_feedback()
 
     def send_goal(self, x: float, y: float) -> None:   # 向 Nav2发送目标点坐标，Nav2 接收后触发 A* 路径规划和 Pure Pursuit 跟踪
@@ -219,13 +224,13 @@ class IsaacROS2Bridge:
                 self._nav_done   = bool(msg["nav_done"])
                 self._nav_failed = bool(msg["nav_failed"])
 
-# IsaacLab -> Nav2
+# MuJoCo/IsaacLab -> ROS bridge -> Nav2
 # 类型	                        JSON 格式	                                                                            作用
-# 位姿更新	            {"type":"pose","pos":[x,y,z],"quat":[x,y,z,w],"lin_vel":[...],"ang_vel":[...]}	            发布真实位姿到 /tf
+# 位姿更新	            {"type":"pose","pos":[x,y,z],"quat":[w,x,y,z],"lin_vel":[...],"ang_vel":[...]}	            发布真实位姿到 /tf、/odom
 # 导航目标	            {"type":"goal","x":5.0,"y":3.0}	                                                            触发 Nav2 导航
-# 停止信号	            {"type":"stop"}	                                                                            关闭 Nav2 进程
+# 停止信号	            {"type":"stop"}	                                                                            关闭 bridge 客户端进程
 
-# Nav2 -> IsaacLab
+# Nav2 -> ROS bridge -> MuJoCo/IsaacLab
 # 类型	                        JSON 格式	                               作用
 # 就绪信号	            {"ready":true}	                            表示 Nav2 已启动完成
 # 速度指令	            {"vx":0.5,"omega_z":0.3}	                    控制器输出的速度

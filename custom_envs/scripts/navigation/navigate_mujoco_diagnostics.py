@@ -1,8 +1,10 @@
-"""Diagnostics helpers for navigate_mujoco.py.
+"""MuJoCo 两套导航抓取状态机共用的只读诊断辅助函数。
 
 All functions in this module are read-only with respect to robot control/state
 (except writing optional PNG debug artifacts). They intentionally keep verbose
-instrumentation out of the main navigation/manipulation state machine.
+instrumentation out of ``navigate_mujoco.py`` and
+``navigate_mujoco_moveit.py``. PNG 会写入 ``custom_envs/tmp_pictures``，不会
+参与规划或控制。
 """
 
 import math

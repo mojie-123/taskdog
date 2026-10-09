@@ -1,4 +1,4 @@
-"""Python-side bridge for MoveIt 2 services.
+"""MuJoCo 主进程一侧的 MoveIt 2 planning bridge。
 
 This module is imported by the MuJoCo process (which may be running in a conda
 Python different from ROS 2 Humble's Python).  A separate /usr/bin/python3.10
@@ -8,6 +8,10 @@ JSON over stdio, matching the pattern already used by ros2_bridge.py.
 MoveIt is used as a *planner only*.  Planned JointTrajectory points are returned
 to the MuJoCo process, which continues to execute arm position targets through
 its existing env.set_arm_target() + PD controller.
+
+持续状态与请求/响应采用两种 JSON 消息：关节状态是无需等待回复的流式更新；IK、
+规划、PlanningScene 和附着物体操作带唯一 request id，由 ``_request`` 等待对应
+回复。ROS 2 server 本身由终端 1 的 ``moveit_mujoco.launch.py`` 启动。
 """
 
 from __future__ import annotations
@@ -93,7 +97,11 @@ class MoveItROS2Bridge:
     # Planning scene
     # ------------------------------------------------------------------
     def apply_default_scene(self, timeout: Optional[float] = None) -> dict:
-        """Add the two MuJoCo tables to MoveIt's PlanningScene in the map frame."""
+        """Add the original two-table scene approximation to PlanningScene.
+
+        这不是通用 MJCF 导入器；使用 ``scene_house.xml`` 时，House 墙体和家具
+        不会由本方法自动加入 MoveIt 碰撞世界。
+        """
         return self._request({"type": "apply_default_scene"}, timeout=timeout)
 
     # ------------------------------------------------------------------
