@@ -21,6 +21,7 @@ Protocol: newline-delimited JSON on stdin/stdout.
     {"type":"pose","pos":[x,y,z],"quat":[w,x,y,z],
      "lin_vel":[vx,vy,vz],"ang_vel":[wx,wy,wz]}
     {"type":"goal","x":float,"y":float}
+    {"type":"cancel_goal"}
     {"type":"stop"}
   stdout (this -> main):
     {"ready":true}                                     -- emitted once on init OK
@@ -134,6 +135,7 @@ def main() -> None:
     _task_active = False
     _stop        = False
     _pending_goal: list = []
+    _pending_cancel = False
     CMD_TIMEOUT = float(args.cmd_vel_timeout)
     # 上次发射给父进程的 nav 状态（None = 还没发过，保证首条必发）。
     # 主循环只在本对值变化时才发 nav_done/nav_failed：否则 NAV1 完成后
@@ -196,7 +198,7 @@ def main() -> None:
     # stdin reader thread
     # -----------------------------------------------------------------------
     def _stdin_reader() -> None:   # 持续读取父进程通过 stdin 发送的 JSON 消息
-        nonlocal _stop
+        nonlocal _stop, _pending_cancel
         for raw_line in sys.stdin:
             raw_line = raw_line.strip()
             if not raw_line:
@@ -217,6 +219,11 @@ def main() -> None:
                 with _lock:
                     _pending_goal.clear()
                     _pending_goal.append((gx, gy))
+            elif t == "cancel_goal":
+                _eprint("[BridgeProc] cancel queued")
+                with _lock:
+                    _pending_goal.clear()
+                    _pending_cancel = True
             elif t == "pose":
                 with _lock:
                     _pos_w[:]   = msg["pos"]
@@ -247,11 +254,29 @@ def main() -> None:
         _loop_count += 1
         with _lock:
             should_stop = _stop
+            should_cancel = _pending_cancel
+            _pending_cancel = False
             goal_list   = list(_pending_goal)
             _pending_goal.clear()
         if should_stop:
             _eprint("[BridgeProc] stop received, shutting down.")
             break
+
+        if should_cancel:
+            with _lock:
+                task_active = _task_active
+            if task_active:
+                try:
+                    navigator.cancelTask()
+                    _eprint("[BridgeProc] active Nav2 task cancelled")
+                except Exception as exc:
+                    _eprint(f"[BridgeProc] warning: cancelTask failed: {exc}")
+            with _lock:
+                _task_active = False
+                _nav_done = False
+                _nav_failed = False
+                _vx = 0.0
+                _omega_z = 0.0
 
         # Process any pending goal
         for gx, gy in goal_list:

@@ -473,3 +473,57 @@ python custom_envs/scripts/N2M/replay_n2m_prediction.py \
 官方权重的首层只接收 XYZ；本项目 loader 会保留三通道预训练权重，并将新增 RGB
 通道置零，然后在 N2M 训练中学习颜色特征。加载时要求本地 backbone 参数 100%
 覆盖，只允许忽略原始 ModelNet 分类头，避免 `strict=False` 掩盖错误。
+
+## 在线 NAV → N2M → 抓取 → 搬运 → 放置集成入口
+
+`navigation/navigate_mujoco_n2m.py` 是独立入口，不修改已经验证的
+`navigate_mujoco_moveit.py`。第一版使用 MuJoCo cube 真值计算距 cube 1.4m
+的 Nav2 观察停靠点；停稳并朝向 cube 后，从 `front_realsense`
+在线生成与训练一致的 base-frame XYZRGB 点云，运行一次 N2M，通过
+MuJoCo 碰撞预检后将底盘直接放置到最高密度 M，并复用已验证的
+`ARM_INIT -> LIFT` 执行器。默认在每个 M 重新运行三次 AnyGrasp；三次都失败
+就保持 cube 当前状态并换到下一个无碰撞 M。最多尝试三个 M（共九次抓取），
+仍失败就退出。成功 LIFT 后先把 cube 重新作为 MoveIt attached object，规划并
+执行到原完整状态机的 `ARM_SIDE=(-π/2, 1.5, -1.5, 0, 1.2, 0)` 安全运输姿态；
+执行中持续检查双指接触和夹爪开口。只有夹爪在短时间内从持物开口迅速塌缩到
+接近闭合，或双指接触连续丢失，才判定 cube 掉落；cube/TCP 相对位移仅记录为
+诊断指标。确认机械臂收回后才继续后撤、Nav2 搬运、末端对齐、转臂和松爪放置。
+
+`--goal X Y` 为兼容旧命令保留，但在此新入口中会被忽略；原入口的
+`--goal` 行为不变。house 场景的默认机器人初始位姿是已验证无碰撞的
+`(x, y, yaw) = (1.6, 1.6, 0)`；也可通过 `--robot-x/--robot-y/--robot-yaw`
+覆盖。先在终端 1 启动 Nav2 和 planning-only MoveIt：
+
+```bash
+source /opt/ros/humble/setup.bash
+cd /home/mojie/taskdog
+ros2 launch custom_envs/launch/nav2_moveit_mujoco.launch.py \
+    params_file:=$(pwd)/custom_envs/config/nav2_params.yaml \
+    map:=$(pwd)/custom_envs/maps/map_house_mujoco_nav2.yaml
+```
+
+再在 `env_isaaclab` 环境的终端 2 运行：
+
+```bash
+python custom_envs/scripts/navigation/navigate_mujoco_n2m.py \
+    --policy_path deps/rl_training/logs/rsl_rl/deeprobotics_m20_flat/2026-07-18_10-57-32/model_4999.pt \
+    --n2m-checkpoint custom_envs/scripts/N2M/data/training/d30_o100_k1_v1/best.pt \
+    --grasp-checkpoint /home/mojie/anygrasp_sdk/grasp_detection/log/checkpoint_detection.tar \
+    --scene custom_envs/mujoco/scene_house_N2M.xml \
+    --nav2-params custom_envs/config/nav2_params.yaml \
+    --destination 12.0 12.0 \
+    --render
+```
+
+终端 1 的 `params_file` 与终端 2 的 `--nav2-params` 应指向同一个文件。集成脚本
+会读取其中的控制器/平滑器频率、最大线角速度、`velocity_timeout` 以及
+`SimpleProgressChecker` 阈值，并按 MuJoCo 的 50 Hz 步长做真实时间同步，避免将
+Nav2 的同一条 20 Hz 指令在仿真中无节制重复执行而走出弯曲、振荡轨迹。若底盘
+在 YAML 配置的 60 秒内移动不足 0.1m，脚本会明确报告 `Nav2 progress timeout`
+并退出，不再以零速度一直等到 `--destination-max-steps`。
+
+默认每次运行的在线点云、图像、N2M prediction、候选队列、碰撞预检、
+`lift_retraction_result.json` 和抓取/搬运结果保存到
+`data/integrated_runs/<timestamp>/`。成功完整放置时
+`summary.json` 的 `outcome` 为 `task_success`；仅 LIFT 成功但搬运失败不会被
+误记为完整成功。

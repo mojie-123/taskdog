@@ -27,6 +27,7 @@ Public API:
     done, failed = bridge.get_nav_status()
     # once before the NAV loop:
     bridge.send_goal(x, y)
+    bridge.cancel_goal()
     bridge.stop()
 """
 
@@ -165,6 +166,15 @@ class IsaacROS2Bridge:
         self._nav_done   = False
         self._nav_failed = False
         self._send({"type": "goal", "x": float(x), "y": float(y)})
+
+    def cancel_goal(self) -> None:
+        """Cancel the active Nav2 task without stopping the bridge."""
+        self._drain_feedback()
+        self._nav_done = False
+        self._nav_failed = False
+        self._vx = 0.0
+        self._omega_z = 0.0
+        self._send({"type": "cancel_goal"})
 
     def get_cmd_vel(self) -> Tuple[float, float]:   # 从Nav2获取速度指令cmd_vel 
         """Return the subprocess-filtered command, or zero if feedback stalls.
