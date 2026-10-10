@@ -478,11 +478,42 @@ python custom_envs/scripts/N2M/replay_n2m_prediction.py \
 
 `navigation/navigate_mujoco_n2m.py` 是独立入口，不修改已经验证的
 `navigate_mujoco_moveit.py`。第一版使用 MuJoCo cube 真值计算距 cube 1.4m
-的 Nav2 观察停靠点；停稳并朝向 cube 后，从 `front_realsense`
+的 Nav2 观察停靠点；NAV 末端朝向控制使用 3° 进入、6° 恢复的 yaw 滞回，
+一旦进入 3° 就不会因为 2.9°/3.0° 的步态摆动反复发出最小角速度命令；停稳并
+朝向 cube 后，从 `front_realsense`
 在线生成与训练一致的 base-frame XYZRGB 点云，运行一次 N2M，通过
-MuJoCo 碰撞预检后将底盘直接放置到最高密度 M，并复用已验证的
+MuJoCo 碰撞预检后，为最高密度 M 生成 cube-radial 预停靠位姿 P：P 始终位于
+从 cube 经过 M 向外延伸的射线上，因此 P→M 始终朝 cube/桌面方向推进，不再生成
+位于 M 机身正前方并要求倒车进入的 P。每个距离依次检查中心线以及左右两个切向
+偏移，默认形成 3 个距离 × 3 个切向位置共 9 个选项；
+`--predock-tangent-offset` 控制左右偏移量。脚本先用
+Nav2 粗略到达 P，再复用原状态机中已验证的 PAN_XY 平滑控制器纯平移居中；这
+一阶段固定 `wz=0`，其完成条件也不检查 yaw 或 yaw 变化率。随后底盘保持
+`vx=vy=0` 原地对齐 M 的 yaw，角速度命令带斜坡、最小有效转速和
+2°/4° 滞回；对齐并停稳后，才使用同一 PAN_XY 控制器从 P 平移到 M。PAN_XY
+在世界坐标系分别控制 X/Y，再转换为实时机体系 `vx/vy`，并沿用最小有效步速、
+速度斜坡和位置滞回。P→M 阶段重新启用 PAN_XY 与 yaw 联合调节，但终点不再
+持续追逐单个精确 SE(2) 点。每个候选 M 使用其所属 N2M 高斯分量的协方差构造
+候选局部椭球：默认 Mahalanobis 半径 2.0 进入减速区，速度上限和最小速度连续降到
+原值的 35%；半径 1.0 且满足物理硬限制时进入捕获区；捕获后使用半径 1.5 的保持区
+吸收停步漂移。这三个半径可分别通过 `--dock-n2m-slow-radius`、
+`--dock-n2m-enter-radius` 和 `--dock-n2m-hold-radius` 调整，并要求
+`enter < hold < slow`。
+
+高斯只决定区域的形状和尺度，不会直接放宽到模型输出的完整方差。默认内层还要求
+纵向误差位于 `[-5, -1] cm`、横向误差不超过 ±5 cm、yaw 偏差不超过 6°；保持区
+最多只放宽到纵向 `[-7, 0] cm`、横向 ±7 cm 和 yaw 8°。纵向误差始终不得大于
+零，因此不会在比候选 M 更远离桌子的一侧结束。进入捕获区后 XY/yaw 命令一起
+斜坡归零；单帧越界不会重新启动控制，只有连续 15 帧离开保持区才解除锁存。
+停稳判定仍使用 15 帧位姿窗口的平移/转动趋势，不使用受周期性步态摆动影响的
+单帧根节点速度。这样保留 PAN_XY+yaw 的联合收敛能力，同时避免机器人在固定
+距离/角度阈值附近反复启停。
+整个过程不再直接修改底盘根节点位姿。P
+周围的完整 360° 旋转区域以及 P 到 M 的走廊都会使用机器狗完整几何体预检。
+实际到达 M 后会用实测底盘位姿计算 joint1 朝向，然后复用已验证的
 `ARM_INIT -> LIFT` 执行器。默认在每个 M 重新运行三次 AnyGrasp；三次都失败
-就保持 cube 当前状态并换到下一个无碰撞 M。最多尝试三个 M（共九次抓取），
+就保持 cube 当前状态，先收回机械臂并让底盘物理退入上一 P 的碰撞预检安全区，
+再前往下一个无碰撞 M。最多尝试三个 M（共九次抓取），
 仍失败就退出。成功 LIFT 后先把 cube 重新作为 MoveIt attached object，规划并
 执行到原完整状态机的 `ARM_SIDE=(-π/2, 1.5, -1.5, 0, 1.2, 0)` 安全运输姿态；
 执行中持续检查双指接触和夹爪开口。只有夹爪在短时间内从持物开口迅速塌缩到
@@ -520,9 +551,12 @@ python custom_envs/scripts/navigation/navigate_mujoco_n2m.py \
 `SimpleProgressChecker` 阈值，并按 MuJoCo 的 50 Hz 步长做真实时间同步，避免将
 Nav2 的同一条 20 Hz 指令在仿真中无节制重复执行而走出弯曲、振荡轨迹。若底盘
 在 YAML 配置的 60 秒内移动不足 0.1m，脚本会明确报告 `Nav2 progress timeout`
-并退出，不再以零速度一直等到 `--destination-max-steps`。
+并退出，不再以零速度一直等到 `--destination-max-steps`。观察位姿停稳判定使用
+短位姿窗口的平移/转动趋势，不直接使用单帧机体速度，因此 locomotion policy
+的周期性车身摆动不会反复清零；持续漂移或重新发出运动命令仍会拒绝通过。
 
 默认每次运行的在线点云、图像、N2M prediction、候选队列、碰撞预检、
+P/M 实际运动与误差记录 `motion_transitions.jsonl`、
 `lift_retraction_result.json` 和抓取/搬运结果保存到
 `data/integrated_runs/<timestamp>/`。成功完整放置时
 `summary.json` 的 `outcome` 为 `task_success`；仅 LIFT 成功但搬运失败不会被

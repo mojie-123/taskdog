@@ -82,6 +82,8 @@ class IsaacROS2Bridge:
 
     def start(self, timeout: float = 30.0) -> None:
         """Launch /usr/bin/python3.10 subprocess and wait for ready signal."""
+        if self._proc is not None:
+            raise RuntimeError("[IsaacROS2Bridge] bridge is already started")
         bridge_script = os.path.join(
             os.path.dirname(__file__), "ros2_bridge_process.py")
 
@@ -105,40 +107,96 @@ class IsaacROS2Bridge:
               flush=True)
 
         # Background thread reads stdout JSON lines
+        proc = self._proc
         self._reader_thread = threading.Thread(
-            target=self._stdout_reader, daemon=True)   # 创建一个守护线程，持续读取子进程的 stdout。主程序退出后，守护线程自动被杀死
+            target=self._stdout_reader,
+            args=(proc,),
+            daemon=True,
+        )   # 创建一个守护线程，持续读取子进程的 stdout。
         self._reader_thread.start()
 
         # Wait for ready signal
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if self._proc.poll() is not None:   # 子进程提前崩溃
-                raise RuntimeError(
-                    f"[IsaacROS2Bridge] subprocess exited early "
-                    f"(code={self._proc.returncode})")
-            try:   # 尝试从消息队列获取反馈
-                msg = self._feedback_q.get(timeout=0.3)   # 从消息队列获取一条消息，最多等待 0.3 秒
-                if msg.get("init_failed"):   # 消息中是否有"init_failed"
+        try:
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if proc.poll() is not None:   # 子进程提前崩溃
                     raise RuntimeError(
-                        "[IsaacROS2Bridge] subprocess init failed; "
-                        "check rclpy/Nav2 installation.")
-                if msg.get("ready"):   # 消息中是否有"ready"
-                    print("[IsaacROS2Bridge] ready: /tf /odom /cmd_vel",
-                          flush=True)
-                    return
-            except queue.Empty:   # 没收到消息，继续循环
-                pass
-        raise RuntimeError(
-            f"[IsaacROS2Bridge] not ready within {timeout}s")   # 超时抛出异常
+                        f"[IsaacROS2Bridge] subprocess exited early "
+                        f"(code={proc.returncode})")
+                try:   # 尝试从消息队列获取反馈
+                    msg = self._feedback_q.get(timeout=0.3)   # 从消息队列获取一条消息，最多等待 0.3 秒
+                    if msg.get("init_failed"):   # 消息中是否有"init_failed"
+                        raise RuntimeError(
+                            "[IsaacROS2Bridge] subprocess init failed; "
+                            "check rclpy/Nav2 installation.")
+                    if msg.get("ready"):   # 消息中是否有"ready"
+                        print("[IsaacROS2Bridge] ready: /tf /odom /cmd_vel",
+                              flush=True)
+                        return
+                except queue.Empty:   # 没收到消息，继续循环
+                    pass
+            raise RuntimeError(
+                f"[IsaacROS2Bridge] not ready within {timeout}s")   # 超时抛出异常
+        except BaseException:
+            # A partially started child and its stdout reader must not survive
+            # a failed start; both own native rclpy/pipe resources.
+            self.stop()
+            raise
 
     def stop(self) -> None:   # 关闭本 bridge 子进程，不关闭终端1的 Nav2 栈
-        """Ask the owned bridge subprocess to shut down gracefully."""
-        self._send({"type": "stop"})
-        if self._proc is not None:
+        """Stop the child, reap it, and join the stdout reader.
+
+        Merely terminating the child is insufficient: a daemon reader blocked
+        on its pipe can otherwise survive until CPython/native-library teardown.
+        This method is deliberately idempotent so every exception path may call
+        it unconditionally.
+        """
+        proc = self._proc
+        reader = self._reader_thread
+        if proc is None:
+            self._reader_thread = None
+            return
+
+        if proc.poll() is None:
+            self._send({"type": "stop"})
+        if proc.stdin is not None:
             try:
-                self._proc.wait(timeout=5.0)
-            except subprocess.TimeoutExpired:   # 超时强制终止并抛出异常
-                self._proc.terminate()
+                proc.stdin.close()
+            except Exception:
+                pass
+        try:
+            proc.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2.0)
+
+        if reader is not None and reader is not threading.current_thread():
+            reader.join(timeout=2.0)
+        if reader is not None and reader.is_alive() and proc.stdout is not None:
+            # Closing the read end releases a reader even if a descendant kept
+            # a duplicate write descriptor alive.
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+            if reader is not threading.current_thread():
+                reader.join(timeout=1.0)
+        elif proc.stdout is not None:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+
+        self._proc = None
+        self._reader_thread = None
+        self._vx = 0.0
+        self._omega_z = 0.0
+        self._nav_done = False
+        self._nav_failed = False
         print("[IsaacROS2Bridge] stopped.", flush=True)
 
     def update_robot_pose(
@@ -210,14 +268,20 @@ class IsaacROS2Bridge:
         except Exception:
             pass
 
-    def _stdout_reader(self) -> None:   # 后台持续读取消息的线程
+    def _stdout_reader(self, proc: subprocess.Popen) -> None:   # 后台持续读取消息的线程
         """Daemon thread: read JSON lines from subprocess stdout."""
-        for raw in self._proc.stdout:   # 持续读子进程的stdout
-            try:
-                msg = json.loads(raw.decode().strip())
-                self._feedback_q.put(msg)   # 放入队列
-            except Exception:
-                pass
+        if proc.stdout is None:
+            return
+        try:
+            for raw in proc.stdout:   # 持续读子进程的stdout
+                try:
+                    msg = json.loads(raw.decode().strip())
+                    self._feedback_q.put(msg)   # 放入队列
+                except Exception:
+                    pass
+        except (OSError, ValueError):
+            # stop() may close the read end to release a stubborn reader.
+            pass
 
     def _drain_feedback(self) -> None:   # 非阻塞地清空反馈队列，并更新缓存的状态变量
         """Non-blocking drain of feedback queue; update cached state."""

@@ -39,6 +39,8 @@ class MoveItROS2Bridge:
         self._pending: Dict[str, dict] = {}
 
     def start(self, timeout: float = 30.0) -> None:
+        if self._proc is not None:
+            raise RuntimeError("MoveIt bridge is already started")
         script = os.path.join(os.path.dirname(__file__), "moveit_bridge_process.py")
         env = os.environ.copy()
         self._proc = subprocess.Popen(
@@ -49,39 +51,83 @@ class MoveItROS2Bridge:
             env=env,
             bufsize=1,
         )
-        self._reader_thread = threading.Thread(target=self._stdout_reader, daemon=True)
+        proc = self._proc
+        self._reader_thread = threading.Thread(
+            target=self._stdout_reader,
+            args=(proc,),
+            daemon=True,
+        )
         self._reader_thread.start()
 
-        deadline = time.monotonic() + float(timeout)
-        while time.monotonic() < deadline:
-            if self._proc.poll() is not None:
-                raise RuntimeError(
-                    f"MoveIt bridge process exited early (code={self._proc.returncode})")
-            try:
-                msg = self._messages.get(timeout=0.25)
-            except queue.Empty:
-                continue
-            if msg.get("init_failed"):
-                raise RuntimeError(
-                    "MoveIt bridge init failed; inspect stderr and verify MoveIt 2 Humble is installed")
-            if msg.get("ready"):
-                print("[MoveItBridge] ready: joint_states + IK + pose/joint planning + cartesian path + attached objects", flush=True)
-                return
-            if "id" in msg:
-                self._pending[str(msg["id"])] = msg
-        raise RuntimeError(f"MoveIt bridge not ready within {timeout:.1f}s")
+        try:
+            deadline = time.monotonic() + float(timeout)
+            while time.monotonic() < deadline:
+                if proc.poll() is not None:
+                    raise RuntimeError(
+                        f"MoveIt bridge process exited early (code={proc.returncode})")
+                try:
+                    msg = self._messages.get(timeout=0.25)
+                except queue.Empty:
+                    continue
+                if msg.get("init_failed"):
+                    raise RuntimeError(
+                        "MoveIt bridge init failed; inspect stderr and verify MoveIt 2 Humble is installed")
+                if msg.get("ready"):
+                    print("[MoveItBridge] ready: joint_states + IK + pose/joint planning + cartesian path + attached objects", flush=True)
+                    return
+                if "id" in msg:
+                    self._pending[str(msg["id"])] = msg
+            raise RuntimeError(f"MoveIt bridge not ready within {timeout:.1f}s")
+        except BaseException:
+            self.stop()
+            raise
 
     def stop(self) -> None:
-        try:
-            self._send({"type": "stop"})
-        except Exception:
-            pass
-        if self._proc is not None:
+        """Stop and reap the ROS child and join its stdout reader."""
+        proc = self._proc
+        reader = self._reader_thread
+        if proc is None:
+            self._reader_thread = None
+            return
+
+        if proc.poll() is None:
             try:
-                self._proc.wait(timeout=4.0)
+                self._send({"type": "stop"})
+            except Exception:
+                pass
+        if proc.stdin is not None:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+        try:
+            proc.wait(timeout=4.0)
+        except subprocess.TimeoutExpired:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2.0)
             except subprocess.TimeoutExpired:
-                self._proc.terminate()
+                proc.kill()
+                proc.wait(timeout=2.0)
+
+        if reader is not None and reader is not threading.current_thread():
+            reader.join(timeout=2.0)
+        if reader is not None and reader.is_alive() and proc.stdout is not None:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+            if reader is not threading.current_thread():
+                reader.join(timeout=1.0)
+        elif proc.stdout is not None:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+
         self._proc = None
+        self._reader_thread = None
+        self._pending.clear()
 
     # ------------------------------------------------------------------
     # State publication
@@ -331,12 +377,16 @@ class MoveItROS2Bridge:
             self._proc.stdin.write(line.encode("utf-8"))
             self._proc.stdin.flush()
 
-    def _stdout_reader(self) -> None:
-        if self._proc is None or self._proc.stdout is None:
+    def _stdout_reader(self, proc: subprocess.Popen) -> None:
+        if proc.stdout is None:
             return
-        for raw in self._proc.stdout:
-            try:
-                msg = json.loads(raw.decode("utf-8").strip())
-                self._messages.put(msg)
-            except Exception:
-                continue
+        try:
+            for raw in proc.stdout:
+                try:
+                    msg = json.loads(raw.decode("utf-8").strip())
+                    self._messages.put(msg)
+                except Exception:
+                    continue
+        except (OSError, ValueError):
+            # stop() may close the read end to release a stubborn reader.
+            pass
