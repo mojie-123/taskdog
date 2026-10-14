@@ -11,11 +11,11 @@ Python 3.11 (MuJoCo/IsaacLab)              Python 3.10 (ROS 2 client)
        │                                              │
        ├─── stdin (JSON) ────────────────────────────>│  发送位姿、目标点
        │                                              │
-       │<─── stdout (JSON) ───────────────────────────┤  接收 cmd_vel、导航状态
+       │<─── stdout (JSON) ───────────────────────────┤  接收 cmd_vel、导航状态、全局路径
        │                                              │
 
-主进程发送 MuJoCo 真值位姿和 Nav2 goal；子进程返回平滑后的 ``vx/wz`` 与导航
-状态。终端 1 的 Nav2 server 不属于这个子进程，``stop()`` 只关闭 bridge 客户端，
+主进程发送 MuJoCo 真值位姿和 Nav2 goal；子进程返回平滑后的 ``vx/wz``、导航
+状态及最新 ``/plan``。终端 1 的 Nav2 server 不属于这个子进程，``stop()`` 只关闭 bridge 客户端，
 不会关闭或 finalized 终端 1 的 Nav2 lifecycle 节点。
 
 Public API:
@@ -25,6 +25,7 @@ Public API:
     bridge.update_robot_pose(pos_w, quat_w, lin_vel, ang_vel)
     vx, omega_z = bridge.get_cmd_vel()
     done, failed = bridge.get_nav_status()
+    path_xy = bridge.get_global_path()
     # once before the NAV loop:
     bridge.send_goal(x, y)
     bridge.cancel_goal()
@@ -74,6 +75,8 @@ class IsaacROS2Bridge:
         self._omega_z:    float = 0.0
         self._nav_done:   bool  = False
         self._nav_failed: bool  = False
+        self._global_path: list[list[float]] = []
+        self._path_revision: int = 0
         self._last_feedback_time: float = 0.0
 
     # ------------------------------------------------------------------
@@ -197,6 +200,8 @@ class IsaacROS2Bridge:
         self._omega_z = 0.0
         self._nav_done = False
         self._nav_failed = False
+        self._global_path = []
+        self._path_revision = 0
         print("[IsaacROS2Bridge] stopped.", flush=True)
 
     def update_robot_pose(
@@ -223,6 +228,7 @@ class IsaacROS2Bridge:
         self._drain_feedback()   # 先清掉队列里上一个任务遗留的 nav_done 消息（否则本任务会读数秒完成）
         self._nav_done   = False
         self._nav_failed = False
+        self._global_path = []
         self._send({"type": "goal", "x": float(x), "y": float(y)})
 
     def cancel_goal(self) -> None:
@@ -251,6 +257,11 @@ class IsaacROS2Bridge:
         """Return (nav_done, nav_failed)."""
         self._drain_feedback()
         return self._nav_done, self._nav_failed
+
+    def get_global_path(self) -> list[list[float]]:
+        """Return the newest Nav2 ``/plan`` path as world-frame XY points."""
+        self._drain_feedback()
+        return [point.copy() for point in self._global_path]
 
     # ------------------------------------------------------------------
     # Internal
@@ -297,6 +308,16 @@ class IsaacROS2Bridge:
             if "nav_done" in msg:
                 self._nav_done   = bool(msg["nav_done"])
                 self._nav_failed = bool(msg["nav_failed"])
+            if "global_path" in msg:
+                path = msg.get("global_path") or []
+                self._global_path = [
+                    [float(point[0]), float(point[1])]
+                    for point in path
+                    if isinstance(point, (list, tuple)) and len(point) >= 2
+                ]
+                self._path_revision = int(
+                    msg.get("path_revision", self._path_revision + 1)
+                )
 
 # MuJoCo/IsaacLab -> ROS bridge -> Nav2
 # 类型	                        JSON 格式	                                                                            作用

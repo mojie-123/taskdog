@@ -8,7 +8,10 @@ The logical target comes from a replaceable TargetProvider.  For this first
 MuJoCo-only version it is the named body's simulator pose.  N2M runs once;
 the grasp recovery policy tries three fresh AnyGrasp plans at each of three
 collision-free M poses before declaring failure.  A successful LIFT continues
-through the original backoff, Nav2 destination, arm rotation and release flow.
+to the Nav2 destination, arm rotation and release flow.  By default Nav2 is
+used only to plan global paths: the MuJoCo base is reset along each path and
+directly to the selected M.  ``--physical-navigation`` restores the former
+locomotion-policy and P-to-M controllers.
 """
 
 from __future__ import annotations
@@ -55,6 +58,7 @@ from custom_envs.scripts.N2M.mujoco_state import (
     BaseWeld,
     robot_environment_contacts,
     robot_table_contacts,
+    set_freejoint_pose,
 )
 from custom_envs.scripts.N2M.target_provider import (
     MuJoCoTruthTargetProvider,
@@ -147,6 +151,49 @@ ALIGN_YAW_SETTLE_STEPS = 6
 NAV_OBSERVATION_YAW_ENTER_RAD = math.radians(3.0)
 NAV_OBSERVATION_YAW_RESUME_RAD = math.radians(6.0)
 
+# Nav2 follows a grid path with an ideal mobile-base controller, while the
+# MuJoCo base is driven by a learned wheeled-quadruped policy.  Passing every
+# small left/right correction straight through makes the policy continually
+# redistribute leg and wheel effort even on an apparently straight segment.
+# Keep the safety stop instantaneous, but condition non-zero Nav2 commands at
+# the policy rate before they reach the locomotion network.
+NAV_CMD_YAW_FILTER_TAU_S = 0.07
+NAV_CMD_LINEAR_ACCEL_LIMIT_MPS2 = 1.0
+NAV_CMD_YAW_ACCEL_LIMIT_RADPS2 = 1.5
+NAV_CMD_TURN_SLOWDOWN_START_RADPS = 0.10
+NAV_CMD_TURN_SLOWDOWN_FULL_RADPS = 0.60
+NAV_CMD_TURN_MIN_SPEED_SCALE = 0.50
+NAV_CMD_ZERO_EPS = 1e-4
+
+# First narrow-passage pilot: the horizontal kitchen/living-room doorway in
+# scene_house_N2M.xml.  Nav2 is only asked to reach the staging pose.  The
+# actual doorway is crossed by a deterministic, forward-only controller so a
+# FollowPath failure cannot trigger a reverse recovery while the base is in
+# the opening.  Other doors deliberately remain on the original Nav2 path for
+# this first experiment.
+KITCHEN_LIVING_DOOR_CENTER = np.array([4.0, 6.0], dtype=np.float64)
+KITCHEN_LIVING_DOOR_HALF_WIDTH_M = 0.60
+KITCHEN_LIVING_DOOR_STAGING_OFFSET_M = 0.85
+KITCHEN_LIVING_DOOR_SIDE_MARGIN_M = 0.20
+KITCHEN_LIVING_DOOR_NAV_TOLERANCE_M = 0.45
+KITCHEN_LIVING_DOOR_CENTER_TOLERANCE_M = 0.10
+KITCHEN_LIVING_DOOR_CROSS_EXIT_TOLERANCE_M = 0.08
+KITCHEN_LIVING_DOOR_MAX_LATERAL_M = 0.22
+KITCHEN_LIVING_DOOR_CENTER_FORWARD_SPEED_MPS = 0.45
+KITCHEN_LIVING_DOOR_CROSS_FORWARD_SPEED_MPS = 0.25
+KITCHEN_LIVING_DOOR_MAX_YAW_ERROR_RAD = math.radians(6.0)
+KITCHEN_LIVING_DOOR_MAX_HEADING_OFFSET_RAD = math.radians(5.0)
+KITCHEN_LIVING_DOOR_CENTER_MAX_STEPS = 1000
+KITCHEN_LIVING_DOOR_ALIGN_MAX_STEPS = 800
+KITCHEN_LIVING_DOOR_CROSS_MAX_STEPS = 1400
+KITCHEN_LIVING_DOOR_POINT_RESUME_M = 0.12
+KITCHEN_LIVING_DOOR_POINT_TURN_ONLY_RAD = math.radians(10.0)
+
+DEFAULT_NAV_SNAPSHOT_MAP = (
+    _ROOT / "custom_envs" / "maps" / "map_house_mujoco_nav2.yaml"
+)
+DEFAULT_NAV_SNAPSHOT_DIR = _ROOT / "custom_envs" / "maps" / "nav_process"
+
 
 def load_nav2_runtime_settings(path: Path) -> dict:
     """Read the values that affect the MuJoCo/Nav2 bridge from Nav2 YAML."""
@@ -190,6 +237,297 @@ def _clip_nav_command(vx: float, wz: float, settings: dict) -> tuple[float, floa
     return (
         float(np.clip(vx, -settings["max_linear_velocity"], settings["max_linear_velocity"])),
         float(np.clip(wz, -settings["max_angular_velocity"], settings["max_angular_velocity"])),
+    )
+
+
+class NavCommandConditioner:
+    """Adapt Nav2 velocity commands to the learned locomotion policy.
+
+    Nav2's velocity smoother operates at 20 Hz and is intentionally generic.
+    The policy runs at 50 Hz and reacts visibly to small alternating yaw
+    commands.  This adapter low-pass filters yaw, removes zero-mean steering
+    chatter, and applies tighter policy-rate slew limits.  A genuine all-zero
+    Nav2 command bypasses the filters so collision/timeout stops remain
+    immediate.
+    """
+
+    def __init__(
+        self,
+        period_s: float,
+        *,
+        yaw_filter_tau_s: float = NAV_CMD_YAW_FILTER_TAU_S,
+        linear_accel_limit_mps2: float = NAV_CMD_LINEAR_ACCEL_LIMIT_MPS2,
+        yaw_accel_limit_radps2: float = NAV_CMD_YAW_ACCEL_LIMIT_RADPS2,
+        turn_slowdown_start_radps: float = NAV_CMD_TURN_SLOWDOWN_START_RADPS,
+        turn_slowdown_full_radps: float = NAV_CMD_TURN_SLOWDOWN_FULL_RADPS,
+        turn_min_speed_scale: float = NAV_CMD_TURN_MIN_SPEED_SCALE,
+    ) -> None:
+        if period_s <= 0.0:
+            raise ValueError("period_s must be positive")
+        if yaw_filter_tau_s <= 0.0:
+            raise ValueError("yaw_filter_tau_s must be positive")
+        if linear_accel_limit_mps2 <= 0.0 or yaw_accel_limit_radps2 <= 0.0:
+            raise ValueError("command acceleration limits must be positive")
+        if not 0.0 <= turn_slowdown_start_radps < turn_slowdown_full_radps:
+            raise ValueError(
+                "require 0 <= turn slowdown start < full threshold"
+            )
+        if not 0.0 < turn_min_speed_scale <= 1.0:
+            raise ValueError("turn_min_speed_scale must be in (0, 1]")
+        self.period_s = float(period_s)
+        self.yaw_filter_tau_s = float(yaw_filter_tau_s)
+        self.linear_accel_limit_mps2 = float(linear_accel_limit_mps2)
+        self.yaw_accel_limit_radps2 = float(yaw_accel_limit_radps2)
+        self.turn_slowdown_start_radps = float(turn_slowdown_start_radps)
+        self.turn_slowdown_full_radps = float(turn_slowdown_full_radps)
+        self.turn_min_speed_scale = float(turn_min_speed_scale)
+        self.reset()
+
+    def reset(self) -> None:
+        self.filtered_yaw_target = 0.0
+        self.command_vx = 0.0
+        self.command_wz = 0.0
+
+    @staticmethod
+    def _slew(current: float, target: float, maximum_delta: float) -> float:
+        return float(
+            current + np.clip(target - current, -maximum_delta, maximum_delta)
+        )
+
+    def step(self, raw_vx: float, raw_wz: float) -> tuple[float, float, dict]:
+        raw_vx = float(raw_vx)
+        raw_wz = float(raw_wz)
+
+        # Do not let filtering extend motion after Nav2 has deliberately
+        # stopped publishing a command near an obstacle or after cancellation.
+        hard_stop = (
+            abs(raw_vx) <= NAV_CMD_ZERO_EPS
+            and abs(raw_wz) <= NAV_CMD_ZERO_EPS
+        )
+        if hard_stop:
+            self.reset()
+            return 0.0, 0.0, {
+                "raw_vx": raw_vx,
+                "raw_wz": raw_wz,
+                "filtered_yaw_target": 0.0,
+                "turn_speed_scale": 1.0,
+                "hard_stop": True,
+            }
+
+        alpha = 1.0 - math.exp(-self.period_s / self.yaw_filter_tau_s)
+        self.filtered_yaw_target += alpha * (
+            raw_wz - self.filtered_yaw_target
+        )
+        yaw_target = self.filtered_yaw_target
+
+        # Keep every persistent small steering correction.  Only the forward
+        # speed is reduced continuously as curvature increases, so heading
+        # error cannot accumulate and then be released as a bang-bang turn.
+        turn_fraction = np.clip(
+            (
+                abs(yaw_target) - self.turn_slowdown_start_radps
+            )
+            / (
+                self.turn_slowdown_full_radps
+                - self.turn_slowdown_start_radps
+            ),
+            0.0,
+            1.0,
+        )
+        turn_speed_scale = float(
+            1.0
+            - turn_fraction * (1.0 - self.turn_min_speed_scale)
+        )
+        linear_target = raw_vx * turn_speed_scale
+
+        # Pure rotations must not inherit residual forward speed.  Other
+        # non-zero commands ramp at policy rate instead of jumping whenever
+        # Nav2 replans or changes curvature.
+        if abs(raw_vx) <= NAV_CMD_ZERO_EPS:
+            self.command_vx = 0.0
+        else:
+            self.command_vx = self._slew(
+                self.command_vx,
+                linear_target,
+                self.linear_accel_limit_mps2 * self.period_s,
+            )
+        self.command_wz = self._slew(
+            self.command_wz,
+            yaw_target,
+            self.yaw_accel_limit_radps2 * self.period_s,
+        )
+        return self.command_vx, self.command_wz, {
+            "raw_vx": raw_vx,
+            "raw_wz": raw_wz,
+            "filtered_yaw_target": float(self.filtered_yaw_target),
+            "turn_speed_scale": turn_speed_scale,
+            "hard_stop": False,
+        }
+
+
+class NavigationSnapshotWriter:
+    """Periodically render the actual Nav2 global plan on the static map."""
+
+    def __init__(self, map_yaml: Path, output_dir: Path, every_steps: int):
+        self.map_yaml = Path(map_yaml).expanduser().resolve()
+        self.output_dir = Path(output_dir).expanduser().resolve()
+        self.every_steps = int(every_steps)
+        self.image_index = 0
+        self._disabled = self.every_steps <= 0
+        self._reported_error = False
+        if self._disabled:
+            return
+        document = yaml.safe_load(
+            self.map_yaml.read_text(encoding="utf-8")
+        ) or {}
+        self.resolution = float(document["resolution"])
+        origin = document["origin"]
+        self.origin = np.array([float(origin[0]), float(origin[1])])
+        image_path = Path(document["image"])
+        if not image_path.is_absolute():
+            image_path = self.map_yaml.parent / image_path
+        self.image_path = image_path.resolve()
+        if not self.image_path.is_file():
+            raise FileNotFoundError(
+                f"navigation map image does not exist: {self.image_path}"
+            )
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+    def is_due(self, step: int) -> bool:
+        step = int(step)
+        return not self._disabled and (
+            step == 1 or step % self.every_steps == 0
+        )
+
+    def maybe_save(
+        self,
+        *,
+        phase: str,
+        step: int,
+        robot_pose,
+        goal_xy,
+        global_path,
+        travelled_path,
+    ) -> Path | None:
+        step = int(step)
+        if not self.is_due(step):
+            return None
+        try:
+            import matplotlib
+
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            from PIL import Image
+
+            image = np.asarray(Image.open(self.image_path))
+            height, width = image.shape[:2]
+            extent = [
+                float(self.origin[0]),
+                float(self.origin[0] + width * self.resolution),
+                float(self.origin[1]),
+                float(self.origin[1] + height * self.resolution),
+            ]
+            pose = np.asarray(robot_pose, dtype=np.float64)
+            goal = np.asarray(goal_xy, dtype=np.float64)
+            plan = np.asarray(global_path, dtype=np.float64)
+            trail = np.asarray(travelled_path, dtype=np.float64)
+
+            fig, ax = plt.subplots(figsize=(8, 8), dpi=120)
+            ax.imshow(image, cmap="gray", origin="upper", extent=extent)
+            if plan.ndim == 2 and plan.shape[0] > 0:
+                ax.plot(
+                    plan[:, 0],
+                    plan[:, 1],
+                    color="#ff8c00",
+                    linewidth=2.0,
+                    label=f"Nav2 global plan ({len(plan)} poses)",
+                )
+            if trail.ndim == 2 and trail.shape[0] > 1:
+                ax.plot(
+                    trail[:, 0],
+                    trail[:, 1],
+                    color="#1976d2",
+                    linewidth=1.4,
+                    alpha=0.8,
+                    label="executed trajectory",
+                )
+            ax.scatter(
+                [pose[0]], [pose[1]], s=55, color="blue", label="robot", zorder=5
+            )
+            ax.arrow(
+                pose[0],
+                pose[1],
+                0.45 * math.cos(float(pose[2])),
+                0.45 * math.sin(float(pose[2])),
+                width=0.035,
+                head_width=0.16,
+                color="blue",
+                length_includes_head=True,
+                zorder=5,
+            )
+            ax.scatter(
+                [goal[0]],
+                [goal[1]],
+                marker="*",
+                s=150,
+                color="red",
+                label="active goal",
+                zorder=5,
+            )
+            ax.set_xlim(extent[0], extent[1])
+            ax.set_ylim(extent[2], extent[3])
+            ax.set_aspect("equal", adjustable="box")
+            ax.set_xlabel("world x [m]")
+            ax.set_ylabel("world y [m]")
+            ax.grid(alpha=0.2)
+            ax.legend(loc="upper right")
+            ax.set_title(
+                f"Nav2 plan — {phase} — step {step}"
+            )
+            safe_phase = "".join(
+                char if char.isalnum() or char in "-_" else "_"
+                for char in str(phase).lower()
+            )
+            output = self.output_dir / (
+                f"nav_step_{self.image_index:04d}_{safe_phase}_{step:05d}.png"
+            )
+            fig.tight_layout()
+            fig.savefig(output)
+            plt.close(fig)
+            self.image_index += 1
+            print(
+                f"[N2M][NAV_SNAPSHOT] phase={phase} step={step} "
+                f"path_points={len(plan) if plan.ndim == 2 else 0} "
+                f"output={output}",
+                flush=True,
+            )
+            return output
+        except Exception as exc:
+            if not self._reported_error:
+                print(f"[N2M][NAV_SNAPSHOT_ERROR] {exc}", flush=True)
+                self._reported_error = True
+            return None
+
+
+def _save_nav_snapshot_if_due(
+    writer,
+    bridge,
+    *,
+    phase: str,
+    step: int,
+    robot_state: dict,
+    goal_xy,
+    travelled_path,
+) -> None:
+    if writer is None or not writer.is_due(step):
+        return
+    writer.maybe_save(
+        phase=phase,
+        step=step,
+        robot_pose=_base_pose_from_state(robot_state),
+        goal_xy=goal_xy,
+        global_path=bridge.get_global_path(),
+        travelled_path=travelled_path,
     )
 
 
@@ -461,6 +799,362 @@ def _base_pose_from_state(state: dict) -> np.ndarray:
         [state["pos"][0], state["pos"][1], state["yaw"]],
         dtype=np.float64,
     )
+
+
+def _wxyz_multiply(first, second) -> np.ndarray:
+    """Hamilton product for MuJoCo's wxyz quaternion convention."""
+    w1, x1, y1, z1 = np.asarray(first, dtype=np.float64)
+    w2, x2, y2, z2 = np.asarray(second, dtype=np.float64)
+    product = np.array(
+        [
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        ],
+        dtype=np.float64,
+    )
+    return product / max(float(np.linalg.norm(product)), 1e-12)
+
+
+def _freejoint_name_for_body(env, body_name: str) -> str:
+    """Resolve the freejoint that owns a named movable body."""
+    import mujoco
+
+    body_id = mujoco.mj_name2id(
+        env.model, mujoco.mjtObj.mjOBJ_BODY, str(body_name)
+    )
+    if body_id < 0:
+        raise ValueError(f"body not found: {body_name}")
+    first_joint = int(env.model.body_jntadr[body_id])
+    joint_count = int(env.model.body_jntnum[body_id])
+    for joint_id in range(first_joint, first_joint + joint_count):
+        if int(env.model.jnt_type[joint_id]) == int(
+            mujoco.mjtJoint.mjJNT_FREE
+        ):
+            name = mujoco.mj_id2name(
+                env.model, mujoco.mjtObj.mjOBJ_JOINT, joint_id
+            )
+            if name:
+                return str(name)
+    raise ValueError(f"body {body_name!r} has no freejoint")
+
+
+def _teleport_base_pose(
+    env,
+    pose,
+    *,
+    root_z: float | None = None,
+    root_roll: float = 0.0,
+    root_pitch: float = 0.0,
+    weld: BaseWeld | None = None,
+    carried_object_name: str | None = None,
+) -> dict:
+    """Reset the base pose, optionally moving a grasped free body with it.
+
+    When an object is carried, its full SE(2) transform relative to the old
+    base is preserved.  This is essential during delivery: resetting only the
+    robot root would otherwise leave the cube behind and tear it out of the
+    gripper.
+    """
+    target = np.asarray(pose, dtype=np.float64).reshape(3)
+    before = env.get_robot_state()
+    before_pose = _base_pose_from_state(before)
+    z = float(before["pos"][2] if root_z is None else root_z)
+
+    object_pose = None
+    object_joint = None
+    if carried_object_name is not None:
+        import mujoco
+
+        body_id = mujoco.mj_name2id(
+            env.model,
+            mujoco.mjtObj.mjOBJ_BODY,
+            str(carried_object_name),
+        )
+        if body_id < 0:
+            raise ValueError(f"body not found: {carried_object_name}")
+        object_pose = np.concatenate(
+            [
+                env.data.xpos[body_id].astype(np.float64).copy(),
+                env.data.xquat[body_id].astype(np.float64).copy(),
+            ]
+        )
+        object_joint = _freejoint_name_for_body(env, carried_object_name)
+
+    if weld is not None and weld.active:
+        weld.disable()
+    env.set_root_pose(
+        np.array([target[0], target[1], z], dtype=np.float64),
+        rpy_to_quat_wxyz(root_roll, root_pitch, target[2]),
+    )
+
+    if object_pose is not None:
+        delta_yaw = _wrap_angle(float(target[2] - before_pose[2]))
+        old_relative = object_pose[:2] - before_pose[:2]
+        cosine = math.cos(delta_yaw)
+        sine = math.sin(delta_yaw)
+        rotated_relative = np.array(
+            [
+                cosine * old_relative[0] - sine * old_relative[1],
+                sine * old_relative[0] + cosine * old_relative[1],
+            ],
+            dtype=np.float64,
+        )
+        new_position = object_pose[:3].copy()
+        new_position[:2] = target[:2] + rotated_relative
+        delta_quaternion = np.array(
+            [math.cos(delta_yaw / 2.0), 0.0, 0.0, math.sin(delta_yaw / 2.0)],
+            dtype=np.float64,
+        )
+        set_freejoint_pose(
+            env,
+            object_joint,
+            new_position,
+            _wxyz_multiply(delta_quaternion, object_pose[3:7]),
+        )
+
+    if weld is not None:
+        weld.enable()
+    # set_root_pose()/set_freejoint_pose() call mj_forward(), which updates
+    # MuJoCo kinematics and offscreen cameras but does not refresh the passive
+    # interactive viewer.  Some callers (notably the final Nav2 waypoint and
+    # direct N2M M placement) return before the next env.step(), so sync here
+    # to guarantee that every teleported landing pose is actually displayed.
+    viewer = getattr(env, "viewer", None)
+    if viewer is not None and env.viewer_is_running():
+        viewer.sync()
+    after = env.get_robot_state()
+    return {
+        "from_pose": before_pose.tolist(),
+        "to_pose": _base_pose_from_state(after).tolist(),
+        "carried_object": carried_object_name,
+    }
+
+
+def _resample_navigation_path(
+    path_xy,
+    start_xy,
+    goal_xy,
+    spacing_m: float,
+) -> np.ndarray:
+    """Convert a Nav2 polyline into fixed-distance teleport waypoints."""
+    if float(spacing_m) <= 0.0:
+        raise ValueError("spacing_m must be positive")
+    start = np.asarray(start_xy, dtype=np.float64).reshape(2)
+    goal = np.asarray(goal_xy, dtype=np.float64).reshape(2)
+    raw = np.asarray(path_xy, dtype=np.float64)
+    if raw.ndim != 2 or raw.shape[1] < 2 or len(raw) == 0:
+        raise ValueError("Nav2 path must contain XY points")
+    points = [start]
+    for point in raw[:, :2]:
+        if float(np.linalg.norm(point - points[-1])) > 1e-6:
+            points.append(point.copy())
+    if float(np.linalg.norm(goal - points[-1])) > 1e-6:
+        points.append(goal)
+    polyline = np.asarray(points, dtype=np.float64)
+    lengths = np.linalg.norm(np.diff(polyline, axis=0), axis=1)
+    cumulative = np.concatenate(([0.0], np.cumsum(lengths)))
+    total = float(cumulative[-1])
+    if total <= 1e-9:
+        return goal.reshape(1, 2)
+    distances = np.arange(float(spacing_m), total, float(spacing_m))
+    distances = np.concatenate((distances, [total]))
+    samples = []
+    segment = 0
+    for distance in distances:
+        while (
+            segment + 1 < len(lengths)
+            and cumulative[segment + 1] < distance
+        ):
+            segment += 1
+        segment_length = max(float(lengths[segment]), 1e-12)
+        alpha = (float(distance) - cumulative[segment]) / segment_length
+        samples.append(
+            (1.0 - alpha) * polyline[segment]
+            + alpha * polyline[segment + 1]
+        )
+    samples[-1] = goal.copy()
+    return np.asarray(samples, dtype=np.float64)
+
+
+def _follow_nav2_path_by_teleport(
+    *,
+    name: str,
+    env,
+    bridge,
+    interactive,
+    goal_xy,
+    final_yaw: float,
+    max_steps: int,
+    teleport_every_steps: int,
+    teleport_spacing_m: float,
+    plan_timeout_s: float,
+    snapshot_writer=None,
+    weld: BaseWeld | None = None,
+    root_z: float | None = None,
+    root_roll: float = 0.0,
+    root_pitch: float = 0.0,
+    carried_object_name: str | None = None,
+    arm_target=None,
+    gripper_target=None,
+) -> dict:
+    """Follow the first Nav2 global plan using discrete MuJoCo pose resets."""
+    goal = np.asarray(goal_xy, dtype=np.float64).reshape(2)
+    state = env.get_robot_state()
+    owned_weld = weld is None
+    lock = BaseWeld(env) if owned_weld else weld
+    if not lock.active:
+        lock.enable()
+    bridge.update_robot_pose(
+        state["pos"], state["quat"], state["lin_vel"], state["ang_vel"]
+    )
+    bridge.send_goal(float(goal[0]), float(goal[1]))
+    started = time.monotonic()
+    pacer = RealtimePacer(env.dt)
+    travelled = [np.asarray(state["pos"][:2], dtype=np.float64).copy()]
+    route = None
+    route_index = 0
+    teleport_count = 0
+    print(
+        f"[N2M][{name}_TELEPORT_START] current="
+        f"{np.round(_base_pose_from_state(state), 3)} goal="
+        f"{np.round(goal, 3)} every={teleport_every_steps}steps "
+        f"spacing={teleport_spacing_m:.3f}m",
+        flush=True,
+    )
+    try:
+        for step in range(int(max_steps)):
+            if interactive.quit:
+                raise KeyboardInterrupt
+            state = env.get_robot_state()
+            bridge.update_robot_pose(
+                state["pos"],
+                state["quat"],
+                state["lin_vel"],
+                state["ang_vel"],
+            )
+            _save_nav_snapshot_if_due(
+                snapshot_writer,
+                bridge,
+                phase=f"{name.lower()}_teleport",
+                step=step + 1,
+                robot_state=state,
+                goal_xy=goal,
+                travelled_path=travelled,
+            )
+            _, nav_failed = bridge.get_nav_status()
+            if nav_failed and route is None:
+                raise RuntimeError(f"{name}: Nav2 failed before publishing a path")
+
+            if route is None:
+                distance = float(np.linalg.norm(state["pos"][:2] - goal))
+                if distance <= 1e-6:
+                    route = goal.reshape(1, 2)
+                else:
+                    path = bridge.get_global_path()
+                    if path:
+                        route = _resample_navigation_path(
+                            path,
+                            state["pos"][:2],
+                            goal,
+                            teleport_spacing_m,
+                        )
+                        print(
+                            f"[N2M][{name}_TELEPORT_PLAN] "
+                            f"raw_points={len(path)} waypoints={len(route)}",
+                            flush=True,
+                        )
+                    elif time.monotonic() - started > float(plan_timeout_s):
+                        raise RuntimeError(
+                            f"{name}: no Nav2 global path after "
+                            f"{plan_timeout_s:.1f}s"
+                        )
+
+            if (
+                route is not None
+                and route_index < len(route)
+                and step % int(teleport_every_steps) == 0
+            ):
+                xy = route[route_index]
+                if route_index + 1 < len(route):
+                    direction = route[route_index + 1] - xy
+                    yaw = math.atan2(float(direction[1]), float(direction[0]))
+                elif route_index > 0:
+                    direction = xy - route[route_index - 1]
+                    yaw = math.atan2(float(direction[1]), float(direction[0]))
+                else:
+                    yaw = float(final_yaw)
+                if route_index == len(route) - 1:
+                    yaw = float(final_yaw)
+                _teleport_base_pose(
+                    env,
+                    [xy[0], xy[1], yaw],
+                    root_z=root_z,
+                    root_roll=root_roll,
+                    root_pitch=root_pitch,
+                    weld=lock,
+                    carried_object_name=carried_object_name,
+                )
+                state = env.get_robot_state()
+                travelled.append(
+                    np.asarray(state["pos"][:2], dtype=np.float64).copy()
+                )
+                teleport_count += 1
+                route_index += 1
+                ignored_geometries = ["floor"]
+                if carried_object_name is not None:
+                    ignored_geometries.append(f"{carried_object_name}_geom")
+                contacts = robot_environment_contacts(
+                    env,
+                    ignored_environment_geoms=tuple(ignored_geometries),
+                )
+                if contacts:
+                    raise RuntimeError(
+                        f"{name}: teleported path pose collides: {contacts}"
+                    )
+                if teleport_count == 1 or teleport_count % 10 == 0:
+                    print(
+                        f"[N2M][{name}_TELEPORT] jump={teleport_count}/"
+                        f"{len(route)} step={step} pose="
+                        f"{np.round(_base_pose_from_state(state), 3)}",
+                        flush=True,
+                    )
+                if route_index >= len(route):
+                    bridge.cancel_goal()
+                    final_state = env.get_robot_state()
+                    print(
+                        f"[N2M][{name}_TELEPORT_DONE] steps={step + 1} "
+                        f"jumps={teleport_count} final="
+                        f"{np.round(_base_pose_from_state(final_state), 4)}",
+                        flush=True,
+                    )
+                    return {
+                        "mode": "nav2_path_teleport",
+                        "steps": step + 1,
+                        "teleport_count": teleport_count,
+                        "path_waypoints": len(route),
+                        "spacing_m": float(teleport_spacing_m),
+                        "every_steps": int(teleport_every_steps),
+                        "elapsed_s": time.monotonic() - started,
+                        "final_base_pose": _base_pose_from_state(
+                            final_state
+                        ).tolist(),
+                    }
+
+            if arm_target is not None:
+                env.set_arm_target(np.asarray(arm_target, dtype=np.float64))
+            if gripper_target is not None:
+                env.set_gripper_target(
+                    np.asarray(gripper_target, dtype=np.float64)
+                )
+            env.step(np.zeros(16, dtype=np.float32))
+            pacer.wait()
+    finally:
+        if owned_weld and lock.active:
+            lock.disable()
+    bridge.cancel_goal()
+    raise RuntimeError(f"{name}: teleport path timed out after {max_steps} steps")
 
 
 def _body_frame_xy_error(current_pose, target_xy) -> np.ndarray:
@@ -1194,6 +1888,38 @@ def _sample_pose_contacts(env, pose, runner) -> tuple[list[str], list[str]]:
     return robot_environment_contacts(env), robot_table_contacts(env)
 
 
+def preflight_teleport_pose(env, runner, manipulation_pose) -> dict:
+    """Collision-check only the final M used by direct teleport mode."""
+    import mujoco
+
+    pose = np.asarray(manipulation_pose, dtype=np.float64).reshape(3)
+    data = env.data
+    qpos = data.qpos.copy()
+    qvel = data.qvel.copy()
+    time_value = float(data.time)
+    eq_active = data.eq_active.copy()
+    mocap_pos = data.mocap_pos.copy()
+    mocap_quat = data.mocap_quat.copy()
+    try:
+        environment, table = _sample_pose_contacts(env, pose, runner)
+    finally:
+        data.qpos[:] = qpos
+        data.qvel[:] = qvel
+        data.time = time_value
+        data.eq_active[:] = eq_active
+        data.mocap_pos[:] = mocap_pos
+        data.mocap_quat[:] = mocap_quat
+        mujoco.mj_forward(env.model, data)
+    return {
+        "passed": not environment and not table,
+        "mode": "final_m_teleport_only",
+        "checked_pose": pose.tolist(),
+        "checked_samples": 1,
+        "environment_contacts": environment,
+        "table_contacts": table,
+    }
+
+
 def preflight_predock_motion(
     env,
     runner,
@@ -1424,6 +2150,7 @@ def navigate_to_predock(
     nav2_settings,
     max_steps: int,
     position_tolerance_m: float,
+    snapshot_writer=None,
 ) -> tuple[np.ndarray, dict]:
     """Use Nav2 for the coarse part of O/current-M to P motion."""
     target = np.asarray(predock_pose, dtype=np.float64)
@@ -1431,7 +2158,9 @@ def navigate_to_predock(
     arm_target = runner._arm_q().copy()
     gripper_target = GRIPPER_OPEN.copy()
     last_action = np.zeros(16, dtype=np.float32)
+    travelled = [np.asarray(initial["pos"][:2], dtype=np.float64).copy()]
     pacer = RealtimePacer(env.dt)
+    nav_commands = NavCommandConditioner(env.dt)
     bridge.update_robot_pose(
         initial["pos"], initial["quat"], initial["lin_vel"], initial["ang_vel"]
     )
@@ -1453,6 +2182,16 @@ def navigate_to_predock(
         state = env.get_robot_state()
         bridge.update_robot_pose(
             state["pos"], state["quat"], state["lin_vel"], state["ang_vel"]
+        )
+        travelled.append(np.asarray(state["pos"][:2], dtype=np.float64).copy())
+        _save_nav_snapshot_if_due(
+            snapshot_writer,
+            bridge,
+            phase="predock_nav",
+            step=step + 1,
+            robot_state=state,
+            goal_xy=target[:2],
+            travelled_path=travelled,
         )
         distance = float(np.linalg.norm(state["pos"][:2] - target[:2]))
         nav_done, nav_failed = bridge.get_nav_status()
@@ -1478,9 +2217,10 @@ def navigate_to_predock(
                 "nav2_failed",
                 distance_m=distance,
             )
-        cmd_vx, cmd_wz = _clip_nav_command(
+        raw_vx, raw_wz = _clip_nav_command(
             *bridge.get_cmd_vel(), nav2_settings
         )
+        cmd_vx, cmd_wz, command_diag = nav_commands.step(raw_vx, raw_wz)
         _update_progress_watchdog(progress, state["pos"][:2], nav2_settings)
         last_action = _checked_base_motion_step(
             stage="PREDOCK_NAV",
@@ -1496,7 +2236,10 @@ def navigate_to_predock(
         if step % 100 == 0:
             print(
                 f"[N2M][PREDOCK_NAV] step={step} distance={distance:.3f}m "
-                f"cmd=({cmd_vx:+.3f},{cmd_wz:+.3f})",
+                f"raw=({raw_vx:+.3f},{raw_wz:+.3f}) "
+                f"cmd=({cmd_vx:+.3f},{cmd_wz:+.3f}) "
+                f"yaw_lp={command_diag['filtered_yaw_target']:+.3f} "
+                f"turn_scale={command_diag['turn_speed_scale']:.2f}",
                 flush=True,
             )
     bridge.cancel_goal()
@@ -2642,6 +3385,11 @@ def deliver_lifted_object(
     destination_max_steps: int,
     render: bool,
     nav2_settings: dict,
+    snapshot_writer=None,
+    teleport_navigation: bool = False,
+    teleport_every_steps: int = 5,
+    teleport_step_distance: float = 0.08,
+    teleport_plan_timeout: float = 15.0,
 ) -> dict:
     """Continue the validated state machine from successful LIFT through release."""
     metrics: dict = {
@@ -2657,6 +3405,194 @@ def deliver_lifted_object(
     last_action = np.zeros(16, dtype=np.float32)
     pacer = RealtimePacer(env.dt)
     runner.weld.disable()
+
+    if teleport_navigation:
+        start = env.get_robot_state()
+        carried_pose = np.asarray(runner.current_object_pose(), dtype=np.float64)
+        candidate_pose = None
+        if isinstance(getattr(runner, "current_candidate", None), dict):
+            candidate_pose = runner.current_candidate.get("cube_pose")
+        reference_object_pose = np.asarray(
+            carried_pose if candidate_pose is None else candidate_pose,
+            dtype=np.float64,
+        )
+        away = (
+            np.asarray(start["pos"][:2], dtype=np.float64)
+            - reference_object_pose[:2]
+        )
+        away_norm = float(np.linalg.norm(away))
+        if away_norm < 1e-6:
+            away = np.array(
+                [math.cos(float(start["yaw"])), math.sin(float(start["yaw"]))],
+                dtype=np.float64,
+            )
+        else:
+            away /= away_norm
+
+        backoff_pose = None
+        backoff_teleport = None
+        rejected_backoffs = []
+        for backoff_distance in (0.50, 0.65, 0.80, 1.00):
+            trial_pose = np.array(
+                [
+                    float(start["pos"][0]) + backoff_distance * away[0],
+                    float(start["pos"][1]) + backoff_distance * away[1],
+                    float(start["yaw"]),
+                ],
+                dtype=np.float64,
+            )
+            trial_teleport = _teleport_base_pose(
+                env,
+                trial_pose,
+                root_z=runner.cfg.robot_root_z,
+                root_roll=runner.cfg.robot_root_roll,
+                root_pitch=runner.cfg.robot_root_pitch,
+                weld=runner.weld,
+                carried_object_name=runner.cfg.object_name,
+            )
+            backoff_contacts = robot_environment_contacts(
+                env,
+                ignored_environment_geoms=(
+                    "floor",
+                    f"{runner.cfg.object_name}_geom",
+                ),
+            )
+            if not backoff_contacts:
+                backoff_pose = trial_pose
+                backoff_teleport = trial_teleport
+                break
+            rejected_backoffs.append(
+                {
+                    "distance_m": backoff_distance,
+                    "pose": trial_pose.tolist(),
+                    "contacts": backoff_contacts,
+                }
+            )
+        if backoff_pose is None or backoff_teleport is None:
+            raise RuntimeError(
+                "DELIVERY_BACKOFF_TELEPORT has no collision-free outward "
+                f"landing pose: {rejected_backoffs}"
+            )
+        metrics["backoff"] = {
+            "mode": "direct_mujoco_pose_reset",
+            "direction": "away_from_carried_object",
+            "direction_world_xy": away.tolist(),
+            "target_pose": backoff_pose.tolist(),
+            "rejected_trials": rejected_backoffs,
+            **backoff_teleport,
+        }
+        print(
+            f"[N2M][DELIVERY_BACKOFF_TELEPORT] target="
+            f"{np.round(backoff_pose, 4)} direction="
+            f"{np.round(away, 4)} rejected={len(rejected_backoffs)}",
+            flush=True,
+        )
+        metrics["navigation"] = _follow_nav2_path_by_teleport(
+            name="DELIVERY_NAV",
+            env=env,
+            bridge=bridge,
+            interactive=interactive,
+            goal_xy=destination,
+            final_yaw=-math.pi / 2.0,
+            max_steps=destination_max_steps,
+            teleport_every_steps=teleport_every_steps,
+            teleport_spacing_m=teleport_step_distance,
+            plan_timeout_s=teleport_plan_timeout,
+            snapshot_writer=snapshot_writer,
+            weld=runner.weld,
+            root_z=runner.cfg.robot_root_z,
+            root_roll=runner.cfg.robot_root_roll,
+            root_pitch=runner.cfg.robot_root_pitch,
+            carried_object_name=runner.cfg.object_name,
+            arm_target=carry_arm,
+            gripper_target=carry_gripper,
+        )
+        final_pose = _base_pose_from_state(env.get_robot_state())
+        metrics["align"] = {
+            "mode": "included_in_final_teleport",
+            "target_yaw": -math.pi / 2.0,
+            "final_yaw": float(final_pose[2]),
+        }
+        metrics["destination_pan"] = {
+            "mode": "included_in_final_teleport",
+            "target_xy": [float(destination[0]), float(destination[1])],
+            "final_xy": final_pose[:2].tolist(),
+        }
+
+        rotate_start = runner._arm_q().copy()
+        rotate_target = rotate_start.copy()
+        rotate_target[:3] = [math.pi / 2.0, 1.8, -1.8]
+        for step in range(DELIVERY_ROTATE_STEPS):
+            if interactive.quit:
+                raise KeyboardInterrupt
+            alpha = 0.5 * (
+                1.0
+                - math.cos(
+                    math.pi * min(1.0, step / DELIVERY_ROTATE_STEPS)
+                )
+            )
+            command = rotate_start + alpha * (rotate_target - rotate_start)
+            last_action = _carry_policy_step(
+                env,
+                policy,
+                device,
+                last_action,
+                (0.0, 0.0, 0.0),
+                command,
+                carry_gripper,
+            )
+            if step == 0 or step % 100 == 0:
+                print(
+                    f"[N2M][DELIVERY_ROTATE] step={step}/"
+                    f"{DELIVERY_ROTATE_STEPS}",
+                    flush=True,
+                )
+
+        env.disable_gripper_force_hold()
+        for step in range(DELIVERY_PUT_DOWN_STEPS):
+            if interactive.quit:
+                raise KeyboardInterrupt
+            last_action = _carry_policy_step(
+                env,
+                policy,
+                device,
+                last_action,
+                (0.0, 0.0, 0.0),
+                rotate_target,
+                GRIPPER_OPEN,
+            )
+        metrics["cube_pose_after_release"] = runner.current_object_pose()
+        final_rs = env.get_robot_state()
+        metrics["final_base_pose"] = _base_pose_from_state(final_rs).tolist()
+        metrics["rotate_steps"] = DELIVERY_ROTATE_STEPS
+        metrics["put_down_steps"] = DELIVERY_PUT_DOWN_STEPS
+        metrics["cube_destination_xy_error_m"] = float(
+            np.linalg.norm(
+                np.asarray(
+                    metrics["cube_pose_after_release"][:2],
+                    dtype=np.float64,
+                )
+                - np.asarray(destination[:2], dtype=np.float64)
+            )
+        )
+        runner.weld.disable()
+        if (
+            metrics["cube_destination_xy_error_m"]
+            > DELIVERY_MAX_PLACEMENT_DISTANCE_M
+        ):
+            raise RuntimeError(
+                "cube was released too far from the destination: "
+                f"distance={metrics['cube_destination_xy_error_m']:.3f}m > "
+                f"{DELIVERY_MAX_PLACEMENT_DISTANCE_M:.3f}m"
+            )
+        print(
+            f"[N2M][DELIVERY_DONE] mode=teleport cube="
+            f"{np.round(metrics['cube_pose_after_release'][:3], 4)} "
+            f"destination_error="
+            f"{metrics['cube_destination_xy_error_m']:.3f}m",
+            flush=True,
+        )
+        return metrics
 
     start = env.get_robot_state()
     backoff_x = float(start["pos"][0]) - 0.5
@@ -2686,6 +3622,8 @@ def deliver_lifted_object(
     rs = env.get_robot_state()
     bridge.update_robot_pose(rs["pos"], rs["quat"], rs["lin_vel"], rs["ang_vel"])
     bridge.send_goal(float(destination[0]), float(destination[1]))
+    travelled = [np.asarray(rs["pos"][:2], dtype=np.float64).copy()]
+    nav_commands = NavCommandConditioner(env.dt)
     progress = {
         "anchor": np.asarray(rs["pos"][:2], dtype=np.float64).copy(),
         "last_progress_time": time.monotonic(),
@@ -2698,6 +3636,16 @@ def deliver_lifted_object(
         rs = env.get_robot_state()
         bridge.update_robot_pose(
             rs["pos"], rs["quat"], rs["lin_vel"], rs["ang_vel"]
+        )
+        travelled.append(np.asarray(rs["pos"][:2], dtype=np.float64).copy())
+        _save_nav_snapshot_if_due(
+            snapshot_writer,
+            bridge,
+            phase="delivery_nav",
+            step=step + 1,
+            robot_state=rs,
+            goal_xy=destination,
+            travelled_path=travelled,
         )
         nav_done, nav_failed = bridge.get_nav_status()
         if nav_failed:
@@ -2720,8 +3668,9 @@ def deliver_lifted_object(
                 flush=True,
             )
             break
-        cmd_vx, cmd_wz = bridge.get_cmd_vel()
-        cmd_vx, cmd_wz = _clip_nav_command(cmd_vx, cmd_wz, nav2_settings)
+        raw_vx, raw_wz = bridge.get_cmd_vel()
+        raw_vx, raw_wz = _clip_nav_command(raw_vx, raw_wz, nav2_settings)
+        cmd_vx, cmd_wz, command_diag = nav_commands.step(raw_vx, raw_wz)
         _update_progress_watchdog(progress, rs["pos"][:2], nav2_settings)
         last_action = _carry_policy_step(
             env,
@@ -2736,7 +3685,10 @@ def deliver_lifted_object(
             print(
                 f"[N2M][DELIVERY_NAV] step={step} "
                 f"base={np.round(rs['pos'][:2], 3)} "
-                f"cmd=({cmd_vx:+.3f},{cmd_wz:+.3f})",
+                f"raw=({raw_vx:+.3f},{raw_wz:+.3f}) "
+                f"cmd=({cmd_vx:+.3f},{cmd_wz:+.3f}) "
+                f"yaw_lp={command_diag['filtered_yaw_target']:+.3f} "
+                f"turn_scale={command_diag['turn_speed_scale']:.2f}",
                 flush=True,
             )
         pacer.wait()
@@ -2904,14 +3856,626 @@ def _pose_window_motion_rates(poses, step_dt: float) -> tuple[float, float]:
     return float(np.linalg.norm(xy_velocity)), abs(yaw_rate)
 
 
-def navigate_to_observation(env, policy, bridge, provider, args, device):
-    """Run Nav2 to a standoff point, then truth-servo into the O gate."""
+def _kitchen_living_door_plan(start_xy, goal_xy) -> dict | None:
+    """Return a one-door transition only when the wall must be crossed.
+
+    The kitchen is north of the horizontal wall (positive Y) and the living
+    room is south of it.  A side margin prevents this pilot from taking over
+    when either endpoint is already inside the doorway strip.
+    """
+    start = np.asarray(start_xy, dtype=np.float64)[:2]
+    goal = np.asarray(goal_xy, dtype=np.float64)[:2]
+    wall_y = float(KITCHEN_LIVING_DOOR_CENTER[1])
+    start_side = float(start[1] - wall_y)
+    goal_side = float(goal[1] - wall_y)
+    margin = KITCHEN_LIVING_DOOR_SIDE_MARGIN_M
+    if start_side >= margin and goal_side <= -margin:
+        direction = np.array([0.0, -1.0], dtype=np.float64)
+        direction_name = "kitchen_to_living"
+    elif start_side <= -margin and goal_side >= margin:
+        direction = np.array([0.0, 1.0], dtype=np.float64)
+        direction_name = "living_to_kitchen"
+    else:
+        return None
+
+    tangent = np.array([-direction[1], direction[0]], dtype=np.float64)
+    staging = KITCHEN_LIVING_DOOR_STAGING_OFFSET_M
+    approach = KITCHEN_LIVING_DOOR_CENTER - staging * direction
+    exit_pose = KITCHEN_LIVING_DOOR_CENTER + staging * direction
+    yaw = math.atan2(float(direction[1]), float(direction[0]))
+    return {
+        "door": "kitchen_living",
+        "direction_name": direction_name,
+        "center_xy": KITCHEN_LIVING_DOOR_CENTER.copy(),
+        "direction_xy": direction,
+        "tangent_xy": tangent,
+        "approach_pose": np.array(
+            [approach[0], approach[1], yaw], dtype=np.float64
+        ),
+        "exit_pose": np.array(
+            [exit_pose[0], exit_pose[1], yaw], dtype=np.float64
+        ),
+    }
+
+
+def _door_point_approach_command(
+    current_pose, target_xy, *, captured: bool
+) -> tuple[tuple[float, float, float], bool, dict]:
+    """Approach an open-space point using rotation plus forward motion only."""
+    pose = np.asarray(current_pose, dtype=np.float64)
+    target = np.asarray(target_xy, dtype=np.float64)[:2]
+    delta = target - pose[:2]
+    distance = float(np.linalg.norm(delta))
+    target_bearing = math.atan2(float(delta[1]), float(delta[0]))
+    bearing_error = _wrap_angle(target_bearing - float(pose[2]))
+    if captured:
+        captured = distance <= KITCHEN_LIVING_DOOR_POINT_RESUME_M
+    else:
+        captured = distance <= KITCHEN_LIVING_DOOR_CENTER_TOLERANCE_M
+
+    if captured:
+        command = (0.0, 0.0, 0.0)
+        mode = "capture"
+    elif abs(bearing_error) > KITCHEN_LIVING_DOOR_POINT_TURN_ONLY_RAD:
+        command = (
+            0.0,
+            0.0,
+            _yaw_velocity_target(
+                bearing_error,
+                deadband=math.radians(3.0),
+                kp=3.0,
+                min_abs=0.40,
+                max_abs=0.80,
+            ),
+        )
+        mode = "turn"
+    else:
+        wz = 0.0 if abs(bearing_error) <= math.radians(1.0) else float(
+            np.clip(2.0 * bearing_error, -0.35, 0.35)
+        )
+        command = (KITCHEN_LIVING_DOOR_CENTER_FORWARD_SPEED_MPS, 0.0, wz)
+        mode = "forward"
+    return command, captured, {
+        "distance_m": distance,
+        "bearing_error_rad": bearing_error,
+        "mode": mode,
+    }
+
+
+def _door_cross_control_command(current_pose, plan: dict) -> tuple[tuple[float, float, float], dict]:
+    """Compute a forward-only command along the doorway center line."""
+    pose = np.asarray(current_pose, dtype=np.float64)
+    center = np.asarray(plan["center_xy"], dtype=np.float64)
+    direction = np.asarray(plan["direction_xy"], dtype=np.float64)
+    tangent = np.asarray(plan["tangent_xy"], dtype=np.float64)
+    offset = pose[:2] - center
+    progress = float(np.dot(offset, direction))
+    lateral = float(np.dot(offset, tangent))
+
+    # Aim a few degrees back toward the center line instead of commanding a
+    # body-frame lateral velocity in the narrow opening.
+    heading_offset = float(
+        np.clip(
+            -1.5 * lateral,
+            -KITCHEN_LIVING_DOOR_MAX_HEADING_OFFSET_RAD,
+            KITCHEN_LIVING_DOOR_MAX_HEADING_OFFSET_RAD,
+        )
+    )
+    nominal_yaw = float(plan["approach_pose"][2])
+    desired_yaw = _wrap_angle(nominal_yaw + heading_offset)
+    yaw_error = _wrap_angle(desired_yaw - float(pose[2]))
+    door_yaw_error = _wrap_angle(nominal_yaw - float(pose[2]))
+    done = progress >= (
+        KITCHEN_LIVING_DOOR_STAGING_OFFSET_M
+        - KITCHEN_LIVING_DOOR_CROSS_EXIT_TOLERANCE_M
+    )
+    tracking_warning = (
+        abs(lateral) > KITCHEN_LIVING_DOOR_MAX_LATERAL_M
+        or abs(door_yaw_error) > KITCHEN_LIVING_DOOR_MAX_YAW_ERROR_RAD
+    )
+    if done:
+        command = (0.0, 0.0, 0.0)
+    else:
+        wz = 0.0 if abs(yaw_error) <= math.radians(1.0) else float(
+            np.clip(2.0 * yaw_error, -0.35, 0.35)
+        )
+        command = (KITCHEN_LIVING_DOOR_CROSS_FORWARD_SPEED_MPS, 0.0, wz)
+    return command, {
+        "progress_m": progress,
+        "lateral_error_m": lateral,
+        "desired_yaw_rad": desired_yaw,
+        "yaw_error_rad": yaw_error,
+        "door_yaw_error_rad": door_yaw_error,
+        "done": bool(done),
+        "tracking_warning": bool(tracking_warning),
+    }
+
+
+def _navigate_nav2_to_door_approach(
+    env, policy, bridge, plan: dict, args, device
+) -> tuple[np.ndarray, dict]:
+    """Use ordinary Nav2 only up to the open-space door staging pose."""
+    target = np.asarray(plan["approach_pose"], dtype=np.float64)
+    initial = env.get_robot_state()
+    bridge.update_robot_pose(
+        initial["pos"], initial["quat"], initial["lin_vel"], initial["ang_vel"]
+    )
+    bridge.send_goal(float(target[0]), float(target[1]))
+    nav_commands = NavCommandConditioner(env.dt)
+    progress = {
+        "anchor": np.asarray(initial["pos"][:2], dtype=np.float64).copy(),
+        "last_progress_time": time.monotonic(),
+    }
+    last_action = np.zeros(16, dtype=np.float32)
+    travelled = [np.asarray(initial["pos"][:2], dtype=np.float64).copy()]
+    snapshot_writer = getattr(args, "nav_snapshot_writer", None)
     pacer = RealtimePacer(env.dt)
+    started = time.monotonic()
+    print(
+        f"[N2M][DOOR_APPROACH_NAV_START] door={plan['door']} "
+        f"direction={plan['direction_name']} current="
+        f"{np.round(_base_pose_from_state(initial), 3)} "
+        f"target={np.round(target, 3)}",
+        flush=True,
+    )
+    try:
+        for step in range(int(args.nav_max_steps)):
+            state = env.get_robot_state()
+            bridge.update_robot_pose(
+                state["pos"], state["quat"], state["lin_vel"], state["ang_vel"]
+            )
+            travelled.append(
+                np.asarray(state["pos"][:2], dtype=np.float64).copy()
+            )
+            _save_nav_snapshot_if_due(
+                snapshot_writer,
+                bridge,
+                phase="door_approach",
+                step=step + 1,
+                robot_state=state,
+                goal_xy=target[:2],
+                travelled_path=travelled,
+            )
+            distance = float(np.linalg.norm(state["pos"][:2] - target[:2]))
+            nav_done, nav_failed = bridge.get_nav_status()
+            if distance <= KITCHEN_LIVING_DOOR_NAV_TOLERANCE_M or nav_done:
+                bridge.cancel_goal()
+                nav_commands.reset()
+                trigger = (
+                    "local_tolerance"
+                    if distance <= KITCHEN_LIVING_DOOR_NAV_TOLERANCE_M
+                    else "nav_done"
+                )
+                print(
+                    f"[N2M][DOOR_APPROACH_NAV_DONE] trigger={trigger} "
+                    f"step={step} distance={distance:.3f}m",
+                    flush=True,
+                )
+                return last_action, {
+                    "steps": step + 1,
+                    "elapsed_s": time.monotonic() - started,
+                    "trigger": trigger,
+                    "final_distance_m": distance,
+                }
+            if nav_failed:
+                raise RuntimeError(
+                    "DOOR_APPROACH_NAV: Nav2 failed before the staging pose "
+                    f"(distance={distance:.3f}m)"
+                )
+            raw_vx, raw_wz = _clip_nav_command(
+                *bridge.get_cmd_vel(), args.nav2_settings
+            )
+            cmd_vx, cmd_wz, command_diag = nav_commands.step(raw_vx, raw_wz)
+            _update_progress_watchdog(
+                progress, state["pos"][:2], args.nav2_settings
+            )
+            last_action = _policy_step(
+                env, policy, device, last_action, (cmd_vx, 0.0, cmd_wz)
+            )
+            contacts = robot_environment_contacts(env)
+            if contacts:
+                raise RuntimeError(
+                    "DOOR_APPROACH_NAV: environment contact before staging: "
+                    f"{contacts}"
+                )
+            if step % 100 == 0:
+                print(
+                    f"[N2M][DOOR_APPROACH_NAV] step={step} "
+                    f"distance={distance:.3f}m raw=({raw_vx:+.2f},{raw_wz:+.2f}) "
+                    f"cmd=({cmd_vx:+.2f},{cmd_wz:+.2f}) "
+                    f"yaw_lp={command_diag['filtered_yaw_target']:+.2f}",
+                    flush=True,
+                )
+            pacer.wait()
+    except BaseException:
+        bridge.cancel_goal()
+        raise
+    raise RuntimeError("DOOR_APPROACH_NAV: timed out before staging pose")
+
+
+def _center_at_door_approach(
+    env, policy, bridge, plan: dict, device, last_action
+) -> tuple[np.ndarray, dict]:
+    """Reach the staging point using turns and forward motion, never strafe."""
+    target = np.asarray(plan["approach_pose"], dtype=np.float64)
+    pacer = RealtimePacer(env.dt)
+    started = time.monotonic()
+    captured = False
+    settle_window = []
+    for step in range(KITCHEN_LIVING_DOOR_CENTER_MAX_STEPS):
+        state = env.get_robot_state()
+        pose = _base_pose_from_state(state)
+        bridge.update_robot_pose(
+            state["pos"], state["quat"], state["lin_vel"], state["ang_vel"]
+        )
+        command, captured, diagnostics = _door_point_approach_command(
+            pose, target[:2], captured=captured
+        )
+        if captured:
+            settle_window.append(pose.copy())
+            settle_window = settle_window[-PAN_SETTLE_WINDOW_FRAMES:]
+        else:
+            settle_window.clear()
+        last_action = _policy_step(env, policy, device, last_action, command)
+        contacts = robot_environment_contacts(env)
+        if contacts:
+            raise RuntimeError(
+                f"DOOR_CENTER: environment contact while centering: {contacts}"
+            )
+        if step == 0 or step % 25 == 0:
+            print(
+                f"[N2M][DOOR_CENTER] step={step}/"
+                f"{KITCHEN_LIVING_DOOR_CENTER_MAX_STEPS} "
+                f"distance={diagnostics['distance_m']:.3f}m "
+                f"bearing={math.degrees(diagnostics['bearing_error_rad']):+.2f}deg "
+                f"mode={diagnostics['mode']} "
+                f"cmd=({command[0]:+.3f},+0.000,{command[2]:+.3f}) "
+                f"window={len(settle_window)}/{PAN_SETTLE_WINDOW_FRAMES}",
+                flush=True,
+            )
+        pacer.wait()
+        if len(settle_window) >= PAN_SETTLE_WINDOW_FRAMES:
+            trend_speed, _ = _pose_window_motion_rates(settle_window, env.dt)
+        else:
+            trend_speed = float("inf")
+        if (
+            captured
+            and len(settle_window) >= PAN_SETTLE_WINDOW_FRAMES
+            and trend_speed <= PAN_SETTLE_LINEAR_RATE
+        ):
+            final = _base_pose_from_state(env.get_robot_state())
+            error = float(np.linalg.norm(final[:2] - target[:2]))
+            print(
+                f"[N2M][DOOR_CENTER_DONE] step={step + 1} "
+                f"xy_error={error:.3f}m avg_speed={trend_speed:.3f}m/s",
+                flush=True,
+            )
+            return last_action, {
+                "steps": step + 1,
+                "elapsed_s": time.monotonic() - started,
+                "final_pose": final.tolist(),
+                "xy_error_m": error,
+                "settle_speed_mps": trend_speed,
+                "controller": "turn_then_forward_point_servo",
+            }
+    raise RuntimeError("DOOR_CENTER: centering timed out")
+
+
+def _align_for_door_crossing(
+    env, policy, bridge, plan: dict, device, last_action
+) -> tuple[np.ndarray, dict]:
+    """Align to the door normal while remaining at the staging pose."""
+    target = np.asarray(plan["approach_pose"], dtype=np.float64)
+    pacer = RealtimePacer(env.dt)
+    cmd_wz = 0.0
+    settling = False
+    settle_count = 0
+    started = time.monotonic()
+    drift_warning_active = False
+    drift_warning_observed = False
+    max_position_error = 0.0
+    for step in range(KITCHEN_LIVING_DOOR_ALIGN_MAX_STEPS):
+        state = env.get_robot_state()
+        pose = _base_pose_from_state(state)
+        bridge.update_robot_pose(
+            state["pos"], state["quat"], state["lin_vel"], state["ang_vel"]
+        )
+        position_error = float(np.linalg.norm(pose[:2] - target[:2]))
+        max_position_error = max(max_position_error, position_error)
+        drift_warning = position_error > 0.25
+        if drift_warning and not drift_warning_active:
+            print(
+                "[N2M][DOOR_ALIGN_TRACKING_WARNING] continuing until "
+                "MuJoCo contact or timeout "
+                f"(staging_error={position_error:.3f}m)",
+                flush=True,
+            )
+        drift_warning_active = drift_warning
+        drift_warning_observed = drift_warning_observed or drift_warning
+        yaw_error = _wrap_angle(float(target[2] - pose[2]))
+        if settling:
+            if abs(yaw_error) > ALIGN_YAW_RESUME_TOL_RAD:
+                settling = False
+                settle_count = 0
+        elif abs(yaw_error) <= ALIGN_YAW_ENTER_TOL_RAD:
+            settling = True
+            settle_count = 0
+        target_wz = 0.0 if settling else _yaw_velocity_target(
+            yaw_error,
+            deadband=ALIGN_YAW_ENTER_TOL_RAD,
+            kp=ALIGN_YAW_KP,
+            min_abs=ALIGN_YAW_MIN,
+            max_abs=ALIGN_YAW_MAX,
+        )
+        cmd_wz = _slew(cmd_wz, target_wz, ALIGN_YAW_DW_PER_STEP)
+        if (
+            settling
+            and abs(yaw_error) <= ALIGN_YAW_RESUME_TOL_RAD
+            and abs(float(state["ang_vel"][2])) <= ALIGN_YAW_RATE_TOL
+            and abs(cmd_wz) <= ALIGN_YAW_DW_PER_STEP
+        ):
+            settle_count += 1
+        else:
+            settle_count = 0
+        last_action = _policy_step(
+            env, policy, device, last_action, (0.0, 0.0, cmd_wz)
+        )
+        contacts = robot_environment_contacts(env)
+        if contacts:
+            raise RuntimeError(
+                "DOOR_ALIGN: collision confirmed by MuJoCo contact: "
+                f"{contacts}"
+            )
+        if step == 0 or step % 25 == 0:
+            print(
+                f"[N2M][DOOR_ALIGN] step={step}/"
+                f"{KITCHEN_LIVING_DOOR_ALIGN_MAX_STEPS} "
+                f"yaw_error={math.degrees(yaw_error):+.2f}deg "
+                f"staging_error={position_error:.3f}m cmd_wz={cmd_wz:+.3f} "
+                f"settle={settle_count}/{ALIGN_YAW_SETTLE_STEPS}",
+                flush=True,
+            )
+        pacer.wait()
+        if settle_count >= ALIGN_YAW_SETTLE_STEPS:
+            final = _base_pose_from_state(env.get_robot_state())
+            lateral = float(
+                np.dot(
+                    final[:2] - np.asarray(plan["center_xy"]),
+                    np.asarray(plan["tangent_xy"]),
+                )
+            )
+            entry_warning = abs(lateral) > 0.12
+            if entry_warning:
+                print(
+                    "[N2M][DOOR_ALIGN_ENTRY_WARNING] proceeding to "
+                    "contact-checked crossing "
+                    f"(lateral={lateral:+.3f}m)",
+                    flush=True,
+                )
+            print(
+                f"[N2M][DOOR_ALIGN_DONE] step={step + 1} "
+                f"yaw_error={math.degrees(abs(_wrap_angle(target[2] - final[2]))):.2f}deg "
+                f"lateral={lateral:+.3f}m",
+                flush=True,
+            )
+            return last_action, {
+                "steps": step + 1,
+                "elapsed_s": time.monotonic() - started,
+                "final_pose": final.tolist(),
+                "lateral_error_m": lateral,
+                "max_staging_error_m": max_position_error,
+                "tracking_warning_observed": drift_warning_observed,
+                "entry_warning": entry_warning,
+            }
+    raise RuntimeError("DOOR_ALIGN: yaw alignment timed out")
+
+
+def _cross_kitchen_living_door(
+    env, policy, bridge, plan: dict, device, last_action
+) -> tuple[np.ndarray, dict]:
+    """Cross the opening with no reverse or lateral velocity commands."""
+    pacer = RealtimePacer(env.dt)
+    started = time.monotonic()
+    warning_active = False
+    for step in range(KITCHEN_LIVING_DOOR_CROSS_MAX_STEPS):
+        state = env.get_robot_state()
+        pose = _base_pose_from_state(state)
+        bridge.update_robot_pose(
+            state["pos"], state["quat"], state["lin_vel"], state["ang_vel"]
+        )
+        command, diagnostics = _door_cross_control_command(pose, plan)
+        if diagnostics["tracking_warning"] and not warning_active:
+            print(
+                "[N2M][DOOR_CROSS_TRACKING_WARNING] continuing until "
+                "MuJoCo contact or timeout "
+                f"(lateral={diagnostics['lateral_error_m']:+.3f}m, "
+                f"door_yaw_error="
+                f"{math.degrees(diagnostics['door_yaw_error_rad']):+.2f}deg)",
+                flush=True,
+            )
+        warning_active = diagnostics["tracking_warning"]
+        if diagnostics["done"]:
+            # Let the gait settle with an explicit zero command before Nav2 is
+            # allowed to issue a new path-following command.
+            for _ in range(PAN_SETTLE_WINDOW_FRAMES):
+                last_action = _policy_step(
+                    env, policy, device, last_action, (0.0, 0.0, 0.0)
+                )
+                settled_state = env.get_robot_state()
+                bridge.update_robot_pose(
+                    settled_state["pos"],
+                    settled_state["quat"],
+                    settled_state["lin_vel"],
+                    settled_state["ang_vel"],
+                )
+                contacts = robot_environment_contacts(env)
+                if contacts:
+                    raise RuntimeError(
+                        f"DOOR_CROSS: contact while settling after exit: {contacts}"
+                    )
+                pacer.wait()
+            final = _base_pose_from_state(env.get_robot_state())
+            final_progress = float(
+                np.dot(
+                    final[:2] - np.asarray(plan["center_xy"]),
+                    np.asarray(plan["direction_xy"]),
+                )
+            )
+            print(
+                f"[N2M][DOOR_CROSS_DONE] step={step} "
+                f"progress={final_progress:.3f}m "
+                f"lateral={diagnostics['lateral_error_m']:+.3f}m",
+                flush=True,
+            )
+            return last_action, {
+                "steps": step,
+                "elapsed_s": time.monotonic() - started,
+                "final_pose": final.tolist(),
+                "progress_m": final_progress,
+                "lateral_error_m": diagnostics["lateral_error_m"],
+            }
+        last_action = _policy_step(env, policy, device, last_action, command)
+        contacts = robot_environment_contacts(env)
+        if contacts:
+            raise RuntimeError(
+                "DOOR_CROSS: collision confirmed by MuJoCo contact: "
+                f"{contacts}"
+            )
+        if step == 0 or step % 25 == 0:
+            print(
+                f"[N2M][DOOR_CROSS] step={step}/"
+                f"{KITCHEN_LIVING_DOOR_CROSS_MAX_STEPS} "
+                f"progress={diagnostics['progress_m']:+.3f}m "
+                f"lateral={diagnostics['lateral_error_m']:+.3f}m "
+                f"door_yaw_error="
+                f"{math.degrees(diagnostics['door_yaw_error_rad']):+.2f}deg "
+                f"cmd=({command[0]:+.3f},+0.000,{command[2]:+.3f})",
+                flush=True,
+            )
+        pacer.wait()
+    raise RuntimeError("DOOR_CROSS: forward-only crossing timed out")
+
+
+def traverse_kitchen_living_door_if_needed(
+    env, policy, bridge, goal_xy, args, device
+) -> tuple[dict, np.ndarray] | None:
+    """Run the special controller for this one door, or leave Nav2 unchanged."""
+    initial = env.get_robot_state()
+    plan = _kitchen_living_door_plan(initial["pos"][:2], goal_xy)
+    if plan is None:
+        return None
+    last_action, nav_metrics = _navigate_nav2_to_door_approach(
+        env, policy, bridge, plan, args, device
+    )
+    last_action, center_metrics = _center_at_door_approach(
+        env, policy, bridge, plan, device, last_action
+    )
+    last_action, align_metrics = _align_for_door_crossing(
+        env, policy, bridge, plan, device, last_action
+    )
+    last_action, cross_metrics = _cross_kitchen_living_door(
+        env, policy, bridge, plan, device, last_action
+    )
+    metrics = {
+        "door": plan["door"],
+        "direction": plan["direction_name"],
+        "center_xy": np.asarray(plan["center_xy"]).tolist(),
+        "approach_pose": np.asarray(plan["approach_pose"]).tolist(),
+        "exit_pose": np.asarray(plan["exit_pose"]).tolist(),
+        "nav_to_approach": nav_metrics,
+        "centering": center_metrics,
+        "alignment": align_metrics,
+        "crossing": cross_metrics,
+    }
+    return metrics, last_action
+
+
+def navigate_to_observation_by_teleport(env, bridge, provider, args):
+    """Use Nav2 only as a planner and reset the base along its global path."""
+    initial = env.get_robot_state()
+    target = provider.estimate(env, args.object)
+    waypoint = standoff_goal(
+        initial["pos"][:2], target.position_world[:2], args.nav_standoff
+    )
+    final_yaw = math.atan2(
+        float(target.position_world[1] - waypoint[1]),
+        float(target.position_world[0] - waypoint[0]),
+    )
+    print(
+        f"[N2M][NAV_GOAL] mode=nav2_path_teleport source={target.source} "
+        f"cube={np.round(target.position_world, 4)} "
+        f"waypoint={np.round(waypoint, 4)} "
+        f"standoff={args.nav_standoff:.2f}m",
+        flush=True,
+    )
+    route_metrics = _follow_nav2_path_by_teleport(
+        name="NAV",
+        env=env,
+        bridge=bridge,
+        interactive=args.interactive_controller,
+        goal_xy=waypoint,
+        final_yaw=final_yaw,
+        max_steps=args.nav_max_steps,
+        teleport_every_steps=args.teleport_every_steps,
+        teleport_spacing_m=args.teleport_step_distance,
+        plan_timeout_s=args.teleport_plan_timeout,
+        snapshot_writer=getattr(args, "nav_snapshot_writer", None),
+        arm_target=ARM_HOME,
+        gripper_target=GRIPPER_OPEN,
+    )
+    state = env.get_robot_state()
+    target = provider.estimate(env, args.object)
+    metrics = navigation_target_metrics(
+        [state["pos"][0], state["pos"][1], state["yaw"]],
+        target.position_world,
+    )
+    max_bearing = math.radians(float(args.nav_max_bearing_deg))
+    if not observation_gate(
+        metrics,
+        min_distance_m=args.nav_min_distance,
+        max_distance_m=args.nav_max_distance,
+        max_bearing_rad=max_bearing,
+    ):
+        raise RuntimeError(
+            "teleported NAV endpoint is outside the observation gate: "
+            f"distance={metrics.horizontal_distance_m:.3f}m "
+            f"bearing={math.degrees(metrics.bearing_error_rad):+.2f}deg"
+        )
+    print(
+        f"[N2M][NAV_OBSERVATION_READY] mode=teleport "
+        f"distance={metrics.horizontal_distance_m:.3f}m "
+        f"bearing={math.degrees(metrics.bearing_error_rad):+.2f}deg",
+        flush=True,
+    )
+    return state, target, {
+        **route_metrics,
+        "waypoint_world": waypoint.tolist(),
+        "horizontal_distance_m": metrics.horizontal_distance_m,
+        "bearing_error_rad": metrics.bearing_error_rad,
+        "navigation_steps": route_metrics["steps"],
+        "kitchen_living_door_transition": None,
+        "settle_window_frames": 0,
+        "settle_linear_rate_mps": 0.0,
+        "settle_yaw_rate_radps": 0.0,
+    }
+
+
+def navigate_to_observation(env, policy, bridge, provider, args, device):
+    """Run one ordinary Nav2 route to the standoff, then enter the O gate."""
+    if args.teleport_navigation:
+        return navigate_to_observation_by_teleport(
+            env, bridge, provider, args
+        )
     nav2_settings = args.nav2_settings
     initial = env.get_robot_state()
     target = provider.estimate(env, args.object)
     waypoint = standoff_goal(
         initial["pos"][:2], target.position_world[:2], args.nav_standoff
+    )
+
+    pacer = RealtimePacer(env.dt)
+    bridge.update_robot_pose(
+        initial["pos"], initial["quat"], initial["lin_vel"], initial["ang_vel"]
     )
     bridge.send_goal(float(waypoint[0]), float(waypoint[1]))
     progress = {
@@ -2931,12 +4495,31 @@ def navigate_to_observation(env, policy, bridge, provider, args, device):
     settle_yaw_rate = float("inf")
     yaw_captured = False
     last_action = np.zeros(16, dtype=np.float32)
+    travelled = [np.asarray(initial["pos"][:2], dtype=np.float64).copy()]
+    snapshot_writer = getattr(args, "nav_snapshot_writer", None)
+    nav_commands = NavCommandConditioner(env.dt)
+    raw_vx = raw_wz = 0.0
+    command_diag = {
+        "filtered_yaw_target": 0.0,
+        "turn_speed_scale": 1.0,
+    }
     max_bearing = math.radians(float(args.nav_max_bearing_deg))
     for step in range(int(args.nav_max_steps)):
         rs = env.get_robot_state()
         bridge.update_robot_pose(
             rs["pos"], rs["quat"], rs["lin_vel"], rs["ang_vel"]
         )
+        travelled.append(np.asarray(rs["pos"][:2], dtype=np.float64).copy())
+        if state == "NAV_GLOBAL":
+            _save_nav_snapshot_if_due(
+                snapshot_writer,
+                bridge,
+                phase="observation_nav",
+                step=step + 1,
+                robot_state=rs,
+                goal_xy=waypoint,
+                travelled_path=travelled,
+            )
         target = provider.estimate(env, args.object)
         metrics = navigation_target_metrics(
             [rs["pos"][0], rs["pos"][1], rs["yaw"]], target.position_world
@@ -2944,9 +4527,12 @@ def navigate_to_observation(env, policy, bridge, provider, args, device):
         nav_done, nav_failed = bridge.get_nav_status()
 
         if state == "NAV_GLOBAL":
-            cmd_vx, cmd_wz = bridge.get_cmd_vel()
-            cmd_vx, cmd_wz = _clip_nav_command(
-                cmd_vx, cmd_wz, nav2_settings
+            raw_vx, raw_wz = bridge.get_cmd_vel()
+            raw_vx, raw_wz = _clip_nav_command(
+                raw_vx, raw_wz, nav2_settings
+            )
+            cmd_vx, cmd_wz, command_diag = nav_commands.step(
+                raw_vx, raw_wz
             )
             cmd_vy = 0.0
             reached_band = (
@@ -2956,6 +4542,7 @@ def navigate_to_observation(env, policy, bridge, provider, args, device):
             )
             if reached_band or nav_done:
                 bridge.cancel_goal()
+                nav_commands.reset()
                 state = "TARGET_ALIGN"
                 cmd_vx = cmd_vy = cmd_wz = 0.0
                 print(
@@ -2994,6 +4581,15 @@ def navigate_to_observation(env, policy, bridge, provider, args, device):
                 cmd_vx = max(-0.15, metrics.horizontal_distance_m - args.nav_standoff)
             else:
                 cmd_vx = 0.0
+
+            # The observation servo has its own deliberate command shaping.
+            # Reuse the common log fields without displaying the last stale
+            # Nav2 sample from NAV_GLOBAL.
+            raw_vx, raw_wz = cmd_vx, cmd_wz
+            command_diag = {
+                "filtered_yaw_target": cmd_wz,
+                "turn_speed_scale": 1.0,
+            }
 
             in_gate = observation_gate(
                 metrics,
@@ -3038,6 +4634,7 @@ def navigate_to_observation(env, policy, bridge, provider, args, device):
                     "horizontal_distance_m": metrics.horizontal_distance_m,
                     "bearing_error_rad": metrics.bearing_error_rad,
                     "navigation_steps": step + 1,
+                    "kitchen_living_door_transition": None,
                     "settle_window_frames": len(settle_window),
                     "settle_linear_rate_mps": settle_linear_rate,
                     "settle_yaw_rate_radps": settle_yaw_rate,
@@ -3048,7 +4645,10 @@ def navigate_to_observation(env, policy, bridge, provider, args, device):
                 f"[N2M][{state}] step={step} pos={np.round(rs['pos'][:2], 3)} "
                 f"distance={metrics.horizontal_distance_m:.3f}m "
                 f"bearing={math.degrees(metrics.bearing_error_rad):+.1f}deg "
+                f"raw=({raw_vx:+.2f},{raw_wz:+.2f}) "
                 f"cmd=({cmd_vx:+.2f},{cmd_wz:+.2f}) "
+                f"yaw_lp={command_diag['filtered_yaw_target']:+.2f} "
+                f"turn_scale={command_diag['turn_speed_scale']:.2f} "
                 f"yaw_capture={yaw_captured} "
                 f"window={len(settle_window)}/{args.nav_settle_frames} "
                 f"avg=({settle_linear_rate:.3f}m/s,"
@@ -3058,6 +4658,12 @@ def navigate_to_observation(env, policy, bridge, provider, args, device):
         last_action = _policy_step(
             env, policy, device, last_action, (cmd_vx, cmd_vy, cmd_wz)
         )
+        contacts = robot_environment_contacts(env)
+        if contacts:
+            bridge.cancel_goal()
+            raise RuntimeError(
+                f"{state}: collision confirmed by MuJoCo contact: {contacts}"
+            )
         pacer.wait()
 
     bridge.cancel_goal()
@@ -3099,7 +4705,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--destination-max-steps",
         type=int,
         default=6000,
-        help="maximum locomotion-policy steps for delivery Nav2",
+        help="maximum simulation steps for the delivery navigation phase",
     )
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
@@ -3134,6 +4740,67 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--nav-stop-yaw-rate", type=float, default=0.10)
     parser.add_argument("--nav-settle-frames", type=int, default=15)
     parser.add_argument("--nav-max-steps", type=int, default=8000)
+    motion = parser.add_mutually_exclusive_group()
+    motion.add_argument(
+        "--teleport-navigation",
+        "--teleport",
+        dest="teleport_navigation",
+        action="store_true",
+        help=(
+            "use Nav2 only for global planning, reset the MuJoCo base along "
+            "the path, and reset directly to every selected N2M M pose "
+            "(current default)"
+        ),
+    )
+    motion.add_argument(
+        "--physical-navigation",
+        dest="teleport_navigation",
+        action="store_false",
+        help="use the locomotion policy and the existing P-to-M controller",
+    )
+    # The integration script currently defaults to planner-guided teleport so
+    # N2M/manipulation can be validated independently of locomotion tuning.
+    # --physical-navigation keeps the complete former controller available.
+    parser.set_defaults(teleport_navigation=True)
+    parser.add_argument(
+        "--teleport-every-steps",
+        type=int,
+        default=5,
+        help="simulation steps between consecutive path pose resets (default: 5)",
+    )
+    parser.add_argument(
+        "--teleport-step-distance",
+        type=float,
+        default=0.08,
+        help="arc distance between consecutive path resets in metres (default: 0.08)",
+    )
+    parser.add_argument(
+        "--teleport-plan-timeout",
+        type=float,
+        default=15.0,
+        help="seconds to wait for Nav2 to publish its global path",
+    )
+    parser.add_argument(
+        "--nav-snapshot-every",
+        type=int,
+        default=200,
+        help=(
+            "save a static-map/global-plan diagnostic every N navigation "
+            "steps; use 0 to disable (default: 200)"
+        ),
+    )
+    parser.add_argument(
+        "--nav-snapshot-dir",
+        type=Path,
+        default=DEFAULT_NAV_SNAPSHOT_DIR,
+        help="directory for periodic Nav2 global-plan images",
+    )
+    parser.add_argument(
+        "--nav-snapshot-map",
+        type=Path,
+        default=DEFAULT_NAV_SNAPSHOT_MAP,
+        help="Nav2 map YAML used as the snapshot background",
+    )
     parser.add_argument(
         "--predock-distance",
         type=float,
@@ -3251,6 +4918,10 @@ def main() -> int:
         raise SystemExit("require 0 < --nav-min-distance < --nav-max-distance")
     if (
         args.nav_settle_frames < 2
+        or args.nav_snapshot_every < 0
+        or args.teleport_every_steps <= 0
+        or args.teleport_step_distance <= 0.0
+        or args.teleport_plan_timeout <= 0.0
         or args.max_grasp_attempts <= 0
         or args.n2m_max_candidates <= 0
         or args.destination_max_steps <= 0
@@ -3277,8 +4948,8 @@ def main() -> int:
     ):
         raise SystemExit(
             "navigation/docking tolerances, ordered N2M radii, speeds, step budgets and "
-            "M/attempt limits must be positive; --nav-settle-frames must "
-            "be at least 2"
+            "M/attempt/teleport limits must be positive; "
+            "--nav-settle-frames must be at least 2"
         )
     if not args.scene.is_file():
         raise SystemExit(f"scene does not exist: {args.scene}")
@@ -3286,6 +4957,10 @@ def main() -> int:
         raise SystemExit(f"N2M checkpoint does not exist: {args.n2m_checkpoint}")
     if not args.nav2_params.is_file():
         raise SystemExit(f"Nav2 params do not exist: {args.nav2_params}")
+    if args.nav_snapshot_every > 0 and not args.nav_snapshot_map.is_file():
+        raise SystemExit(
+            f"navigation snapshot map does not exist: {args.nav_snapshot_map}"
+        )
     try:
         nav2_settings = load_nav2_runtime_settings(args.nav2_params)
     except (KeyError, TypeError, ValueError, yaml.YAMLError) as exc:
@@ -3309,6 +4984,33 @@ def main() -> int:
         f"{nav2_settings['movement_time_allowance_s']:.1f}s",
         flush=True,
     )
+    print(
+        f"[N2M][NAV_CMD_FILTER] yaw_tau={NAV_CMD_YAW_FILTER_TAU_S:.2f}s "
+        f"turn_slowdown=({NAV_CMD_TURN_SLOWDOWN_START_RADPS:.2f},"
+        f"{NAV_CMD_TURN_SLOWDOWN_FULL_RADPS:.2f})rad/s "
+        f"min_speed_scale={NAV_CMD_TURN_MIN_SPEED_SCALE:.2f} "
+        f"accel_limits=({NAV_CMD_LINEAR_ACCEL_LIMIT_MPS2:.2f}m/s^2,"
+        f"{NAV_CMD_YAW_ACCEL_LIMIT_RADPS2:.2f}rad/s^2)",
+        flush=True,
+    )
+    print(
+        "[N2M][DOOR_NAV_MODE] standard Nav2 global path for every door; "
+        "special door waypoints/controllers disabled",
+        flush=True,
+    )
+    if args.teleport_navigation:
+        print(
+            f"[N2M][BASE_MOTION_MODE] nav2_path_teleport "
+            f"every={args.teleport_every_steps}steps "
+            f"spacing={args.teleport_step_distance:.3f}m; "
+            "N2M M transitions use one direct pose reset",
+            flush=True,
+        )
+    else:
+        print(
+            "[N2M][BASE_MOTION_MODE] physical_locomotion_policy",
+            flush=True,
+        )
 
     os.environ.setdefault("MUJOCO_GL", "glx" if args.render else "egl")
     device_name = args.device if torch.cuda.is_available() else "cpu"
@@ -3327,12 +5029,21 @@ def main() -> int:
         )
     )
     output_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        args.nav_snapshot_writer = NavigationSnapshotWriter(
+            args.nav_snapshot_map,
+            args.nav_snapshot_dir,
+            args.nav_snapshot_every,
+        )
+    except (OSError, KeyError, TypeError, ValueError, yaml.YAMLError) as exc:
+        raise SystemExit(f"cannot initialize navigation snapshots: {exc}") from exc
 
     from custom_envs.mujoco.env import MuJoCoEnv
     from custom_envs.mujoco.policy_loader import load_locomotion_policy
     from custom_envs.utils.ros2_bridge import IsaacROS2Bridge
 
     controller = InteractiveController()
+    args.interactive_controller = controller
     env = MuJoCoEnv(
         robot_init_pos=(args.robot_x, args.robot_y, 0.58),
         robot_init_quat=(
@@ -3383,6 +5094,19 @@ def main() -> int:
         "nav2_runtime_settings": nav2_settings,
         "mujoco_policy_frequency_hz": 1.0 / float(env.dt),
         "realtime_navigation_pacing": True,
+        "base_motion_mode": (
+            "nav2_path_teleport"
+            if args.teleport_navigation
+            else "physical_locomotion_policy"
+        ),
+        "teleport_navigation": {
+            "enabled": bool(args.teleport_navigation),
+            "every_steps": args.teleport_every_steps,
+            "path_spacing_m": args.teleport_step_distance,
+            "plan_timeout_s": args.teleport_plan_timeout,
+            "n2m_transition": "direct_single_reset",
+            "carried_object_transform": "preserve_base_relative_se2",
+        },
         "bridge_feedback_timeout_s": bridge_feedback_timeout,
         "policy_path": str(Path(args.policy_path).expanduser().resolve()),
         "checkpoint": str(args.n2m_checkpoint.expanduser().resolve()),
@@ -3405,8 +5129,36 @@ def main() -> int:
                 math.radians(args.nav_max_bearing_deg),
             )
         ),
+        "nav_command_conditioning": {
+            "scope": "all_nav2_to_locomotion_policy_segments",
+            "yaw_filter_tau_s": NAV_CMD_YAW_FILTER_TAU_S,
+            "turn_slowdown_start_radps": (
+                NAV_CMD_TURN_SLOWDOWN_START_RADPS
+            ),
+            "turn_slowdown_full_radps": (
+                NAV_CMD_TURN_SLOWDOWN_FULL_RADPS
+            ),
+            "turn_min_speed_scale": NAV_CMD_TURN_MIN_SPEED_SCALE,
+            "linear_accel_limit_mps2": NAV_CMD_LINEAR_ACCEL_LIMIT_MPS2,
+            "yaw_accel_limit_radps2": NAV_CMD_YAW_ACCEL_LIMIT_RADPS2,
+            "all_zero_command_is_immediate_stop": True,
+        },
+        "navigation_snapshots": {
+            "every_steps": args.nav_snapshot_every,
+            "output_dir": str(args.nav_snapshot_dir.expanduser().resolve()),
+            "map_yaml": str(args.nav_snapshot_map.expanduser().resolve()),
+            "source": "nav2_/plan",
+        },
+        "door_navigation": {
+            "mode": "standard_nav2_global_path",
+            "special_door_waypoints": False,
+            "special_door_controller": False,
+            "collision_guard": "mujoco_environment_contact",
+        },
         "manipulation_pose_transition": (
-            "cube_radial_predock_then_joint_pan_xy_yaw_to_n2m_terminal_region"
+            "direct_mujoco_pose_reset_to_n2m_m"
+            if args.teleport_navigation
+            else "cube_radial_predock_then_joint_pan_xy_yaw_to_n2m_terminal_region"
         ),
         "predock": {
             "distance_m": args.predock_distance,
@@ -3632,6 +5384,231 @@ def main() -> int:
                 "hold_radius": terminal_region["hold_radius"],
                 "slow_radius": terminal_region["slow_radius"],
             }
+            if args.teleport_navigation:
+                if needs_retraction:
+                    runner.debug_dir = (
+                        output_dir
+                        / "debug"
+                        / f"m_{queue_index:04d}"
+                        / "transition"
+                    )
+                    runner.retract_for_reposition()
+                    runner.weld.disable()
+                    needs_retraction = False
+
+                preflight = preflight_teleport_pose(
+                    env, runner, candidate["base_pose"]
+                )
+                preflight_row = {
+                    "created_at": _utc_now(),
+                    "queue_index": queue_index,
+                    "candidate_id": candidate["candidate_id"],
+                    "base_pose": candidate["base_pose"],
+                    "selection": queue_row["selection"],
+                    "terminal_region": terminal_region_summary,
+                    "initial_log_density": queue_row["initial_log_density"],
+                    **preflight,
+                }
+                append_jsonl(
+                    output_dir / "collision_preflights.jsonl",
+                    preflight_row,
+                )
+                if not preflight["passed"]:
+                    collision_rejected_m_count += 1
+                    append_jsonl(
+                        output_dir / "m_summaries.jsonl",
+                        {
+                            **preflight_row,
+                            "status": "collision_rejected",
+                            "attempts": 0,
+                        },
+                    )
+                    print(
+                        f"[N2M][M_REJECTED] queue={queue_index} "
+                        f"candidate={candidate['candidate_id']} "
+                        "reason=final_teleport_pose_collision "
+                        f"contacts={preflight['environment_contacts']}",
+                        flush=True,
+                    )
+                    continue
+
+                attempted_m_count += 1
+                transition_cube_before = runner.current_object_pose()
+                teleport_metrics = _teleport_base_pose(
+                    env,
+                    candidate["base_pose"],
+                    root_z=runner.cfg.robot_root_z,
+                    root_roll=runner.cfg.robot_root_roll,
+                    root_pitch=runner.cfg.robot_root_pitch,
+                    weld=runner.weld,
+                )
+                transition_cube_after = runner.current_object_pose()
+                transition_translation, transition_rotation = pose_motion(
+                    transition_cube_before, transition_cube_after
+                )
+                actual_base_pose = _base_pose_from_state(
+                    env.get_robot_state()
+                )
+                pose_error = np.asarray(
+                    candidate["base_pose"], dtype=np.float64
+                ) - actual_base_pose
+                pose_error[2] = _wrap_angle(float(pose_error[2]))
+                dock_metrics = {
+                    "mode": "direct_mujoco_pose_reset",
+                    "xy_error_m": float(np.linalg.norm(pose_error[:2])),
+                    "longitudinal_error_m": 0.0,
+                    "lateral_error_m": 0.0,
+                    "yaw_error_rad": abs(float(pose_error[2])),
+                    **teleport_metrics,
+                }
+                execution_candidate = dict(candidate)
+                execution_candidate["n2m_target_base_pose"] = list(
+                    candidate["base_pose"]
+                )
+                execution_candidate["base_pose"] = actual_base_pose.tolist()
+                execution_candidate["predock_pose"] = None
+                execution_candidate["terminal_region"] = (
+                    terminal_region_summary
+                )
+                transition_metrics = {
+                    "created_at": _utc_now(),
+                    "kind": "direct_teleport_to_m",
+                    "queue_index": queue_index,
+                    "candidate_id": candidate["candidate_id"],
+                    "n2m_target_base_pose": candidate["base_pose"],
+                    "actual_base_pose": actual_base_pose.tolist(),
+                    "predock_pose": None,
+                    "terminal_region": terminal_region_summary,
+                    "dock": dock_metrics,
+                    "cube_pose_before": transition_cube_before,
+                    "cube_pose_after": transition_cube_after,
+                    "cube_motion_m": transition_translation,
+                    "cube_rotation_rad": transition_rotation,
+                }
+                append_jsonl(
+                    output_dir / "motion_transitions.jsonl",
+                    transition_metrics,
+                )
+                print(
+                    f"[N2M][M_TELEPORTED] attempted_m="
+                    f"{attempted_m_count}/{args.n2m_max_candidates} "
+                    f"queue={queue_index} target="
+                    f"{np.round(candidate['base_pose'], 4)} actual="
+                    f"{np.round(actual_base_pose, 4)} "
+                    f"xy_error={dock_metrics['xy_error_m']:.4f}m "
+                    f"yaw_error="
+                    f"{math.degrees(dock_metrics['yaw_error_rad']):.3f}deg",
+                    flush=True,
+                )
+
+                selected_candidate = execution_candidate
+                active_predock_pose = None
+                active_execution_candidate = execution_candidate
+                runner.weld.enable()
+                m_success = False
+                m_last_failure = None
+                m_attempts = 0
+                print(
+                    f"[N2M][M_START] attempted_m={attempted_m_count}/"
+                    f"{args.n2m_max_candidates} queue={queue_index} "
+                    "transition=direct_teleport",
+                    flush=True,
+                )
+                for local_attempt in range(int(args.max_grasp_attempts)):
+                    runner.debug_dir = (
+                        output_dir
+                        / "debug"
+                        / f"m_{queue_index:04d}"
+                        / f"attempt_{local_attempt:04d}"
+                    )
+                    result = runner.run_preserved_attempt(
+                        execution_candidate, global_attempt
+                    )
+                    row = result.to_dict()
+                    row.update(
+                        {
+                            "created_at": _utc_now(),
+                            "observation_id": prediction["observation_id"],
+                            "queue_index": queue_index,
+                            "attempted_m_index": attempted_m_count - 1,
+                            "attempt_within_m": local_attempt,
+                            "selection": queue_row["selection"],
+                            "initial_log_density": queue_row[
+                                "initial_log_density"
+                            ],
+                        }
+                    )
+                    append_jsonl(
+                        output_dir / "manipulation_attempts.jsonl", row
+                    )
+                    result_rows.append(row)
+                    global_attempt += 1
+                    m_attempts += 1
+                    needs_retraction = True
+                    m_last_failure = (
+                        None
+                        if result.success
+                        else f"{result.failure_stage}:{result.failure_reason}"
+                    )
+                    print(
+                        f"[N2M][GRASP_ATTEMPT] global={global_attempt}/"
+                        f"{args.n2m_max_candidates * args.max_grasp_attempts} "
+                        f"m={attempted_m_count}/{args.n2m_max_candidates} "
+                        f"local={local_attempt + 1}/"
+                        f"{args.max_grasp_attempts} success={result.success} "
+                        f"completed={result.completed_stage} "
+                        f"failure={m_last_failure}",
+                        flush=True,
+                    )
+                    if result.success:
+                        m_success = True
+                        lift_succeeded = True
+                        outcome = "lift_success"
+                        selected_candidate = dict(execution_candidate)
+                        selected_candidate["cube_pose_after_lift"] = (
+                            runner.current_object_pose()
+                        )
+                        break
+                    if result.failure_stage == "OPERATOR":
+                        if controller.quit:
+                            raise KeyboardInterrupt
+                        break
+                    if result.failure_stage in {
+                        "SAFETY",
+                        "INTERNAL",
+                        "EPISODE",
+                    }:
+                        outcome = "fatal_manipulation_failure"
+                        fatal = True
+                        break
+
+                append_jsonl(
+                    output_dir / "m_summaries.jsonl",
+                    {
+                        "created_at": _utc_now(),
+                        "queue_index": queue_index,
+                        "attempted_m_index": attempted_m_count - 1,
+                        "candidate_id": candidate["candidate_id"],
+                        "n2m_target_base_pose": candidate["base_pose"],
+                        "actual_base_pose": execution_candidate["base_pose"],
+                        "predock_pose": None,
+                        "transition": "direct_teleport",
+                        "status": (
+                            "success"
+                            if m_success
+                            else "fatal_failure"
+                            if fatal
+                            else "attempts_exhausted"
+                        ),
+                        "attempts": m_attempts,
+                        "last_failure": m_last_failure,
+                        "cube_pose_after": runner.current_object_pose(),
+                    },
+                )
+                if m_success or fatal:
+                    break
+                continue
+
             if needs_retraction:
                 runner.debug_dir = output_dir / "debug" / f"m_{queue_index:04d}" / "transition"
                 runner.retract_for_reposition()
@@ -3760,6 +5737,7 @@ def main() -> int:
                     nav2_settings=nav2_settings,
                     max_steps=args.predock_nav_max_steps,
                     position_tolerance_m=args.predock_nav_tolerance,
+                    snapshot_writer=args.nav_snapshot_writer,
                 )
             finally:
                 # stop() is idempotent and also reaps a child from a partially
@@ -4113,6 +6091,11 @@ def main() -> int:
                 destination_max_steps=args.destination_max_steps,
                 render=args.render,
                 nav2_settings=nav2_settings,
+                snapshot_writer=args.nav_snapshot_writer,
+                teleport_navigation=args.teleport_navigation,
+                teleport_every_steps=args.teleport_every_steps,
+                teleport_step_distance=args.teleport_step_distance,
+                teleport_plan_timeout=args.teleport_plan_timeout,
             )
             write_json(output_dir / "delivery_result.json", delivery_metrics)
             outcome = "task_success"

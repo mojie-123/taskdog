@@ -24,15 +24,21 @@ from custom_envs.scripts.navigation.navigate_mujoco_n2m import (
     PAN_SETTLE_WINDOW_FRAMES,
     PAN_SETTLE_YAW_RATE,
     AttachedPersistentGraspRunner,
+    NavCommandConditioner,
     _approach_frame_position_errors,
     _body_frame_xy_error,
     _clip_nav_command,
+    _door_cross_control_command,
+    _door_point_approach_command,
+    _kitchen_living_door_plan,
     _new_pan_xy_control_state,
     _n2m_candidate_terminal_region,
     _observation_yaw_capture_step,
     _pan_world_xy_control_step,
     _pose_window_motion_rates,
+    _resample_navigation_path,
     _update_progress_watchdog,
+    _wxyz_multiply,
     build_predock_pose_options,
     build_parser,
     load_nav2_runtime_settings,
@@ -87,6 +93,97 @@ class NavigationTargetTests(unittest.TestCase):
                 captured, math.radians(6.1), maximum
             )
         )
+
+    def test_nav_path_resampling_uses_fixed_spacing_and_exact_goal(self):
+        samples = _resample_navigation_path(
+            [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]],
+            [0.0, 0.0],
+            [1.0, 1.0],
+            0.4,
+        )
+        np.testing.assert_allclose(samples[-1], [1.0, 1.0], atol=1e-12)
+        self.assertEqual(len(samples), 5)
+        steps = np.linalg.norm(
+            np.diff(np.vstack(([0.0, 0.0], samples)), axis=0), axis=1
+        )
+        self.assertTrue(np.all(steps <= 0.4 + 1e-12))
+
+    def test_wxyz_multiply_rotates_yaw_without_losing_unit_norm(self):
+        yaw_90 = np.array([math.sqrt(0.5), 0.0, 0.0, math.sqrt(0.5)])
+        product = _wxyz_multiply(yaw_90, yaw_90)
+        np.testing.assert_allclose(product, [0.0, 0.0, 0.0, 1.0], atol=1e-12)
+
+    def test_kitchen_living_door_plan_only_crosses_horizontal_wall(self):
+        southbound = _kitchen_living_door_plan([12.0, 12.0], [6.2, 4.7])
+        self.assertIsNotNone(southbound)
+        self.assertEqual(southbound["direction_name"], "kitchen_to_living")
+        np.testing.assert_allclose(
+            southbound["approach_pose"], [4.0, 6.85, -math.pi / 2]
+        )
+        np.testing.assert_allclose(
+            southbound["exit_pose"], [4.0, 5.15, -math.pi / 2]
+        )
+
+        northbound = _kitchen_living_door_plan([2.0, 3.0], [4.0, 8.0])
+        self.assertEqual(northbound["direction_name"], "living_to_kitchen")
+        np.testing.assert_allclose(
+            northbound["approach_pose"], [4.0, 5.15, math.pi / 2]
+        )
+        np.testing.assert_allclose(
+            northbound["exit_pose"], [4.0, 6.85, math.pi / 2]
+        )
+
+        self.assertIsNone(
+            _kitchen_living_door_plan([1.6, 1.6], [4.1, 4.8])
+        )
+
+    def test_door_cross_command_is_forward_only_and_centers_heading(self):
+        plan = _kitchen_living_door_plan([12.0, 12.0], [6.2, 4.7])
+        command, diagnostics = _door_cross_control_command(
+            [4.08, 6.50, -math.pi / 2], plan
+        )
+        self.assertGreater(command[0], 0.0)
+        self.assertEqual(command[1], 0.0)
+        self.assertLess(command[2], 0.0)
+        self.assertFalse(diagnostics["tracking_warning"])
+
+        command, diagnostics = _door_cross_control_command(
+            [4.0, 5.10, -math.pi / 2], plan
+        )
+        self.assertEqual(command, (0.0, 0.0, 0.0))
+        self.assertTrue(diagnostics["done"])
+
+        command, diagnostics = _door_cross_control_command(
+            [4.30, 6.0, -math.pi / 2], plan
+        )
+        self.assertGreater(command[0], 0.0)
+        self.assertEqual(command[1], 0.0)
+        self.assertTrue(diagnostics["tracking_warning"])
+
+    def test_door_point_approach_never_strafes_or_reverses(self):
+        command, captured, diagnostics = _door_point_approach_command(
+            [4.466, 6.846, math.radians(177.6)],
+            [4.0, 6.85],
+            captured=False,
+        )
+        self.assertFalse(captured)
+        self.assertEqual(diagnostics["mode"], "forward")
+        self.assertAlmostEqual(command[0], 0.45)
+        self.assertEqual(command[1], 0.0)
+
+        command, captured, diagnostics = _door_point_approach_command(
+            [4.466, 6.846, 0.0], [4.0, 6.85], captured=False
+        )
+        self.assertFalse(captured)
+        self.assertEqual(diagnostics["mode"], "turn")
+        self.assertEqual(command[0], 0.0)
+        self.assertEqual(command[1], 0.0)
+
+        command, captured, diagnostics = _door_point_approach_command(
+            [4.09, 6.85, 0.0], [4.0, 6.85], captured=False
+        )
+        self.assertTrue(captured)
+        self.assertEqual(command, (0.0, 0.0, 0.0))
 
 
 class RuntimeGeometryTests(unittest.TestCase):
@@ -622,6 +719,19 @@ class BridgeProtocolTests(unittest.TestCase):
         self.assertEqual(sent, [{"type": "cancel_goal"}])
         self.assertEqual((bridge._vx, bridge._omega_z), (0.0, 0.0))
 
+    def test_global_plan_feedback_is_exposed_as_a_copy(self):
+        bridge = IsaacROS2Bridge()
+        bridge._feedback_q.put(
+            {
+                "global_path": [[1.0, 2.0], [3.0, 4.0]],
+                "path_revision": 7,
+            }
+        )
+        path = bridge.get_global_path()
+        self.assertEqual(path, [[1.0, 2.0], [3.0, 4.0]])
+        path[0][0] = 99.0
+        self.assertEqual(bridge.get_global_path()[0][0], 1.0)
+
 
 class IntegratedPipelineArgumentTests(unittest.TestCase):
     def test_default_recovery_budget_is_three_m_times_three_attempts(self):
@@ -647,6 +757,31 @@ class IntegratedPipelineArgumentTests(unittest.TestCase):
         self.assertEqual(args.dock_yaw_tolerance_deg, 4.0)
         self.assertEqual(args.dock_pulse_steps, 8)
         self.assertEqual(args.dock_max_cycles, 120)
+        self.assertEqual(args.nav_snapshot_every, 200)
+        self.assertTrue(args.teleport_navigation)
+        self.assertEqual(args.teleport_every_steps, 5)
+        self.assertEqual(args.teleport_step_distance, 0.08)
+
+    def test_teleport_navigation_alias_enables_pose_reset_mode(self):
+        args = build_parser().parse_args(
+            [
+                "--policy_path",
+                "policy.pt",
+                "--grasp-checkpoint",
+                "grasp.tar",
+                "--destination",
+                "12.0",
+                "12.0",
+                "--teleport",
+                "--teleport-every-steps",
+                "7",
+                "--teleport-step-distance",
+                "0.1",
+            ]
+        )
+        self.assertTrue(args.teleport_navigation)
+        self.assertEqual(args.teleport_every_steps, 7)
+        self.assertEqual(args.teleport_step_distance, 0.1)
 
     def test_test_script_argument_aliases_are_supported(self):
         args = build_parser().parse_args(
@@ -689,6 +824,38 @@ class Nav2RuntimeSettingTests(unittest.TestCase):
             _clip_nav_command(1.7, -2.2, self.settings),
             (0.8, -1.0),
         )
+
+    def test_nav_command_conditioner_rejects_alternating_yaw_chatter(self):
+        conditioner = NavCommandConditioner(0.02)
+        outputs = []
+        # Model a 10 Hz bridge command whose steering sign flips on every
+        # update while the apparent route remains nearly straight.
+        for step in range(200):
+            sign = 1.0 if (step // 5) % 2 == 0 else -1.0
+            _, wz, _ = conditioner.step(0.5, sign * 0.18)
+            outputs.append(wz)
+        self.assertLess(max(abs(value) for value in outputs), 0.08)
+
+    def test_nav_command_conditioner_preserves_sustained_small_correction(self):
+        conditioner = NavCommandConditioner(0.02)
+        outputs = [conditioner.step(0.5, 0.18)[1] for _ in range(200)]
+        self.assertGreater(outputs[-1], 0.17)
+
+    def test_nav_command_conditioner_preserves_sustained_turn(self):
+        conditioner = NavCommandConditioner(0.02)
+        vx = wz = 0.0
+        for _ in range(75):
+            vx, wz, _ = conditioner.step(0.5, 0.4)
+        self.assertAlmostEqual(vx, 0.35, places=2)
+        self.assertGreater(wz, 0.35)
+
+    def test_nav_command_conditioner_stops_immediately_on_zero(self):
+        conditioner = NavCommandConditioner(0.02)
+        for _ in range(50):
+            conditioner.step(0.5, 0.4)
+        vx, wz, diagnostics = conditioner.step(0.0, 0.0)
+        self.assertEqual((vx, wz), (0.0, 0.0))
+        self.assertTrue(diagnostics["hard_stop"])
 
     def test_progress_watchdog_uses_yaml_allowance(self):
         state = {

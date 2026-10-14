@@ -11,6 +11,7 @@ ROS 侧职责：
 * 以 50 Hz 发布仿真真值 ``odom -> base_link`` TF 和 ``/odom``；
 * 用 ``BasicNavigator`` 发送 NavigateToPose action；
 * 订阅 velocity_smoother 的最终 ``/cmd_vel``；
+* 订阅 PlannerServer 的 ``/plan`` 并转发给主进程；
 * 对陈旧速度命令做 watchdog 归零。
 
 This script MUST be executed with /usr/bin/python3.10 so that rclpy
@@ -28,6 +29,7 @@ Protocol: newline-delimited JSON on stdin/stdout.
     {"init_failed":true}                               -- emitted once on import error
     {"vx":float,"omega_z":float,
      "nav_done":bool,"nav_failed":bool}                -- emitted every publish cycle
+    {"global_path":[[x,y],...],"path_revision":int}     -- emitted on every new /plan
 
 All diagnostic prints go to stderr (visible in parent terminal).
 """
@@ -88,7 +90,7 @@ def main() -> None:
             QoSProfile, QoSReliabilityPolicy,
             QoSDurabilityPolicy, QoSHistoryPolicy)
         from geometry_msgs.msg import Twist, TransformStamped, PoseStamped
-        from nav_msgs.msg import Odometry
+        from nav_msgs.msg import Odometry, Path
         from tf2_ros import TransformBroadcaster, StaticTransformBroadcaster
         from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
     except ImportError as exc:
@@ -133,6 +135,8 @@ def main() -> None:
     _nav_done    = False
     _nav_failed  = False
     _task_active = False
+    _global_path: list = []
+    _path_revision = 0
     _stop        = False
     _pending_goal: list = []
     _pending_cancel = False
@@ -143,6 +147,7 @@ def main() -> None:
     # 导航任务（NAV2_DEST）在 send_goal 后立刻读到陈旧 true 而"秒完成"。
     _last_nd_out = None
     _last_nf_out = None
+    _last_path_revision_out = -1
 
     def _cmd_cb(msg: Twist) -> None:
         nonlocal _vx, _omega_z, _last_cmd_t
@@ -153,6 +158,21 @@ def main() -> None:
     # 只接收 velocity_smoother 的最终输出。controller_server 与
     # behavior_server 都先发布到 /cmd_vel_nav，再由平滑器输出 /cmd_vel。
     node.create_subscription(Twist, "/cmd_vel", _cmd_cb, 10)   # 订阅平滑后的速度指令
+
+    def _plan_cb(msg: Path) -> None:
+        nonlocal _global_path, _path_revision
+        points = [
+            [float(pose.pose.position.x), float(pose.pose.position.y)]
+            for pose in msg.poses
+        ]
+        with _lock:
+            _global_path = points
+            _path_revision += 1
+
+    # PlannerServer publishes every newly computed global plan here.  Sending
+    # the exact ROS plan to the parent lets diagnostic figures show replanning
+    # and doorway selection instead of drawing a guessed straight segment.
+    node.create_subscription(Path, "/plan", _plan_cb, 10)
 
     # -----------------------------------------------------------------------
     # BasicNavigator — do NOT call waitUntilNav2Active() here because TF
@@ -292,6 +312,8 @@ def main() -> None:
                 _nav_done    = False
                 _nav_failed  = False
                 _task_active = True
+                _global_path = []
+                _path_revision += 1
 
         # Spin ROS once
         try:
@@ -409,6 +431,16 @@ def main() -> None:
         if (nd_out, nf_out) != (_last_nd_out, _last_nf_out):
             _emit({"nav_done": nd_out, "nav_failed": nf_out})
             _last_nd_out, _last_nf_out = nd_out, nf_out
+
+        with _lock:
+            path_revision_out = _path_revision
+            path_out = list(_global_path)
+        if path_revision_out != _last_path_revision_out:
+            _emit({
+                "global_path": path_out,
+                "path_revision": path_revision_out,
+            })
+            _last_path_revision_out = path_revision_out
 
         time.sleep(0.001)
 
