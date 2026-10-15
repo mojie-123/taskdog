@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Protocol
 
+import cv2
 import numpy as np
 
 from .config import SearchConfig
@@ -48,7 +49,45 @@ class SemanticReasoner(Protocol):
         *,
         room_description: str = "",
         nearby_objects=(),
+        candidate_crop_rgb: np.ndarray | None = None,
+        candidate_clipped_by_image_edge: bool = False,
     ) -> TargetVerification: ...
+
+
+def _candidate_crop(
+    outlined_image_rgb: np.ndarray,
+    bbox_xyxy: tuple[float, float, float, float],
+) -> np.ndarray:
+    """Return a context crop for VLM inspection, without applying a size rule."""
+
+    image = np.asarray(outlined_image_rgb)
+    height, width = image.shape[:2]
+    x1, y1, x2, y2 = bbox_xyxy
+    box_width = max(1.0, x2 - x1)
+    box_height = max(1.0, y2 - y1)
+    crop_width = max(64.0, 1.5 * box_width)
+    crop_height = max(64.0, 1.5 * box_height)
+    center_x = 0.5 * (x1 + x2)
+    center_y = 0.5 * (y1 + y2)
+    left = max(0, int(np.floor(center_x - 0.5 * crop_width)))
+    right = min(width, int(np.ceil(center_x + 0.5 * crop_width)))
+    top = max(0, int(np.floor(center_y - 0.5 * crop_height)))
+    bottom = min(height, int(np.ceil(center_y + 0.5 * crop_height)))
+    crop = np.ascontiguousarray(image[top:bottom, left:right])
+    if crop.size == 0:
+        return np.ascontiguousarray(image).copy()
+    # Upscaling only improves VLM visibility; it is not used as an acceptance
+    # criterion and therefore introduces no object-size prior.
+    scale = max(1.0, 256.0 / float(max(crop.shape[:2])))
+    if scale > 1.0:
+        crop = cv2.resize(
+            crop,
+            dsize=None,
+            fx=scale,
+            fy=scale,
+            interpolation=cv2.INTER_NEAREST,
+        )
+    return crop
 
 
 class SysNavSearchPolicy:
@@ -200,9 +239,11 @@ class SysNavSearchPolicy:
             return TargetVerification(False, "detector label does not match target object")
         if detection.confidence < self.config.target_accept_confidence:
             return TargetVerification(False, "detector confidence is below acceptance threshold")
-        if not self.instruction.needs_vlm_verification:
-            return TargetVerification(True, "class-only instruction accepted by detector")
         if self.reasoner is None:
+            if not self.instruction.needs_vlm_verification:
+                return TargetVerification(
+                    True, "class-only instruction accepted without a configured VLM"
+                )
             return TargetVerification(False, "task constraints require VLM verification")
         room_id = candidate.room_id or ""
         room_description = (
@@ -210,11 +251,29 @@ class SysNavSearchPolicy:
             if room_id in self.memory.rooms
             else ""
         )
-        nearby = self.memory.nearby_labels(candidate.position_world, 1.5)
+        nearby = tuple(
+            label
+            for label in self.memory.nearby_labels(candidate.position_world, 1.5)
+            if label != self.instruction.target_object
+        )
+        outlined = annotate_detection(frame_rgb, detection, show_label=False)
+        height, width = np.asarray(frame_rgb).shape[:2]
+        x1, y1, x2, y2 = detection.bbox_xyxy
+        edge_tolerance_px = 2.0
+        clipped_by_edge = bool(
+            x1 <= edge_tolerance_px
+            or y1 <= edge_tolerance_px
+            or x2 >= width - edge_tolerance_px
+            or y2 >= height - edge_tolerance_px
+        )
         return self.reasoner.verify_target(
             self.instruction,
             detection.label,
-            annotate_detection(frame_rgb, detection),
+            outlined,
             room_description=room_description,
             nearby_objects=nearby,
+            # Keep the location cue in the full scene, but do not let the
+            # artificial green contour dominate a tiny target's clean crop.
+            candidate_crop_rgb=_candidate_crop(frame_rgb, detection.bbox_xyxy),
+            candidate_clipped_by_image_edge=clipped_by_edge,
         )

@@ -54,6 +54,8 @@ def test_parser_adds_sysnav_options_without_changing_legacy_defaults():
     assert args.sysnav_retry_min_view_angle_deg == 60.0
     assert args.sysnav_max_direct_goal_distance == 6.0
     assert not args.sysnav_disable_obstacle_edge_view
+    assert not args.sysnav_disable_transit_detection
+    assert args.sysnav_transit_detection_hz is None
 
 
 def test_navfn_uses_dijkstra_for_stable_long_path_extraction():
@@ -152,6 +154,42 @@ def test_path_fraction_pose_ignores_duplicate_nav2_poses():
     # navigation leg starts in the continuation direction.
     np.testing.assert_allclose(pose, [2.0, 0.0, np.pi / 2.0])
     assert total_length == pytest.approx(4.0)
+
+
+def test_long_navigation_does_not_start_second_leg_after_transit_interrupt(
+    monkeypatch,
+):
+    class FakeEnv:
+        def get_robot_state(self):
+            return {"pos": np.array([0.0, 0.0, 0.58]), "yaw": 0.0}
+
+    class FakeBridge:
+        def plan_path(self, start_xy, goal_xy, *, timeout):
+            return [[0.0, 0.0], [4.0, 0.0], [8.0, 0.0]]
+
+    args = Namespace(
+        teleport_navigation=True,
+        sysnav_max_direct_goal_distance=6.0,
+        teleport_plan_timeout=15.0,
+    )
+    navigator = _LegacySearchNavigator(FakeEnv(), FakeBridge(), args, object())
+    calls = []
+
+    def interrupted(target, *, name):
+        calls.append((np.asarray(target).copy(), name))
+        return {
+            "mode": "nav2_path_teleport",
+            "interrupted_for_transit_candidate": True,
+            "elapsed_s": 0.1,
+        }
+
+    monkeypatch.setattr(navigator, "_move_once", interrupted)
+    result = navigator.move_to((8.0, 0.0, 0.0), name="SEARCH")
+
+    assert len(calls) == 1
+    assert calls[0][1] == "SEARCH_MIDPOINT"
+    assert result["interrupted_for_transit_candidate"]
+    assert result["split_strategy"] == "nav2_path_arclength"
 
 
 def test_long_sysnav_navigation_stops_when_full_path_is_unavailable():

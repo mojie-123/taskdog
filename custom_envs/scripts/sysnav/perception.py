@@ -185,7 +185,12 @@ class YOLOESAM2Perceptor:
             pass
 
 
-def annotate_detection(image_rgb: np.ndarray, detection: Detection2D) -> np.ndarray:
+def annotate_detection(
+    image_rgb: np.ndarray,
+    detection: Detection2D,
+    *,
+    show_label: bool = True,
+) -> np.ndarray:
     """Draw the candidate contour and label used for VLM verification/debugging."""
 
     output = np.asarray(image_rgb).copy()
@@ -193,15 +198,16 @@ def annotate_detection(image_rgb: np.ndarray, detection: Detection2D) -> np.ndar
         detection.mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
     )
     cv2.drawContours(output, contours, -1, (0, 255, 0), 2)
-    x1, y1, _, _ = detection.bbox_xyxy
-    cv2.putText(
-        output,
-        f"{detection.label} {detection.confidence:.2f}",
-        (max(0, int(x1)), max(18, int(y1) - 4)),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.55,
-        (0, 255, 0),
-        2,
-        cv2.LINE_AA,
-    )
+    if show_label:
+        x1, y1, _, _ = detection.bbox_xyxy
+        cv2.putText(
+            output,
+            f"{detection.label} {detection.confidence:.2f}",
+            (max(0, int(x1)), max(18, int(y1) - 4)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (0, 255, 0),
+            2,
+            cv2.LINE_AA,
+        )
     return output

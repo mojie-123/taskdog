@@ -14,6 +14,7 @@ from custom_envs.scripts.N2M.manifests import append_jsonl, write_json
 
 from .rgbd import RGBDFrame
 from .runtime import ObservationUpdate, SysNavComponents
+from .transit_detection import ConfirmedTransitCandidate, TransitCandidate
 from .types import LocalizedDetection, SearchInstruction
 
 
@@ -53,6 +54,14 @@ class SearchResult:
             "searched_rooms": list(self.searched_rooms),
             "final_robot_pose": list(self.final_robot_pose),
         }
+
+
+class _TransitTargetVerified(RuntimeError):
+    """Internal signal used to escape room/coverage loops after verification."""
+
+    def __init__(self, target: LocalizedDetection):
+        super().__init__("target verified from an in-motion observation")
+        self.target = target
 
 
 @dataclass(frozen=True)
@@ -126,6 +135,161 @@ class SysNavSearchRunner:
         path.parent.mkdir(parents=True, exist_ok=True)
         Image.fromarray(frame.rgb, mode="RGB").save(path)
         return str(path)
+
+    def _take_transit_candidate(self) -> TransitCandidate | None:
+        take = getattr(self.navigator, "take_transit_candidate", None)
+        return None if take is None else take()
+
+    def _commit_confirmed_transit(
+        self, confirmed: ConfirmedTransitCandidate
+    ) -> ObservationUpdate | None:
+        observation = confirmed.representative
+        room_id = observation.metric_room_id or confirmed.target.room_id
+        if room_id is None:
+            self._record_event(
+                "transit_scene_commit_skipped",
+                reason="robot and target are outside the anonymous room map",
+                sequence=observation.sequence,
+            )
+            return None
+        representative_target = (
+            confirmed.first.target
+            if observation is confirmed.first.observation
+            else confirmed.confirmation.target
+        )
+        localized = tuple(
+            confirmed.target if item is representative_target else item
+            for item in observation.localized_detections
+        )
+        return self.components.commit_observation(
+            observation.frame,
+            observation.robot_pose_world,
+            room_id,
+            observation.detections,
+            localized,
+            planned_viewpoint_index=None,
+            image_path=observation.image_path,
+        )
+
+    def _verify_transit_candidate(
+        self, candidate: TransitCandidate, *, navigation_name: str
+    ) -> str | None:
+        detector = getattr(self.navigator, "transit_detector", None)
+        if detector is None:
+            return
+        self._record_event(
+            "transit_candidate_detected",
+            navigation_name=navigation_name,
+            sequence=candidate.observation.sequence,
+            image_path=candidate.observation.image_path,
+            robot_pose_world=candidate.observation.robot_pose_world.tolist(),
+            position_world=candidate.target.position_world.tolist(),
+            confidence=candidate.target.detection.confidence,
+        )
+        confirmed = detector.confirm(
+            candidate,
+            self.navigator.current_pose(),
+            navigation_name=navigation_name,
+        )
+        if confirmed is None:
+            self._record_event(
+                "transit_candidate_confirmation_failed",
+                navigation_name=navigation_name,
+                sequence=candidate.observation.sequence,
+            )
+            return "not_confirmed"
+
+        # Persist only the observation viewpoint before verification.  The
+        # candidate itself must not enter the Object layer unless the VLM
+        # accepts the complete target instruction below.
+        update = self._commit_confirmed_transit(confirmed)
+        try:
+            decision = self.components.search_policy.verify_candidate(
+                confirmed.target,
+                confirmed.representative.frame.rgb,
+            )
+        except Exception as exc:
+            detector.defer(
+                confirmed.target.position_world,
+                confirmed.representative.robot_pose_world,
+                verdict="not_confirmed",
+                reason=f"VLM verification failed: {type(exc).__name__}: {exc}",
+            )
+            self._record_event(
+                "transit_target_verification_failed",
+                navigation_name=navigation_name,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            return "not_confirmed"
+        scene_object_id = None
+        if decision.is_target and update is not None:
+            scene_object = self.components.commit_verified_detection(
+                update.viewpoint.viewpoint_id,
+                confirmed.target,
+            )
+            scene_object_id = scene_object.object_id
+        self._record_event(
+            "transit_target_verified",
+            navigation_name=navigation_name,
+            first_sequence=confirmed.first.observation.sequence,
+            confirmation_sequence=confirmed.confirmation.observation.sequence,
+            separation_m=confirmed.separation_m,
+            image_path=confirmed.representative.image_path,
+            position_world=confirmed.target.position_world.tolist(),
+            confidence=confirmed.target.detection.confidence,
+            room_id=confirmed.target.room_id,
+            is_target=decision.is_target,
+            verdict=decision.verdict,
+            reason=decision.reason,
+            scene_viewpoint_id=(
+                None if update is None else update.viewpoint.viewpoint_id
+            ),
+            scene_object_id=scene_object_id,
+        )
+        if decision.is_target:
+            raise _TransitTargetVerified(confirmed.target)
+        # The VLM keeps a three-way diagnostic verdict, but navigation has
+        # only two semantic outcomes: confirmed or not confirmed.  Any
+        # negative/ambiguous view is deduplicated from the same observer pose,
+        # never converted into a persistent spatial blacklist.
+        detector.defer(
+            confirmed.target.position_world,
+            confirmed.representative.robot_pose_world,
+            verdict=decision.verdict,
+            reason=f"VLM did not confirm candidate: {decision.reason}",
+        )
+        return "not_confirmed"
+
+    def _navigate_with_transit_detection(
+        self, pose: tuple[float, float, float], *, name: str
+    ) -> dict:
+        """Resume the same goal after non-confirmed transit candidates."""
+
+        interruptions: list[dict] = []
+        while True:
+            metrics = self.navigator.move_to(pose, name=name)
+            candidate = self._take_transit_candidate()
+            if candidate is None:
+                if interruptions:
+                    result = dict(metrics)
+                    result["transit_interruptions"] = interruptions
+                    return result
+                return metrics
+            interruptions.append(
+                {
+                    "sequence": candidate.observation.sequence,
+                    "position_world": candidate.target.position_world.tolist(),
+                    "confidence": candidate.target.detection.confidence,
+                }
+            )
+            verdict = self._verify_transit_candidate(candidate, navigation_name=name)
+            self._record_event(
+                "navigation_resumed_after_transit_review",
+                navigation_name=name,
+                goal=list(pose),
+                interruption_count=len(interruptions),
+                verdict=verdict,
+            )
 
     def _remember_room_image(
         self,
@@ -271,6 +435,7 @@ class SysNavSearchRunner:
                 confidence=candidate.detection.confidence,
                 room_id=candidate.room_id,
                 is_target=decision.is_target,
+                verdict=decision.verdict,
                 reason=decision.reason,
                 position_world=candidate.position_world.astype(float).tolist(),
             )
@@ -313,6 +478,19 @@ class SysNavSearchRunner:
         )
         self._describe_room(viewed_room, frame, update, image_path)
         target = self._verify_targets(frame, update.localized_detections)
+        if target is not None:
+            scene_object = self.components.commit_verified_detection(
+                update.viewpoint.viewpoint_id,
+                target,
+            )
+            self._record_event(
+                "verified_object_committed",
+                viewpoint_id=update.viewpoint.viewpoint_id,
+                object_id=scene_object.object_id,
+                label=scene_object.label,
+                room_id=scene_object.room_id,
+                position_world=scene_object.position_world.astype(float).tolist(),
+            )
         self._record_event(
             "observation",
             room_id=room_id,
@@ -359,7 +537,9 @@ class SysNavSearchRunner:
         active = current_room
         for next_room in path[1:]:
             anchor = self.components.room_graph.execution_anchor(active, next_room)
-            metrics = self.navigator.move_to(anchor, name=f"ROOM_{active}_TO_{next_room}")
+            metrics = self._navigate_with_transit_detection(
+                anchor, name=f"ROOM_{active}_TO_{next_room}"
+            )
             self._record_event(
                 "room_entered",
                 source_room=active,
@@ -408,7 +588,7 @@ class SysNavSearchRunner:
                 continue
             self._peeked_edges.add(edge)
             pose = self._portal_peek_pose(current_room, nearby_room)
-            metrics = self.navigator.move_to(
+            metrics = self._navigate_with_transit_detection(
                 pose, name=f"PEEK_{current_room}_TO_{nearby_room}"
             )
             self._viewpoint_count += 1
@@ -518,6 +698,20 @@ class SysNavSearchRunner:
         return result
 
     def run(self, instruction: SearchInstruction) -> SearchResult:
+        try:
+            return self._run_search(instruction)
+        except _TransitTargetVerified as verified:
+            return self._result(
+                found=True,
+                reason="target verified from in-motion observation",
+                target=verified.target,
+            )
+        finally:
+            detector = getattr(self.navigator, "transit_detector", None)
+            if detector is not None:
+                detector.save_summary()
+
+    def _run_search(self, instruction: SearchInstruction) -> SearchResult:
         self.components.search_policy.start(instruction)
         self.components.perception.set_prompts(instruction.detector_prompts)
         pose = self.navigator.current_pose()
@@ -568,7 +762,7 @@ class SysNavSearchRunner:
                         coverage=self.components.scene_memory.rooms[current_room].coverage,
                     )
                     break
-                navigation = self.navigator.move_to(
+                navigation = self._navigate_with_transit_detection(
                     viewpoint.pose,
                     name=f"SEARCH_{current_room}_{viewpoint.index:04d}",
                 )

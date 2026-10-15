@@ -202,14 +202,34 @@ class SceneMemory:
         room.viewpoint_ids.append(viewpoint_id)
         room.visited = True
         for detection in detections:
-            assigned_room = detection.room_id or room_id
-            if assigned_room not in self.rooms:
-                assigned_room = room_id
-            obj = self._add_or_update_object(
-                detection, assigned_room, viewpoint_id, timestamp
-            )
-            record.object_ids.append(obj.object_id)
+            self.attach_verified_detection(viewpoint_id, detection)
         return record
+
+    def attach_verified_detection(
+        self, viewpoint_id: str, detection: LocalizedDetection
+    ) -> ObjectRecord:
+        """Attach one VLM-approved object observation to an existing viewpoint.
+
+        Raw detector proposals must stay outside the persistent three-layer
+        representation.  Search code creates the viewpoint first and calls
+        this method only after semantic verification succeeds.
+        """
+
+        if viewpoint_id not in self.viewpoints:
+            raise KeyError(f"unknown viewpoint id: {viewpoint_id}")
+        viewpoint = self.viewpoints[viewpoint_id]
+        assigned_room = detection.room_id or viewpoint.room_id
+        if assigned_room not in self.rooms:
+            assigned_room = viewpoint.room_id
+        obj = self._add_or_update_object(
+            detection,
+            assigned_room,
+            viewpoint_id,
+            viewpoint.timestamp_s,
+        )
+        if obj.object_id not in viewpoint.object_ids:
+            viewpoint.object_ids.append(obj.object_id)
+        return obj
 
     def objects_by_label(self, label: str, *, room_id: str | None = None) -> list[ObjectRecord]:
         normalised = " ".join(str(label).strip().lower().split())

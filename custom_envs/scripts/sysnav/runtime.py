@@ -15,7 +15,7 @@ from .coverage import CoveragePlanner
 from .perception import YOLOESAM2Perceptor
 from .rgbd import DepthLocalizer, RGBDFrame
 from .room_graph import AnonymousRoomGraph
-from .scene_memory import SceneMemory, ViewpointRecord
+from .scene_memory import ObjectRecord, SceneMemory, ViewpointRecord
 from .search_policy import SysNavSearchPolicy
 from .types import Detection2D, LocalizedDetection
 from .vlm import QwenVLMClient
@@ -42,23 +42,36 @@ class SysNavComponents:
     localizer: DepthLocalizer
     search_policy: SysNavSearchPolicy
 
-    def process_observation(
+    def infer_observation(
+        self, frame: RGBDFrame
+    ) -> tuple[tuple[Detection2D, ...], tuple[LocalizedDetection, ...]]:
+        """Infer one RGB-D frame without changing coverage or scene memory."""
+
+        detections = tuple(self.perception.detect(frame.rgb))
+        localized = tuple(self.localizer.localize_all(frame, detections))
+        return detections, localized
+
+    def commit_observation(
         self,
         frame: RGBDFrame,
         robot_pose_world: tuple[float, float, float] | np.ndarray,
         room_id: str,
+        detections: tuple[Detection2D, ...],
+        localized: tuple[LocalizedDetection, ...],
         *,
         planned_viewpoint_index: int | None = None,
         image_path: str = "",
     ) -> ObservationUpdate:
-        """Run perception/localization and attach evidence to all three layers."""
+        """Attach a viewpoint and coverage, but keep proposals out of memory.
 
-        detections = self.perception.detect(frame.rgb)
-        localized = self.localizer.localize_all(frame, detections)
+        ``localized`` is returned for logging and VLM verification.  It is
+        intentionally not attached to the persistent Object layer here.
+        """
+
         viewpoint = self.scene_memory.add_viewpoint(
             room_id,
             robot_pose_world,
-            localized,
+            [],
             timestamp_s=frame.timestamp_s,
             image_path=image_path,
         )
@@ -69,9 +82,38 @@ class SysNavComponents:
             )
         return ObservationUpdate(
             viewpoint=viewpoint,
-            detections=tuple(detections),
-            localized_detections=tuple(localized),
+            detections=detections,
+            localized_detections=localized,
             coverage=coverage,
+        )
+
+    def commit_verified_detection(
+        self, viewpoint_id: str, detection: LocalizedDetection
+    ) -> ObjectRecord:
+        """Persist one object only after the semantic verifier accepts it."""
+
+        return self.scene_memory.attach_verified_detection(viewpoint_id, detection)
+
+    def process_observation(
+        self,
+        frame: RGBDFrame,
+        robot_pose_world: tuple[float, float, float] | np.ndarray,
+        room_id: str,
+        *,
+        planned_viewpoint_index: int | None = None,
+        image_path: str = "",
+    ) -> ObservationUpdate:
+        """Run perception/localization and persist only room/viewpoint state."""
+
+        detections, localized = self.infer_observation(frame)
+        return self.commit_observation(
+            frame,
+            robot_pose_world,
+            room_id,
+            detections,
+            localized,
+            planned_viewpoint_index=planned_viewpoint_index,
+            image_path=image_path,
         )
 
     def close(self) -> None:

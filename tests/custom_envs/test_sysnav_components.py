@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from custom_envs.scripts.N2M.data_generation.camera_geometry import CameraIntrinsics
 from custom_envs.scripts.map.nav2_map_io import load_nav2_map
@@ -12,18 +14,20 @@ from custom_envs.scripts.sysnav.config import load_sysnav_config
 from custom_envs.scripts.sysnav.coverage import CoveragePlanner
 from custom_envs.scripts.sysnav.rgbd import DepthLocalizer, RGBDFrame
 from custom_envs.scripts.sysnav.room_graph import AnonymousRoomGraph
-from custom_envs.scripts.sysnav.runtime import build_sysnav_components
+from custom_envs.scripts.sysnav.runtime import SysNavComponents, build_sysnav_components
 from custom_envs.scripts.sysnav.scene_memory import SceneMemory
 from custom_envs.scripts.sysnav.search_policy import SysNavSearchPolicy
 from custom_envs.scripts.sysnav.search_runner import (
     RoomImageEvidence,
     SysNavSearchRunner,
 )
+from custom_envs.scripts.sysnav.transit_detection import ContinuousTransitDetector
 from custom_envs.scripts.sysnav.types import (
     Detection2D,
     EarlyStopDecision,
     LocalizedDetection,
     SearchInstruction,
+    TargetVerification,
 )
 from custom_envs.scripts.sysnav.vlm import QwenVLMClient
 
@@ -69,6 +73,172 @@ def test_config_and_instruction_prompts():
     assert instruction.detector_prompts == ("cube", "coffee table")
     assert instruction.needs_vlm_verification
     assert config.search.early_stop_max_current_images == 4
+    assert config.search.target_accept_confidence == 0.20
+    assert config.transit_detection.enabled
+    assert config.transit_detection.frequency_hz == 2.0
+    assert config.transit_detection.candidate_dedup_radius_m == 0.30
+    assert config.transit_detection.reobserve_min_translation_m == 0.50
+    assert config.transit_detection.reobserve_min_yaw_deg == 20.0
+    assert config.transit_detection.save_images
+
+
+def test_transit_detector_saves_and_confirms_spatially_consistent_frames(tmp_path):
+    config = load_sysnav_config()
+    frame = RGBDFrame(
+        rgb=np.zeros((8, 8, 3), dtype=np.uint8),
+        depth=np.ones((8, 8), dtype=np.float32),
+        intrinsics=CameraIntrinsics.from_vertical_fov(8, 8, 90.0),
+        camera_position_world=np.zeros(3),
+        camera_rotation_world=np.eye(3),
+        camera_name="test",
+        timestamp_s=1.0,
+    )
+    positions = iter(([2.0, 2.0, 0.5], [2.08, 2.0, 0.5]))
+
+    class Components:
+        def __init__(self):
+            self.config = SimpleNamespace(search=config.search)
+            self.room_graph = SimpleNamespace(room_at=lambda x, y: "room_0")
+
+        def infer_observation(self, unused_frame):
+            target = _localized(next(positions), confidence=0.9)
+            return (target.detection,), (target,)
+
+    detector = ContinuousTransitDetector(
+        Components(),
+        lambda: frame,
+        tmp_path,
+        "cube",
+        config.transit_detection,
+    )
+    first = detector.sample(
+        (1.0, 1.0, 0.0), navigation_name="SEARCH", force=True
+    )
+    assert first is not None
+    confirmed = detector.confirm(
+        first, (1.0, 1.0, 0.0), navigation_name="SEARCH"
+    )
+    assert confirmed is not None
+    assert confirmed.separation_m == pytest.approx(0.08)
+    np.testing.assert_allclose(confirmed.target.position_world, [2.04, 2.0, 0.5])
+    assert (tmp_path / "images" / "transit_000001.png").is_file()
+    assert (tmp_path / "images" / "confirmation_000002.png").is_file()
+    assert (tmp_path / "annotated" / "transit_000001.png").is_file()
+    detector.save_summary()
+    summary = json.loads((tmp_path / "transit_summary.json").read_text())
+    assert summary["sample_count"] == 2
+    assert summary["candidate_count"] == 2
+    assert summary["confirmed_count"] == 1
+
+
+def test_transit_confirmation_failure_defers_only_the_same_view(tmp_path):
+    config = load_sysnav_config()
+    frame = RGBDFrame(
+        rgb=np.zeros((8, 8, 3), dtype=np.uint8),
+        depth=np.ones((8, 8), dtype=np.float32),
+        intrinsics=CameraIntrinsics.from_vertical_fov(8, 8, 90.0),
+        camera_position_world=np.zeros(3),
+        camera_rotation_world=np.eye(3),
+        camera_name="test",
+        timestamp_s=1.0,
+    )
+    responses = iter((True, False, True, True))
+
+    class Components:
+        def __init__(self):
+            self.config = SimpleNamespace(search=config.search)
+            self.room_graph = SimpleNamespace(room_at=lambda x, y: "room_0")
+
+        def infer_observation(self, unused_frame):
+            if not next(responses):
+                return (), ()
+            target = _localized([2.0, 2.0, 0.5], confidence=0.9)
+            return (target.detection,), (target,)
+
+    detector = ContinuousTransitDetector(
+        Components(),
+        lambda: frame,
+        tmp_path,
+        "cube",
+        config.transit_detection,
+    )
+    original_pose = np.array([1.0, 1.0, 0.0])
+    first = detector.sample(original_pose, navigation_name="SEARCH", force=True)
+    assert first is not None
+    assert detector.confirm(
+        first, original_pose, navigation_name="SEARCH"
+    ) is None
+
+    # The failed stationary confirmation is not immediately reviewed again
+    # from the same pose.
+    assert detector.sample(
+        original_pose, navigation_name="SEARCH", force=True
+    ) is None
+
+    # It remains eligible after a meaningful viewpoint change, even though
+    # the estimated target location is exactly the same.
+    moved_pose = np.array([1.6, 1.0, 0.0])
+    assert detector.sample(
+        moved_pose, navigation_name="SEARCH", force=True
+    ) is not None
+
+    detector.save_summary()
+    summary = json.loads((tmp_path / "transit_summary.json").read_text())
+    assert summary["schema_version"] == 2
+    assert summary["deferred_count"] == 1
+    assert summary["same_view_suppressed_count"] == 1
+    assert "rejected_positions" not in summary
+
+
+def test_transit_vlm_rejection_is_controlled_as_not_confirmed():
+    target = _localized([2.0, 2.0, 0.5], confidence=0.9)
+    frame = SimpleNamespace(rgb=np.zeros((8, 8, 3), dtype=np.uint8))
+    observation = SimpleNamespace(
+        sequence=1,
+        image_path="candidate.png",
+        robot_pose_world=np.array([1.0, 1.0, 0.0]),
+        frame=frame,
+    )
+    candidate = SimpleNamespace(observation=observation, target=target)
+    confirmed = SimpleNamespace(
+        first=candidate,
+        confirmation=candidate,
+        representative=observation,
+        target=target,
+        separation_m=0.0,
+    )
+
+    class Detector:
+        def __init__(self):
+            self.deferred = []
+
+        def confirm(self, *unused_args, **unused_kwargs):
+            return confirmed
+
+        def defer(self, *args, **kwargs):
+            self.deferred.append((args, kwargs))
+
+    detector = Detector()
+    runner = object.__new__(SysNavSearchRunner)
+    runner.navigator = SimpleNamespace(
+        transit_detector=detector,
+        current_pose=lambda: np.array([1.0, 1.0, 0.0]),
+    )
+    runner.components = SimpleNamespace(
+        search_policy=SimpleNamespace(
+            verify_candidate=lambda *unused: TargetVerification(
+                False, "visible wall panel", verdict="rejected"
+            )
+        )
+    )
+    runner._record_event = lambda *unused, **unused_kwargs: None
+    runner._commit_confirmed_transit = lambda unused: None
+
+    outcome = runner._verify_transit_candidate(candidate, navigation_name="SEARCH")
+
+    assert outcome == "not_confirmed"
+    assert len(detector.deferred) == 1
+    assert detector.deferred[0][1]["verdict"] == "rejected"
 
 
 def test_early_stop_vlm_receives_every_selected_room_view():
@@ -97,6 +267,183 @@ def test_early_stop_vlm_receives_every_selected_room_view():
     text = "\n".join(item["text"] for item in content if item["type"] == "text")
     assert "Current room view 3/3" in text
     assert "Nearby room view 1/1" in text
+
+
+def test_vlm_target_verification_rejects_identity_before_relation():
+    config = load_sysnav_config()
+    client = QwenVLMClient(config.vlm)
+    calls = []
+
+    def fake_parse(model, response_format, messages):
+        calls.append((response_format.__name__, messages))
+        return SimpleNamespace(
+            verdict="rejected",
+            reason="the outlined region is a wall panel, not a cube",
+        )
+
+    client._parse = fake_parse
+    image = np.zeros((64, 64, 3), dtype=np.uint8)
+    decision = client.verify_target(
+        SearchInstruction(
+            "去客厅茶几上拿 cube",
+            "cube",
+            room_condition="客厅",
+            spatial_condition="上",
+            anchor_object="茶几",
+        ),
+        "cube",
+        image,
+        candidate_crop_rgb=image,
+    )
+
+    assert not decision.is_target
+    assert decision.verdict == "rejected"
+    assert decision.reason.startswith("identity rejected:")
+    assert len(calls) == 1
+    assert calls[0][0] == "_TargetIdentityResult"
+    system_prompt = calls[0][1][0]["content"]
+    assert "untrusted detector proposal" in system_prompt
+    assert "Do not turn missing evidence into rejection" in system_prompt
+    image_items = [
+        item
+        for item in calls[0][1][1]["content"]
+        if item["type"] == "image_url"
+    ]
+    assert len(image_items) == 2
+
+
+def test_vlm_target_verification_runs_relation_only_after_identity_passes():
+    config = load_sysnav_config()
+    client = QwenVLMClient(config.vlm)
+    responses = iter(
+        (
+            SimpleNamespace(
+                verdict="confirmed",
+                reason="the outlined object is visibly a cube",
+            ),
+            SimpleNamespace(
+                verdict="rejected",
+                reason="the outlined cube is not visibly on the table",
+            ),
+        )
+    )
+    calls = []
+
+    def fake_parse(model, response_format, messages):
+        calls.append((response_format.__name__, messages))
+        return next(responses)
+
+    client._parse = fake_parse
+    image = np.zeros((64, 64, 3), dtype=np.uint8)
+    decision = client.verify_target(
+        SearchInstruction(
+            "去客厅茶几上拿 cube",
+            "cube",
+            room_condition="客厅",
+            spatial_condition="上",
+            anchor_object="茶几",
+        ),
+        "cube",
+        image,
+        candidate_crop_rgb=image,
+    )
+
+    assert not decision.is_target
+    assert decision.verdict == "rejected"
+    assert "identity confirmed:" in decision.reason
+    assert "constraints rejected:" in decision.reason
+    assert [item[0] for item in calls] == [
+        "_TargetIdentityResult",
+        "_TargetRelationResult",
+    ]
+    relation_prompt = calls[1][1][0]["content"]
+    assert "do not substitute another" in relation_prompt
+    assert "do not rename an arbitrary support surface" in relation_prompt
+    assert "Never turn missing evidence" in relation_prompt
+
+
+def test_vlm_target_verification_preserves_uncertain_identity():
+    config = load_sysnav_config()
+    client = QwenVLMClient(config.vlm)
+    calls = []
+
+    def fake_parse(model, response_format, messages):
+        calls.append((response_format.__name__, messages))
+        return SimpleNamespace(
+            verdict="uncertain",
+            reason="the distant square may be a cube but depth is not visible",
+        )
+
+    client._parse = fake_parse
+    image = np.zeros((64, 64, 3), dtype=np.uint8)
+    decision = client.verify_target(
+        SearchInstruction("find cube", "cube"),
+        "cube",
+        image,
+        candidate_crop_rgb=image,
+    )
+
+    assert not decision.is_target
+    assert decision.is_uncertain
+    assert decision.reason.startswith("identity uncertain:")
+    assert len(calls) == 1
+    system_prompt = calls[0][1][0]["content"]
+    assert "artificial annotation overlay" in system_prompt
+    assert "do not require multiple visible faces" in system_prompt
+    assert "do not use assumed metric dimensions" in system_prompt
+    assert "touches an image boundary" in system_prompt
+    assert "never confirm from the crop alone" in system_prompt
+    assert "flag is authoritative visibility metadata" in system_prompt
+    assert "MANDATORY CLIPPING RULE" in system_prompt
+
+
+def test_vlm_clipping_guard_downgrades_rejection_to_uncertain():
+    config = load_sysnav_config()
+    client = QwenVLMClient(config.vlm)
+
+    def fake_parse(model, response_format, messages):
+        return SimpleNamespace(
+            verdict="rejected",
+            reason="the partial patch looks flat rather than cubic",
+        )
+
+    client._parse = fake_parse
+    image = np.zeros((64, 64, 3), dtype=np.uint8)
+    decision = client.verify_target(
+        SearchInstruction("find cube", "cube"),
+        "cube",
+        image,
+        candidate_crop_rgb=image,
+        candidate_clipped_by_image_edge=True,
+    )
+
+    assert not decision.is_target
+    assert decision.is_uncertain
+    assert "uncertain after clipping guard" in decision.reason
+    assert "not a conclusive mismatch" in decision.reason
+
+
+def test_room_description_treats_detector_labels_as_unverified_hints():
+    config = load_sysnav_config()
+    client = QwenVLMClient(config.vlm)
+    calls = []
+
+    def fake_parse(model, response_format, messages):
+        calls.append(messages)
+        return SimpleNamespace(
+            room_type="unknown",
+            visual_cues=[],
+            confidence=0.1,
+        )
+
+    client._parse = fake_parse
+    client.describe_room("room_0", np.zeros((32, 32, 3), dtype=np.uint8), ["cube"])
+
+    system_prompt = calls[0][0]["content"]
+    user_text = calls[0][1]["content"][0]["text"]
+    assert "never claim an object is present merely" in system_prompt
+    assert "small movable task targets" in system_prompt
+    assert "unverified_detector_proposals=['cube']" in user_text
 
 
 def test_component_factory_is_lazy_and_does_not_require_api_key():
@@ -166,6 +513,50 @@ def test_scene_memory_merges_repeated_object_observations(tmp_path):
     assert '"room_0"' in output.read_text(encoding="utf-8")
 
 
+def test_runtime_persists_object_only_after_explicit_verification():
+    config, _, graph, _ = _components()
+    memory = SceneMemory(graph, merge_distance_m=config.search.object_merge_distance_m)
+    localized = _localized([2.0, 2.0, 0.8], confidence=0.9)
+    frame = RGBDFrame(
+        rgb=np.zeros((4, 4, 3), dtype=np.uint8),
+        depth=np.ones((4, 4), dtype=np.float32),
+        intrinsics=CameraIntrinsics.from_vertical_fov(4, 4, 90.0),
+        camera_position_world=np.zeros(3),
+        camera_rotation_world=np.eye(3),
+        camera_name="test",
+        timestamp_s=1.0,
+    )
+    components = object.__new__(SysNavComponents)
+    components.perception = SimpleNamespace(
+        detect=lambda unused_rgb: [localized.detection]
+    )
+    components.localizer = SimpleNamespace(
+        localize_all=lambda unused_frame, unused_detections: [localized]
+    )
+    components.scene_memory = memory
+    components.search_policy = SimpleNamespace()
+
+    update = components.process_observation(
+        frame,
+        (1.0, 1.0, 0.0),
+        "room_0",
+        image_path="view.png",
+    )
+
+    assert update.localized_detections == (localized,)
+    assert len(memory.viewpoints) == 1
+    assert memory.objects == {}
+    assert memory.rooms["room_0"].observed_labels == ()
+    assert update.viewpoint.object_ids == []
+
+    record = components.commit_verified_detection(
+        update.viewpoint.viewpoint_id, localized
+    )
+    assert record.label == "cube"
+    assert memory.rooms["room_0"].observed_labels == ("cube",)
+    assert update.viewpoint.object_ids == [record.object_id]
+
+
 class _EarlyStopReasoner:
     def should_switch_room(self, instruction, current_room_id, current_images_rgb, nearby_room_id, nearby_images_rgb):
         assert len(current_images_rgb) == 2
@@ -199,6 +590,34 @@ def test_class_only_target_can_skip_extra_vlm_call():
         np.zeros((4, 4, 3), dtype=np.uint8),
     )
     assert answer.is_target
+
+
+def test_search_policy_sends_an_unannotated_candidate_crop_to_vlm():
+    config, _, graph, planner = _components()
+    memory = SceneMemory(graph)
+
+    class CaptureReasoner:
+        def verify_target(self, *args, candidate_crop_rgb=None, **kwargs):
+            self.full_scene = np.asarray(args[2])
+            self.crop = np.asarray(candidate_crop_rgb)
+            self.clipped = kwargs["candidate_clipped_by_image_edge"]
+            return TargetVerification(True, "test", verdict="confirmed")
+
+    reasoner = CaptureReasoner()
+    policy = SysNavSearchPolicy(
+        graph, planner, memory, config.search, reasoner=reasoner
+    )
+    policy.start(SearchInstruction("find cube", "cube"))
+    frame = np.full((4, 4, 3), (17, 23, 31), dtype=np.uint8)
+    answer = policy.verify_candidate(
+        _localized([2.0, 2.0, 0.8], confidence=0.9), frame
+    )
+
+    assert answer.is_target
+    assert np.any(np.all(reasoner.full_scene == (0, 255, 0), axis=2))
+    assert not np.any(np.all(reasoner.crop == (0, 255, 0), axis=2))
+    assert np.all(reasoner.crop == (17, 23, 31))
+    assert reasoner.clipped
 
 
 def test_doorway_peek_keeps_pose_room_but_describes_viewed_room(tmp_path):

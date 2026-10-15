@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 
@@ -145,6 +145,21 @@ class EarlyStopDecision:
 class TargetVerification:
     is_target: bool
     reason: str
+    verdict: Literal["confirmed", "rejected", "uncertain"] | str = ""
+
+    def __post_init__(self) -> None:
+        verdict = str(self.verdict).strip().lower()
+        if not verdict:
+            verdict = "confirmed" if self.is_target else "rejected"
+        if verdict not in {"confirmed", "rejected", "uncertain"}:
+            raise ValueError(f"unknown target-verification verdict: {verdict!r}")
+        if bool(self.is_target) != (verdict == "confirmed"):
+            raise ValueError("is_target must be true exactly when verdict is confirmed")
+        object.__setattr__(self, "verdict", verdict)
+
+    @property
+    def is_uncertain(self) -> bool:
+        return self.verdict == "uncertain"
 
 
 def json_safe(value: Any) -> Any:

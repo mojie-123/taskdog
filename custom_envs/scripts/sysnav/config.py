@@ -78,11 +78,27 @@ class SearchConfig:
 
 
 @dataclass(frozen=True)
+class TransitDetectionConfig:
+    """Rate and consistency gates for perception while the base is moving."""
+
+    enabled: bool
+    frequency_hz: float
+    min_translation_m: float
+    min_yaw_deg: float
+    confirmation_distance_m: float
+    candidate_dedup_radius_m: float
+    reobserve_min_translation_m: float
+    reobserve_min_yaw_deg: float
+    save_images: bool
+
+
+@dataclass(frozen=True)
 class SysNavConfig:
     vlm: VLMConfig
     perception: PerceptionConfig
     coverage: CoverageConfig
     search: SearchConfig
+    transit_detection: TransitDetectionConfig
 
     def validate_files(self, *, require_models: bool = True) -> None:
         paths = [self.search.room_map_manifest, self.search.nav2_map_yaml]
@@ -117,6 +133,9 @@ def load_sysnav_config(path: Path | str = DEFAULT_CONFIG) -> SysNavConfig:
     perception = _required(document, "perception")
     coverage = _required(document, "coverage")
     search = _required(document, "search")
+    transit = document.get("transit_detection", {})
+    if not isinstance(transit, dict):
+        raise ValueError("invalid 'transit_detection' section")
     root = PROJECT_ROOT
     result = SysNavConfig(
         vlm=VLMConfig(
@@ -165,6 +184,29 @@ def load_sysnav_config(path: Path | str = DEFAULT_CONFIG) -> SysNavConfig:
                 search.get("early_stop_max_current_images", 4)
             ),
         ),
+        transit_detection=TransitDetectionConfig(
+            enabled=bool(transit.get("enabled", True)),
+            frequency_hz=float(transit.get("frequency_hz", 2.0)),
+            min_translation_m=float(transit.get("min_translation_m", 0.10)),
+            min_yaw_deg=float(transit.get("min_yaw_deg", 10.0)),
+            confirmation_distance_m=float(
+                transit.get("confirmation_distance_m", 0.20)
+            ),
+            candidate_dedup_radius_m=float(
+                transit.get(
+                    "candidate_dedup_radius_m",
+                    # Read the former name so older local configs keep working.
+                    transit.get("rejected_candidate_radius_m", 0.30),
+                )
+            ),
+            reobserve_min_translation_m=float(
+                transit.get("reobserve_min_translation_m", 0.50)
+            ),
+            reobserve_min_yaw_deg=float(
+                transit.get("reobserve_min_yaw_deg", 20.0)
+            ),
+            save_images=bool(transit.get("save_images", True)),
+        ),
     )
     if not 0.0 < result.perception.confidence <= 1.0:
         raise ValueError("perception.confidence must lie in (0, 1]")
@@ -176,4 +218,26 @@ def load_sysnav_config(path: Path | str = DEFAULT_CONFIG) -> SysNavConfig:
         raise ValueError("early_stop_min_ordinary_viewpoints must be positive")
     if result.search.early_stop_max_current_images <= 0:
         raise ValueError("early_stop_max_current_images must be positive")
+    if result.transit_detection.frequency_hz <= 0.0:
+        raise ValueError("transit_detection.frequency_hz must be positive")
+    if result.transit_detection.min_translation_m < 0.0:
+        raise ValueError("transit_detection.min_translation_m must be non-negative")
+    if result.transit_detection.min_yaw_deg < 0.0:
+        raise ValueError("transit_detection.min_yaw_deg must be non-negative")
+    if result.transit_detection.confirmation_distance_m <= 0.0:
+        raise ValueError(
+            "transit_detection.confirmation_distance_m must be positive"
+        )
+    if result.transit_detection.candidate_dedup_radius_m <= 0.0:
+        raise ValueError(
+            "transit_detection.candidate_dedup_radius_m must be positive"
+        )
+    if result.transit_detection.reobserve_min_translation_m <= 0.0:
+        raise ValueError(
+            "transit_detection.reobserve_min_translation_m must be positive"
+        )
+    if result.transit_detection.reobserve_min_yaw_deg <= 0.0:
+        raise ValueError(
+            "transit_detection.reobserve_min_yaw_deg must be positive"
+        )
     return result

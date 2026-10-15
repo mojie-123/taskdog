@@ -11,7 +11,7 @@ import base64
 import json
 from io import BytesIO
 from collections.abc import Sequence
-from typing import Any, Iterable
+from typing import Any, Iterable, Literal
 
 import numpy as np
 from PIL import Image
@@ -53,8 +53,13 @@ class _EarlyStopResult(BaseModel):
     reason: str
 
 
-class _TargetResult(BaseModel):
-    is_target: bool
+class _TargetIdentityResult(BaseModel):
+    verdict: Literal["confirmed", "rejected", "uncertain"]
+    reason: str
+
+
+class _TargetRelationResult(BaseModel):
+    verdict: Literal["confirmed", "rejected", "uncertain"]
     reason: str
 
 
@@ -145,15 +150,26 @@ class QwenVLMClient:
                 {
                     "role": "system",
                     "content": (
-                        "Describe the visually observed indoor room. The supplied "
-                        "room id is an anonymous map id, not a semantic label. Base "
-                        "the answer only on the image and detected object names."
+                        "Classify the visually observed indoor room from the RGB image. "
+                        "The supplied room id is an anonymous map id, not a semantic "
+                        "label. Infer room_type from directly visible room layout, fixed "
+                        "features, and large room-defining furniture. Detector proposals "
+                        "are unverified hints only: never claim an object is present merely "
+                        "because its name appears in that list. Do not identify or record "
+                        "small movable task targets in visual_cues. If the image does not "
+                        "support a room type, return room_type='unknown' with low confidence."
                     ),
                 },
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": f"room_id={room_id}; detections={labels}"},
+                        {
+                            "type": "text",
+                            "text": (
+                                f"room_id={room_id}; "
+                                f"unverified_detector_proposals={labels}"
+                            ),
+                        },
                         {"type": "image_url", "image_url": {"url": _image_data_url(image_rgb)}},
                     ],
                 },
@@ -310,34 +326,186 @@ class QwenVLMClient:
         *,
         room_description: str = "",
         nearby_objects: Iterable[str] = (),
+        candidate_crop_rgb: np.ndarray | None = None,
+        candidate_clipped_by_image_edge: bool = False,
     ) -> TargetVerification:
-        """Verify attributes/room/spatial constraints on a detected candidate."""
+        """Verify visual identity first, then the instruction constraints."""
 
-        context = {
-            "instruction": instruction.to_dict(),
-            "candidate_label": candidate_label,
-            "runtime_room_description": room_description,
-            "nearby_detected_objects": sorted(set(nearby_objects)),
-        }
-        result = self._parse(
+        del candidate_label  # The detector's class prediction must not bias identity.
+        crop = image_rgb if candidate_crop_rgb is None else candidate_crop_rgb
+        identity = self._parse(
             self.config.reasoning_model,
-            _TargetResult,
+            _TargetIdentityResult,
             [
                 {
                     "role": "system",
                     "content": (
-                        "Verify whether the outlined candidate satisfies the complete "
-                        "instruction. Reject it when an explicit attribute, room or "
-                        "spatial relation is contradicted or not visible enough to verify."
+                        "Stage 1: independently verify object identity. The green-outlined "
+                        "region is an untrusted detector proposal. The green line is an "
+                        "artificial annotation overlay, not part of the object's color, texture, "
+                        "or silhouette. Use the outlined full scene to locate the candidate and "
+                        "the clean enlarged crop to inspect its unannotated pixels. Judge only "
+                        "that physical candidate against the requested target category; ignore "
+                        "detector labels, confidence, room type, anchor objects, relations, and "
+                        "target-like objects elsewhere. Return exactly one verdict. MANDATORY "
+                        "CLIPPING RULE: when candidate_clipped_by_image_edge=true, never reject "
+                        "because the candidate looks flat or elongated, lacks depth or faces, or "
+                        "has an incomplete silhouette; clipping makes all of those observations "
+                        "unreliable. In that case reject only when independent visible semantic "
+                        "evidence identifies background or a different object category. Otherwise "
+                        "return uncertain rather than rejected. Confirm when "
+                        "the visible appearance and scene contact support a discrete physical "
+                        "instance of the category. Reject when visible evidence shows background, "
+                        "a continuous part of a wall, floor or large furniture item, a different "
+                        "category, or shape proportions incompatible with the requested category. "
+                        "These visible proportions and surface-continuity cues are allowed; do not "
+                        "use assumed metric dimensions or a memorized real-world object size. For "
+                        "a cube, a compact approximately square face belonging to a discrete object "
+                        "can support confirmation even when viewed far away or nearly face-on; do "
+                        "not require multiple visible faces or visible depth. Conversely, a clearly "
+                        "elongated rectangle or a region visibly continuous with room structure is "
+                        "evidence against a cube, not merely missing evidence. Check that the clean "
+                        "crop interpretation agrees with the candidate's silhouette and structural "
+                        "context in the full scene; never confirm from the crop alone when the full "
+                        "scene shows an elongated architectural or furniture element. If the "
+                        "candidate touches an image boundary and is visibly clipped, do not reject "
+                        "it from the partial silhouette or proportions; return uncertain unless the "
+                        "remaining visible evidence independently identifies it. The supplied "
+                        "candidate_clipped_by_image_edge flag is authoritative visibility metadata: "
+                        "when true, absent depth, incomplete shape, or clipped proportions cannot "
+                        "justify rejection. Return uncertain unless the visible pixels positively "
+                        "identify background or a different category. Return uncertain "
+                        "only when image quality, clipping, occlusion, proposal alignment, or "
+                        "viewpoint leaves both the category-consistent and category-inconsistent "
+                        "explanations genuinely plausible. Do not turn missing evidence into "
+                        "rejection, and do not guess it into confirmation."
                     ),
                 },
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": json.dumps(context, ensure_ascii=False)},
+                        {
+                            "type": "text",
+                            "text": json.dumps(
+                                {
+                                    "requested_target_category": instruction.target_object,
+                                    "detector_proposal_is_untrusted": True,
+                                    "candidate_clipped_by_image_edge": bool(
+                                        candidate_clipped_by_image_edge
+                                    ),
+                                    "mandatory_clipping_policy": (
+                                        "when clipped, flatness, aspect ratio, missing depth, "
+                                        "and incomplete silhouette cannot justify rejection"
+                                    ),
+                                },
+                                ensure_ascii=False,
+                            ),
+                        },
+                        {
+                            "type": "text",
+                            "text": "Full scene; inspect only the green-outlined candidate:",
+                        },
+                        {"type": "image_url", "image_url": {"url": _image_data_url(image_rgb)}},
+                        {
+                            "type": "text",
+                            "text": (
+                                "Clean enlarged crop of the same candidate; this crop has no "
+                                "green annotation overlay:"
+                            ),
+                        },
+                        {"type": "image_url", "image_url": {"url": _image_data_url(crop)}},
+                    ],
+                },
+            ],
+        )
+        if candidate_clipped_by_image_edge and identity.verdict == "rejected":
+            return TargetVerification(
+                is_target=False,
+                reason=(
+                    "identity uncertain after clipping guard: the candidate is "
+                    "incomplete at the image boundary, so the VLM rejection is "
+                    f"not a conclusive mismatch ({identity.reason})"
+                ),
+                verdict="uncertain",
+            )
+        if identity.verdict != "confirmed":
+            return TargetVerification(
+                is_target=False,
+                reason=f"identity {identity.verdict}: {identity.reason}",
+                verdict=identity.verdict,
+            )
+        if not instruction.needs_vlm_verification:
+            return TargetVerification(
+                is_target=True,
+                reason=f"identity confirmed: {identity.reason}; no relation constraints",
+                verdict="confirmed",
+            )
+
+        relation_context = {
+            "requested_target_category": instruction.target_object,
+            "room_condition": instruction.room_condition,
+            "spatial_condition": instruction.spatial_condition,
+            "attribute_condition": instruction.attribute_condition,
+            "anchor_object": instruction.anchor_object,
+            "anchor_attribute": instruction.anchor_attribute,
+            "runtime_room_description": room_description,
+            "untrusted_nearby_detector_labels": sorted(set(nearby_objects)),
+        }
+        relation = self._parse(
+            self.config.reasoning_model,
+            _TargetRelationResult,
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "Stage 2: verify every explicit non-identity constraint for the same "
+                        "green-outlined candidate whose identity is confirmed. Return exactly "
+                        "one verdict for all explicit room, attribute, and spatial constraints: "
+                        "confirmed only when the supplied image directly supports every "
+                        "constraint; rejected only when a visible constraint is contradicted; "
+                        "uncertain when an anchor, relation, attribute, or room cue is not "
+                        "visible enough to decide. The outlined candidate itself must "
+                        "participate in the requested relation; do not substitute another "
+                        "object elsewhere. Merely seeing an anchor nearby is insufficient. "
+                        "Visually identify the requested anchor from category-defining evidence; "
+                        "do not rename an arbitrary support surface as the anchor just because the "
+                        "candidate rests on it. For example, a brown horizontal region is not by "
+                        "itself proof of a coffee table: require directly visible table structure "
+                        "or sufficiently clear whole-scene evidence, otherwise return uncertain. "
+                        "The green outline is an artificial annotation and is not part of the "
+                        "candidate's appearance. "
+                        "Treat runtime room text and detector-provided nearby labels as "
+                        "unverified supporting hints, never as proof. Do not use object-size "
+                        "assumptions. Never turn missing evidence into either rejection or "
+                        "confirmation."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(relation_context, ensure_ascii=False),
+                        },
                         {"type": "image_url", "image_url": {"url": _image_data_url(image_rgb)}},
                     ],
                 },
             ],
         )
-        return TargetVerification(is_target=result.is_target, reason=result.reason)
+        if relation.verdict != "confirmed":
+            return TargetVerification(
+                is_target=False,
+                reason=(
+                    f"identity confirmed: {identity.reason}; "
+                    f"constraints {relation.verdict}: {relation.reason}"
+                ),
+                verdict=relation.verdict,
+            )
+        return TargetVerification(
+            is_target=True,
+            reason=(
+                f"identity confirmed: {identity.reason}; "
+                f"constraints confirmed: {relation.reason}"
+            ),
+            verdict="confirmed",
+        )

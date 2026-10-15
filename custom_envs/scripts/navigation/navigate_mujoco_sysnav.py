@@ -10,6 +10,7 @@ observation, N2M, grasp and delivery stages without resetting the simulation.
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import json
 import math
 import os
@@ -51,6 +52,10 @@ from custom_envs.scripts.sysnav.obstacle_edge_view import (
 from custom_envs.scripts.sysnav.rgbd import capture_rgbd_frame
 from custom_envs.scripts.sysnav.runtime import SysNavComponents, build_sysnav_components
 from custom_envs.scripts.sysnav.search_runner import SysNavSearchRunner
+from custom_envs.scripts.sysnav.transit_detection import (
+    ContinuousTransitDetector,
+    TransitCandidate,
+)
 from custom_envs.scripts.sysnav.types import SearchInstruction
 
 
@@ -80,6 +85,43 @@ class _VisionTargetProvider:
         self.position_world = np.asarray(
             position_world, dtype=np.float64
         ).reshape(3)
+
+
+class _TransitNavigationInterrupt(RuntimeError):
+    """Internal control-flow signal raised after a moving-frame detection."""
+
+    def __init__(self, candidate: TransitCandidate):
+        super().__init__("navigation interrupted for transit target confirmation")
+        self.candidate = candidate
+
+
+class _ObservedEnvProxy:
+    """Observe N2M's unmodified teleport loop after each MuJoCo step."""
+
+    def __init__(self, env, detector: ContinuousTransitDetector, name: str):
+        self._env = env
+        self._detector = detector
+        self._name = str(name)
+        self._origin = n2m._base_pose_from_state(env.get_robot_state())
+
+    def __getattr__(self, name):
+        return getattr(self._env, name)
+
+    def step(self, action):
+        result = self._env.step(action)
+        pose = n2m._base_pose_from_state(self._env.get_robot_state())
+        moved = (
+            float(np.linalg.norm(pose[:2] - self._origin[:2])) > 1e-5
+            or abs(n2m._wrap_angle(float(pose[2] - self._origin[2]))) > 1e-5
+        )
+        if moved:
+            candidate = self._detector.sample(
+                pose,
+                navigation_name=self._name,
+            )
+            if candidate is not None:
+                raise _TransitNavigationInterrupt(candidate)
+        return result
 
 
 def _path_pose_at_fraction(
@@ -128,13 +170,30 @@ def _path_pose_at_fraction(
 class _LegacySearchNavigator:
     """Execute SysNav metric viewpoints with the already validated controllers."""
 
-    def __init__(self, env, bridge, args, controller, *, policy=None, device=None):
+    def __init__(
+        self,
+        env,
+        bridge,
+        args,
+        controller,
+        *,
+        policy=None,
+        device=None,
+        transit_detector: ContinuousTransitDetector | None = None,
+    ):
         self.env = env
         self.bridge = bridge
         self.args = args
         self.controller = controller
         self.policy = policy
         self.device = device
+        self.transit_detector = transit_detector
+        self._pending_transit_candidate: TransitCandidate | None = None
+
+    def take_transit_candidate(self) -> TransitCandidate | None:
+        candidate = self._pending_transit_candidate
+        self._pending_transit_candidate = None
+        return candidate
 
     def current_pose(self) -> np.ndarray:
         return n2m._base_pose_from_state(self.env.get_robot_state())
@@ -170,6 +229,14 @@ class _LegacySearchNavigator:
                 midpoint,
                 name=f"{name}_MIDPOINT",
             )
+            if midpoint_metrics.get("interrupted_for_transit_candidate"):
+                midpoint_metrics["direct_distance_m"] = direct_distance
+                midpoint_metrics["split_threshold_m"] = split_threshold
+                midpoint_metrics["split_strategy"] = "nav2_path_arclength"
+                midpoint_metrics["split_path_points"] = len(path)
+                midpoint_metrics["split_path_length_m"] = path_length
+                midpoint_metrics["midpoint_pose"] = midpoint.astype(float).tolist()
+                return midpoint_metrics
             target_metrics = self._move_once(target, name=name)
             result = dict(target_metrics)
             result["mode"] = f"{target_metrics['mode']}_via_midpoint"
@@ -193,21 +260,44 @@ class _LegacySearchNavigator:
 
     def _move_once(self, target: np.ndarray, *, name: str) -> dict:
         if self.args.teleport_navigation:
-            return n2m._follow_nav2_path_by_teleport(
-                name=name,
-                env=self.env,
-                bridge=self.bridge,
-                interactive=self.controller,
-                goal_xy=target[:2],
-                final_yaw=float(target[2]),
-                max_steps=self.args.sysnav_nav_max_steps,
-                teleport_every_steps=self.args.teleport_every_steps,
-                teleport_spacing_m=self.args.teleport_step_distance,
-                plan_timeout_s=self.args.teleport_plan_timeout,
-                snapshot_writer=getattr(self.args, "nav_snapshot_writer", None),
-                arm_target=ARM_HOME,
-                gripper_target=GRIPPER_OPEN,
+            observed_env = (
+                self.env
+                if self.transit_detector is None
+                else _ObservedEnvProxy(self.env, self.transit_detector, name)
             )
+            started = time.monotonic()
+            try:
+                return n2m._follow_nav2_path_by_teleport(
+                    name=name,
+                    env=observed_env,
+                    bridge=self.bridge,
+                    interactive=self.controller,
+                    goal_xy=target[:2],
+                    final_yaw=float(target[2]),
+                    max_steps=self.args.sysnav_nav_max_steps,
+                    teleport_every_steps=self.args.teleport_every_steps,
+                    teleport_spacing_m=self.args.teleport_step_distance,
+                    plan_timeout_s=self.args.teleport_plan_timeout,
+                    snapshot_writer=getattr(self.args, "nav_snapshot_writer", None),
+                    arm_target=ARM_HOME,
+                    gripper_target=GRIPPER_OPEN,
+                )
+            except _TransitNavigationInterrupt as interrupt:
+                self._pending_transit_candidate = interrupt.candidate
+                self.bridge.cancel_goal()
+                pose = self.current_pose()
+                print(
+                    f"[SYSNAV][NAV_INTERRUPTED_FOR_TARGET] name={name} "
+                    f"pose={np.round(pose, 3)} "
+                    f"sequence={interrupt.candidate.observation.sequence}",
+                    flush=True,
+                )
+                return {
+                    "mode": "nav2_path_teleport",
+                    "interrupted_for_transit_candidate": True,
+                    "elapsed_s": time.monotonic() - started,
+                    "final_base_pose": pose.astype(float).tolist(),
+                }
         return self._move_physically(target, name=name)
 
     def _move_physically(self, target: np.ndarray, *, name: str) -> dict:
@@ -246,6 +336,19 @@ class _LegacySearchNavigator:
             contacts = n2m.robot_environment_contacts(self.env)
             if contacts:
                 raise RuntimeError(f"{name}: environment contact: {contacts}")
+            if self.transit_detector is not None:
+                candidate = self.transit_detector.sample(
+                    self.current_pose(), navigation_name=name
+                )
+                if candidate is not None:
+                    self._pending_transit_candidate = candidate
+                    self.bridge.cancel_goal()
+                    return {
+                        "mode": "physical_locomotion_policy",
+                        "interrupted_for_transit_candidate": True,
+                        "elapsed_s": time.monotonic() - started,
+                        "final_base_pose": self.current_pose().tolist(),
+                    }
             pacer.wait()
         else:
             self.bridge.cancel_goal()
@@ -269,6 +372,19 @@ class _LegacySearchNavigator:
                 last_action,
                 (0.0, 0.0, command),
             )
+            if self.transit_detector is not None:
+                candidate = self.transit_detector.sample(
+                    self.current_pose(), navigation_name=f"{name}_ALIGN"
+                )
+                if candidate is not None:
+                    self._pending_transit_candidate = candidate
+                    self.bridge.cancel_goal()
+                    return {
+                        "mode": "physical_locomotion_policy",
+                        "interrupted_for_transit_candidate": True,
+                        "elapsed_s": time.monotonic() - started,
+                        "final_base_pose": self.current_pose().tolist(),
+                    }
             if settled >= 8:
                 break
             pacer.wait()
@@ -369,6 +485,17 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sysnav-skip-room-semantics", action="store_true")
     parser.add_argument("--sysnav-disable-early-stop", action="store_true")
     parser.add_argument(
+        "--sysnav-disable-transit-detection",
+        action="store_true",
+        help="disable RGB-D target detection while the robot is navigating",
+    )
+    parser.add_argument(
+        "--sysnav-transit-detection-hz",
+        type=float,
+        default=None,
+        help="override the config sampling-rate upper bound (default: 2 Hz)",
+    )
+    parser.add_argument(
         "--sysnav-search-only",
         action="store_true",
         help="stop successfully after visually locating the target",
@@ -396,6 +523,11 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("SysNav viewpoint/navigation limits must be positive")
     if args.sysnav_retry_min_view_angle_deg > 180.0:
         raise SystemExit("--sysnav-retry-min-view-angle-deg must be <= 180")
+    if (
+        getattr(args, "sysnav_transit_detection_hz", None) is not None
+        and args.sysnav_transit_detection_hz <= 0.0
+    ):
+        raise SystemExit("--sysnav-transit-detection-hz must be positive")
     if args.sysnav_direct_teleport_test and not args.sysnav_search_only:
         raise SystemExit(
             "--sysnav-direct-teleport-test requires --sysnav-search-only"
@@ -1359,6 +1491,15 @@ def main() -> int:
         args.nav_snapshot_dir,
         args.nav_snapshot_every,
     )
+    transit_config = config.config.transit_detection
+    if args.sysnav_transit_detection_hz is not None:
+        transit_config = replace(
+            transit_config,
+            frequency_hz=float(args.sysnav_transit_detection_hz),
+        )
+    if args.sysnav_disable_transit_detection or args.sysnav_direct_teleport_test:
+        transit_config = replace(transit_config, enabled=False)
+
     write_json(
         output_dir / "sysnav_config.json",
         {
@@ -1384,6 +1525,28 @@ def main() -> int:
                 "map_mutation": "none_derived_masks_only",
                 "debug_output": str(
                     (output_dir / "viewpoint_planning").resolve()
+                ),
+            },
+            "transit_detection": {
+                "enabled": bool(transit_config.enabled),
+                "frequency_hz": float(transit_config.frequency_hz),
+                "min_translation_m": float(transit_config.min_translation_m),
+                "min_yaw_deg": float(transit_config.min_yaw_deg),
+                "confirmation_distance_m": float(
+                    transit_config.confirmation_distance_m
+                ),
+                "candidate_dedup_radius_m": float(
+                    transit_config.candidate_dedup_radius_m
+                ),
+                "reobserve_min_translation_m": float(
+                    transit_config.reobserve_min_translation_m
+                ),
+                "reobserve_min_yaw_deg": float(
+                    transit_config.reobserve_min_yaw_deg
+                ),
+                "save_images": bool(transit_config.save_images),
+                "output": str(
+                    (output_dir / "sysnav_search" / "transit").resolve()
                 ),
             },
         },
@@ -1414,6 +1577,27 @@ def main() -> int:
     bridge = None
     handed_off = False
     try:
+        def capture_frame():
+            return capture_rgbd_frame(env, config.config.search.camera_name)
+
+        transit_detector = (
+            ContinuousTransitDetector(
+                config,
+                capture_frame,
+                output_dir / "sysnav_search" / "transit",
+                instruction.target_object,
+                transit_config,
+            )
+            if transit_config.enabled
+            else None
+        )
+        if transit_detector is not None:
+            print(
+                f"[SYSNAV][TRANSIT_DETECTION] enabled=true "
+                f"frequency={transit_config.frequency_hz:.2f}Hz "
+                f"save_images={transit_config.save_images}",
+                flush=True,
+            )
         policy = None
         device = None
         if args.sysnav_direct_teleport_test:
@@ -1438,11 +1622,12 @@ def main() -> int:
                 controller,
                 policy=policy,
                 device=device,
+                transit_detector=transit_detector,
             )
         runner = SysNavSearchRunner(
             config,
             navigator,
-            lambda: capture_rgbd_frame(env, config.config.search.camera_name),
+            capture_frame,
             output_dir / "sysnav_search",
             enable_room_semantics=(
                 not args.sysnav_skip_vlm

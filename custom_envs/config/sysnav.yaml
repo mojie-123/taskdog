@@ -36,7 +36,22 @@ search:
   nav2_map_yaml: custom_envs/maps/map_house_mujoco_nav2.yaml
   camera_name: front_realsense
   object_merge_distance_m: 0.45
-  target_accept_confidence: 0.25
+  target_accept_confidence: 0.20
   early_stop_min_room_coverage: 0.50
   early_stop_min_ordinary_viewpoints: 3
   early_stop_max_current_images: 4
+
+# Perception is sampled synchronously in the MuJoCo/navigation thread.  Thus
+# frequency_hz is an upper bound: slow inference never builds a stale backlog.
+transit_detection:
+  enabled: true
+  frequency_hz: 2.0
+  min_translation_m: 0.10
+  min_yaw_deg: 10.0
+  confirmation_distance_m: 0.20
+  # A non-confirmed proposal is deduplicated only from a near-identical
+  # observation. Moving or turning enough permits a fresh VLM review.
+  candidate_dedup_radius_m: 0.30
+  reobserve_min_translation_m: 0.50
+  reobserve_min_yaw_deg: 20.0
+  save_images: true
