@@ -21,6 +21,8 @@ Protocol: newline-delimited JSON on stdin/stdout.
   stdin  (main -> this):
     {"type":"pose","pos":[x,y,z],"quat":[w,x,y,z],
      "lin_vel":[vx,vy,vz],"ang_vel":[wx,wy,wz]}
+    {"type":"plan_path","request_id":int,
+     "start":[x,y],"goal":[x,y]}
     {"type":"goal","x":float,"y":float}
     {"type":"cancel_goal"}
     {"type":"stop"}
@@ -30,6 +32,9 @@ Protocol: newline-delimited JSON on stdin/stdout.
     {"vx":float,"omega_z":float,
      "nav_done":bool,"nav_failed":bool}                -- emitted every publish cycle
     {"global_path":[[x,y],...],"path_revision":int}     -- emitted on every new /plan
+    {"plan_result":{"request_id":int,"success":bool,
+     "path":[[x,y],...],"error":str}}                   -- plan-only reply
+    {"cancel_complete":int}                              -- cancellation settled
 
 All diagnostic prints go to stderr (visible in parent terminal).
 """
@@ -138,8 +143,10 @@ def main() -> None:
     _global_path: list = []
     _path_revision = 0
     _stop        = False
+    _pending_plan: list = []
     _pending_goal: list = []
-    _pending_cancel = False
+    _pending_cancel_id = None
+    _cancel_sequence = 0
     CMD_TIMEOUT = float(args.cmd_vel_timeout)
     # 上次发射给父进程的 nav 状态（None = 还没发过，保证首条必发）。
     # 主循环只在本对值变化时才发 nav_done/nav_failed：否则 NAV1 完成后
@@ -218,7 +225,7 @@ def main() -> None:
     # stdin reader thread
     # -----------------------------------------------------------------------
     def _stdin_reader() -> None:   # 持续读取父进程通过 stdin 发送的 JSON 消息
-        nonlocal _stop, _pending_cancel
+        nonlocal _stop, _pending_cancel_id, _cancel_sequence
         for raw_line in sys.stdin:
             raw_line = raw_line.strip()
             if not raw_line:
@@ -239,11 +246,23 @@ def main() -> None:
                 with _lock:
                     _pending_goal.clear()
                     _pending_goal.append((gx, gy))
+            elif t == "plan_path":
+                request_id = int(msg["request_id"])
+                start_xy = [float(value) for value in msg["start"][:2]]
+                goal_xy = [float(value) for value in msg["goal"][:2]]
+                _eprint(
+                    f"[BridgeProc] path request {request_id} "
+                    f"({start_xy[0]:.2f},{start_xy[1]:.2f}) -> "
+                    f"({goal_xy[0]:.2f},{goal_xy[1]:.2f})"
+                )
+                with _lock:
+                    _pending_plan.append((request_id, start_xy, goal_xy))
             elif t == "cancel_goal":
                 _eprint("[BridgeProc] cancel queued")
                 with _lock:
                     _pending_goal.clear()
-                    _pending_cancel = True
+                    _cancel_sequence += 1
+                    _pending_cancel_id = _cancel_sequence
             elif t == "pose":
                 with _lock:
                     _pos_w[:]   = msg["pos"]
@@ -274,15 +293,17 @@ def main() -> None:
         _loop_count += 1
         with _lock:
             should_stop = _stop
-            should_cancel = _pending_cancel
-            _pending_cancel = False
+            cancel_request_id = _pending_cancel_id
+            _pending_cancel_id = None
+            plan_list   = list(_pending_plan)
+            _pending_plan.clear()
             goal_list   = list(_pending_goal)
             _pending_goal.clear()
         if should_stop:
             _eprint("[BridgeProc] stop received, shutting down.")
             break
 
-        if should_cancel:
+        if cancel_request_id is not None:
             with _lock:
                 task_active = _task_active
             if task_active:
@@ -297,6 +318,84 @@ def main() -> None:
                 _nav_failed = False
                 _vx = 0.0
                 _omega_z = 0.0
+            # cancelTask() waits for Nav2's cancellation response. Tell the
+            # parent only after the previous action has stopped driving.
+            _emit({"cancel_complete": cancel_request_id})
+
+        # ComputePathToPose uses the same planner/costmap as navigation but
+        # does not start the controller or recovery behaviors.  Explicitly
+        # supplying the start pose also avoids relying on a possibly delayed
+        # TF update immediately after a teleport.
+        for request_id, start_xy, goal_xy in plan_list:
+            with _lock:
+                task_active = _task_active
+            if task_active:
+                _emit(
+                    {
+                        "plan_result": {
+                            "request_id": request_id,
+                            "success": False,
+                            "path": [],
+                            "error": "navigation task is active",
+                        }
+                    }
+                )
+                continue
+            try:
+                stamp = navigator.get_clock().now().to_msg()
+                start_pose = PoseStamped()
+                start_pose.header.stamp = stamp
+                start_pose.header.frame_id = "map"
+                start_pose.pose.position.x = float(start_xy[0])
+                start_pose.pose.position.y = float(start_xy[1])
+                start_pose.pose.orientation.w = 1.0
+                goal_pose = PoseStamped()
+                goal_pose.header.stamp = stamp
+                goal_pose.header.frame_id = "map"
+                goal_pose.pose.position.x = float(goal_xy[0])
+                goal_pose.pose.position.y = float(goal_xy[1])
+                goal_pose.pose.orientation.w = 1.0
+                planned = navigator.getPath(
+                    start_pose,
+                    goal_pose,
+                    use_start=True,
+                )
+                points = [] if planned is None else [
+                    [
+                        float(pose.pose.position.x),
+                        float(pose.pose.position.y),
+                    ]
+                    for pose in planned.poses
+                ]
+                success = len(points) >= 2
+                _eprint(
+                    f"[BridgeProc] path request {request_id} "
+                    f"success={success} points={len(points)}"
+                )
+                _emit(
+                    {
+                        "plan_result": {
+                            "request_id": request_id,
+                            "success": success,
+                            "path": points,
+                            "error": "" if success else "planner returned no path",
+                        }
+                    }
+                )
+            except Exception as exc:
+                _eprint(
+                    f"[BridgeProc] path request {request_id} failed: {exc}"
+                )
+                _emit(
+                    {
+                        "plan_result": {
+                            "request_id": request_id,
+                            "success": False,
+                            "path": [],
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                    }
+                )
 
         # Process any pending goal
         for gx, gy in goal_list:

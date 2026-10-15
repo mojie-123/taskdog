@@ -1,0 +1,42 @@
+version: 1
+
+# No API key is stored here. The client reads it from this environment variable.
+vlm:
+  api_key_env: DASHSCOPE_API_KEY
+  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+  reasoning_model: qwen3-vl-plus
+  fast_model: qwen3-vl-plus
+  timeout_s: 45.0
+
+perception:
+  yoloe_weights: custom_envs/models/sysnav/yoloe-26s-seg.pt
+  mobileclip_weights: custom_envs/models/sysnav/mobileclip2_b.ts
+  sam2_checkpoint: custom_envs/models/sysnav/sam2.1_hiera_base_plus.pt
+  sam2_model_config: configs/sam2.1/sam2.1_hiera_b+.yaml
+  device: cuda
+  confidence: 0.12
+  iou: 0.55
+  max_detections: 30
+  min_mask_pixels: 30
+  max_depth_m: 6.0
+  min_localization_points: 20
+
+coverage:
+  candidate_spacing_m: 0.8
+  target_spacing_m: 0.25
+  max_view_range_m: 4.0
+  horizontal_fov_deg: 75.0
+  yaw_bins: 8
+  min_new_coverage_cells: 5
+  travel_cost_weight: 0.35
+  semantic_interest_weight: 12.0
+
+search:
+  room_map_manifest: custom_envs/maps/map_house_mujoco_rooms.yaml
+  nav2_map_yaml: custom_envs/maps/map_house_mujoco_nav2.yaml
+  camera_name: front_realsense
+  object_merge_distance_m: 0.45
+  target_accept_confidence: 0.25
+  early_stop_min_room_coverage: 0.50
+  early_stop_min_ordinary_viewpoints: 3
+  early_stop_max_current_images: 4

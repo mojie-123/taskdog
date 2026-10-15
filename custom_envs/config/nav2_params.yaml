@@ -95,7 +95,10 @@ planner_server:   # 路径规划服务器。在全局代价地图上计算从起
     GridBased:
       plugin: "nav2_navfn_planner/NavfnPlanner"   # 指定 "GridBased" 插件实际使用的规划器类。NavfnPlanner 是 ROS Navigation Stack 1 中的经典规划器，支持 Dijkstra 和 A* 算法
       tolerance: 0.5   # 目标点容差。如果目标点被标记为"占据"或"未知"，规划器会在目标点周围 0.5 米范围内寻找最近的可达点作为替代目标
-      use_astar: true   # 使用 A* 算法
+      # Humble NavFn 的 A* 势场在当前大地图上会对较长路径出现
+      # “legal potential found, but failed to create plan”梯度提取失败。
+      # Dijkstra 使用相同代价地图，但能稳定提取跨房间路径。
+      use_astar: false
       allow_unknown: true   # 允许通过未知区域，决定规划器是否愿意"穿过"未知区域
 
 controller_server:   # 控制器服务器。跟踪全局路径，实时计算机器人的速度指令（线速度和角速度），并判断导航是否完成。

@@ -998,6 +998,7 @@ def _follow_nav2_path_by_teleport(
     carried_object_name: str | None = None,
     arm_target=None,
     gripper_target=None,
+    plan_retries: int = 1,
 ) -> dict:
     """Follow the first Nav2 global plan using discrete MuJoCo pose resets."""
     goal = np.asarray(goal_xy, dtype=np.float64).reshape(2)
@@ -1011,6 +1012,8 @@ def _follow_nav2_path_by_teleport(
     )
     bridge.send_goal(float(goal[0]), float(goal[1]))
     started = time.monotonic()
+    plan_started = started
+    plan_attempt = 1
     pacer = RealtimePacer(env.dt)
     travelled = [np.asarray(state["pos"][:2], dtype=np.float64).copy()]
     route = None
@@ -1065,11 +1068,27 @@ def _follow_nav2_path_by_teleport(
                             f"raw_points={len(path)} waypoints={len(route)}",
                             flush=True,
                         )
-                    elif time.monotonic() - started > float(plan_timeout_s):
-                        raise RuntimeError(
-                            f"{name}: no Nav2 global path after "
-                            f"{plan_timeout_s:.1f}s"
-                        )
+                    elif time.monotonic() - plan_started > float(plan_timeout_s):
+                        if plan_attempt <= int(plan_retries):
+                            print(
+                                f"[N2M][{name}_TELEPORT_PLAN_RETRY] "
+                                f"attempt={plan_attempt + 1}/"
+                                f"{int(plan_retries) + 1} "
+                                f"reason=no_global_path",
+                                flush=True,
+                            )
+                            bridge.cancel_goal()
+                            # send_goal() waits for cancellation acknowledgement
+                            # before submitting this fresh planning request.
+                            bridge.send_goal(float(goal[0]), float(goal[1]))
+                            plan_attempt += 1
+                            plan_started = time.monotonic()
+                        else:
+                            raise RuntimeError(
+                                f"{name}: no Nav2 global path after "
+                                f"{plan_attempt} attempts of "
+                                f"{plan_timeout_s:.1f}s"
+                            )
 
             if (
                 route is not None

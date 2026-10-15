@@ -114,6 +114,11 @@ class MuJoCoEnv:
 
         self._model = mujoco.MjModel.from_xml_path(self._scene_path)
         self._data  = mujoco.MjData(self._model)
+        # Lazily create one offscreen renderer and reuse it for every RGB-D
+        # capture.  Creating and destroying a GL context for each scan frame
+        # is both expensive and unstable when the passive GLFW viewer is also
+        # active.
+        self._camera_renderer = None
 
         # 建立关节名 -> qpos/dof 地址表
         self._jnt_qposadr = {}
@@ -470,15 +475,24 @@ class MuJoCoEnv:
                 f"Please add a <camera> tag to scene.xml or M20_Piper.xml."
             )
 
-        renderer = mujoco.Renderer(self._model, height=self._cam_h, width=self._cam_w)
+        if self._camera_renderer is None:
+            self._camera_renderer = mujoco.Renderer(
+                self._model,
+                height=self._cam_h,
+                width=self._cam_w,
+            )
+        renderer = self._camera_renderer
         renderer.update_scene(self._data, camera=camera_name)
         rgb = renderer.render().copy()  # (H,W,3) uint8
 
         renderer.enable_depth_rendering()
-        renderer.update_scene(self._data, camera=camera_name)
-        depth = renderer.render().copy()  # (H,W) float32
-        renderer.disable_depth_rendering()
-        renderer.close()
+        try:
+            renderer.update_scene(self._data, camera=camera_name)
+            depth = renderer.render().copy()  # (H,W) float32
+        finally:
+            # Always restore RGB mode so the persistent renderer is safe for
+            # the next caller even when depth rendering raises.
+            renderer.disable_depth_rendering()
 
         return rgb, depth
 
@@ -527,6 +541,9 @@ class MuJoCoEnv:
         return self._data.qpos[a:a + 3].copy()
 
     def close(self):
+        if self._camera_renderer is not None:
+            self._camera_renderer.close()
+            self._camera_renderer = None
         if self._viewer is not None:
             self._viewer.close()
             self._viewer = None

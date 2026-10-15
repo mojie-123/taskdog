@@ -20,6 +20,14 @@
        注: <option> 不接受 condim(MuJoCo schema 校验会报错), 全局只能走 default 类。 -->
   <option timestep="0.001" gravity="0 0 -9.81" integrator="implicitfast"
           iterations="100" noslip_iterations="30" />
+  <!-- Keep the onboard RGB cameras usable in the enclosed house.  The
+       headlight provides modest camera-aligned fill rather than replacing the
+       fixed room lighting below. -->
+  <visual>
+    <headlight ambient="0.18 0.18 0.18"
+               diffuse="0.55 0.55 0.55"
+               specular="0.10 0.10 0.10" />
+  </visual>
   <default>
     <geom contype="1" conaffinity="1" condim="4" />
     <joint armature="0" damping="2.0" frictionloss="0" />
@@ -112,8 +120,20 @@
     <material name="apple_mat"  rgba="0.9 0.1  0.1 1" />
   </asset>
   <worldbody>
-    <light name="main_light" pos="5 5 5" dir="0 0 -1" diffuse="0.8 0.8 0.8" />
-    <light name="fill_light" pos="0 0 4" dir="0 0 -1" diffuse="0.4 0.4 0.4" />
+    <!-- Broad, shadow-free ceiling lights provide even illumination for
+         perception in each anonymous room without changing scene geometry. -->
+    <light name="living_light" pos="8 3 4.5" dir="0 0 -1"
+           cutoff="90" exponent="1"
+           ambient="0.03 0.03 0.03" diffuse="0.65 0.65 0.65"
+           specular="0.10 0.10 0.10" castshadow="false" />
+    <light name="room1_light" pos="4 10 4.5" dir="0 0 -1"
+           cutoff="90" exponent="1"
+           ambient="0.03 0.03 0.03" diffuse="0.65 0.65 0.65"
+           specular="0.10 0.10 0.10" castshadow="false" />
+    <light name="room2_light" pos="12 10 4.5" dir="0 0 -1"
+           cutoff="90" exponent="1"
+           ambient="0.03 0.03 0.03" diffuse="0.65 0.65 0.65"
+           specular="0.10 0.10 0.10" castshadow="false" />
     <geom name="floor" type="plane" size="20 20 0.1" friction="0.8 0.01 0.01" material="grid_mat" contype="1" conaffinity="1" />
     <!-- M20_Piper robot (FIRST so freejoint gets index 0) -->
     <body name="base_link" pos="1.6 1.6 0.58">

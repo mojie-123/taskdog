@@ -77,7 +77,12 @@ class IsaacROS2Bridge:
         self._nav_failed: bool  = False
         self._global_path: list[list[float]] = []
         self._path_revision: int = 0
+        self._plan_sequence: int = 0
+        self._plan_results: dict[int, dict] = {}
         self._last_feedback_time: float = 0.0
+        self._cancel_sequence: int = 0
+        self._pending_cancel_id: Optional[int] = None
+        self._completed_cancel_id: Optional[int] = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -202,6 +207,11 @@ class IsaacROS2Bridge:
         self._nav_failed = False
         self._global_path = []
         self._path_revision = 0
+        self._plan_sequence = 0
+        self._plan_results = {}
+        self._cancel_sequence = 0
+        self._pending_cancel_id = None
+        self._completed_cancel_id = None
         print("[IsaacROS2Bridge] stopped.", flush=True)
 
     def update_robot_pose(
@@ -225,20 +235,110 @@ class IsaacROS2Bridge:
 
     def send_goal(self, x: float, y: float) -> None:   # 向 Nav2发送目标点坐标，Nav2 接收后触发 A* 路径规划和 Pure Pursuit 跟踪
         """Send a Nav2 navigation goal."""
+        if self._pending_cancel_id is not None:
+            self.wait_for_cancel(timeout=3.0)
+            # Let TF and the costmaps observe the final teleported pose before
+            # starting the next behavior tree.
+            time.sleep(0.25)
         self._drain_feedback()   # 先清掉队列里上一个任务遗留的 nav_done 消息（否则本任务会读数秒完成）
         self._nav_done   = False
         self._nav_failed = False
         self._global_path = []
         self._send({"type": "goal", "x": float(x), "y": float(y)})
 
-    def cancel_goal(self) -> None:
-        """Cancel the active Nav2 task without stopping the bridge."""
+    def plan_path(
+        self,
+        start_xy,
+        goal_xy,
+        *,
+        timeout: float = 15.0,
+    ) -> list[list[float]]:
+        """Compute a Nav2 global path without starting navigation.
+
+        The ROS child uses ``ComputePathToPose`` with the supplied start pose,
+        so this request neither drives the robot nor depends on a guessed
+        straight-line midpoint. An empty list means that the planner completed
+        the request but found no path.
+        """
+
+        if timeout <= 0.0:
+            raise ValueError("plan timeout must be positive")
+        if self._pending_cancel_id is not None:
+            self.wait_for_cancel(timeout=3.0)
+            time.sleep(0.25)
+
+        start = np.asarray(start_xy, dtype=np.float64).reshape(2)
+        goal = np.asarray(goal_xy, dtype=np.float64).reshape(2)
+        self._plan_sequence += 1
+        request_id = self._plan_sequence
+        self._plan_results.pop(request_id, None)
+        self._send(
+            {
+                "type": "plan_path",
+                "request_id": request_id,
+                "start": start.astype(float).tolist(),
+                "goal": goal.astype(float).tolist(),
+            }
+        )
+
+        deadline = time.monotonic() + float(timeout)
+        while time.monotonic() < deadline:
+            self._drain_feedback()
+            result = self._plan_results.pop(request_id, None)
+            if result is not None:
+                if not result.get("success", False):
+                    return []
+                return [point.copy() for point in result.get("path", [])]
+            proc = self._proc
+            if proc is None or proc.poll() is not None:
+                raise RuntimeError(
+                    "[IsaacROS2Bridge] subprocess stopped while planning path"
+                )
+            time.sleep(0.01)
+        raise RuntimeError(
+            f"[IsaacROS2Bridge] Nav2 path request timed out after "
+            f"{float(timeout):.1f}s"
+        )
+
+    def cancel_goal(self, *, wait: bool = False, timeout: float = 3.0) -> None:
+        """Cancel the active Nav2 task without stopping the bridge.
+
+        The next :meth:`send_goal` is a cancellation barrier. Callers that
+        need the barrier immediately may pass ``wait=True``.
+        """
         self._drain_feedback()
         self._nav_done = False
         self._nav_failed = False
         self._vx = 0.0
         self._omega_z = 0.0
+        self._cancel_sequence += 1
+        request_id = self._cancel_sequence
+        self._pending_cancel_id = request_id
         self._send({"type": "cancel_goal"})
+        if wait:
+            self.wait_for_cancel(timeout=timeout)
+
+    def wait_for_cancel(self, timeout: float = 3.0) -> None:
+        """Wait until the ROS child confirms the latest cancellation."""
+        request_id = self._pending_cancel_id
+        if request_id is None:
+            return
+        deadline = time.monotonic() + float(timeout)
+        while time.monotonic() < deadline:
+            self._drain_feedback()
+            if self._completed_cancel_id == request_id:
+                self._pending_cancel_id = None
+                return
+            proc = self._proc
+            if proc is None or proc.poll() is not None:
+                raise RuntimeError(
+                    "[IsaacROS2Bridge] subprocess stopped while canceling Nav2 task"
+                )
+            time.sleep(0.01)
+        raise RuntimeError(
+            f"[IsaacROS2Bridge] Nav2 cancellation was not acknowledged "
+            f"within {float(timeout):.1f}s"
+        )
 
     def get_cmd_vel(self) -> Tuple[float, float]:   # 从Nav2获取速度指令cmd_vel 
         """Return the subprocess-filtered command, or zero if feedback stalls.
@@ -318,6 +418,23 @@ class IsaacROS2Bridge:
                 self._path_revision = int(
                     msg.get("path_revision", self._path_revision + 1)
                 )
+            if "plan_result" in msg:
+                raw_result = msg.get("plan_result") or {}
+                request_id = int(raw_result.get("request_id", -1))
+                if request_id >= 0:
+                    path = raw_result.get("path") or []
+                    self._plan_results[request_id] = {
+                        "success": bool(raw_result.get("success", False)),
+                        "path": [
+                            [float(point[0]), float(point[1])]
+                            for point in path
+                            if isinstance(point, (list, tuple))
+                            and len(point) >= 2
+                        ],
+                        "error": str(raw_result.get("error", "")),
+                    }
+            if "cancel_complete" in msg:
+                self._completed_cancel_id = int(msg["cancel_complete"])
 
 # MuJoCo/IsaacLab -> ROS bridge -> Nav2
 # 类型	                        JSON 格式	                                                                            作用

@@ -1,0 +1,223 @@
+version: 1
+frame_id: map
+source:
+  scene_xml: ../mujoco/scene_house_N2M.xml
+  nav2_map: map_house_mujoco_nav2.yaml
+  structure_geoms:
+  - wall_top
+  - wall_bottom
+  - wall_left
+  - wall_right_top
+  - wall_right_bottom
+  - wall_mid_h_1
+  - wall_mid_h_2
+  - wall_mid_h_3
+  - wall_mid_v_top
+  - wall_mid_v_bottom
+raster_file: map_house_mujoco_rooms.npz
+resolution: 0.05
+origin:
+- -1.0
+- -1.0
+width: 400
+height: 400
+labels:
+  outside_or_unknown: -2
+  structural_wall: -1
+  portal_or_unassigned: 0
+generation:
+  door_min_width_m: 0.7
+  door_max_width_m: 1.8
+  line_angle_tolerance_deg: 5.0
+  line_offset_tolerance_m: 0.15
+  portal_overlap_m: 0.06
+  barrier_close_cells: 1
+  min_room_area_m2: 2.0
+  search_clearance_m: 0.52
+  entry_offset_m: 0.85
+rooms:
+  room_0:
+    label_value: 1
+    area_m2: 92.3025
+    center:
+    - 7.9835
+    - 3.0178
+    bbox:
+    - 0.05
+    - 0.1
+    - 15.9
+    - 5.95
+    polygon:
+    - - 0.075
+      - 5.925
+    - - 0.075
+      - 0.125
+    - - 15.875
+      - 0.125
+    - - 15.875
+      - 5.925
+    neighbors:
+    - room_1
+    - room_2
+    portals:
+    - portal_0
+    - portal_1
+    - portal_2
+    entry_poses:
+    - portal: portal_0
+      pose:
+      - 0.825
+      - 1.975
+      - -0.030294
+    - portal: portal_1
+      pose:
+      - 3.975
+      - 5.175
+      - -1.60109
+    - portal: portal_2
+      pose:
+      - 14.175
+      - 5.175
+      - -1.60109
+  room_1:
+    label_value: 2
+    area_m2: 60.8075
+    center:
+    - 3.9886
+    - 10.0015
+    bbox:
+    - 0.05
+    - 6.1
+    - 7.9
+    - 13.9
+    polygon:
+    - - 0.125
+      - 13.875
+    - - 0.075
+      - 6.125
+    - - 7.875
+      - 6.125
+    - - 7.875
+      - 13.875
+    neighbors:
+    - room_0
+    - room_2
+    portals:
+    - portal_1
+    - portal_3
+    entry_poses:
+    - portal: portal_1
+      pose:
+      - 3.975
+      - 6.825
+      - 1.60109
+    - portal: portal_3
+      pose:
+      - 7.125
+      - 8.225
+      - 3.113029
+  room_2:
+    label_value: 3
+    area_m2: 61.02
+    center:
+    - 11.9813
+    - 10.0086
+    bbox:
+    - 8.05
+    - 6.1
+    - 15.9
+    - 13.9
+    polygon:
+    - - 8.075
+      - 13.875
+    - - 8.075
+      - 6.125
+    - - 15.875
+      - 6.125
+    - - 15.875
+      - 13.875
+    neighbors:
+    - room_0
+    - room_1
+    portals:
+    - portal_2
+    - portal_3
+    entry_poses:
+    - portal: portal_2
+      pose:
+      - 14.175
+      - 6.825
+      - 1.60109
+    - portal: portal_3
+      pose:
+      - 8.825
+      - 8.225
+      - 0.030294
+portals:
+  portal_0:
+    center:
+    - -0.0
+    - 2.0
+    endpoints:
+    - - -0.0
+      - 1.4
+    - - -0.0
+      - 2.6
+    width_m: 1.2
+    connects:
+    - room_0
+    is_exterior: true
+    source_walls:
+    - wall_right_bottom
+    - wall_right_top
+  portal_1:
+    center:
+    - 4.0
+    - 6.0
+    endpoints:
+    - - 3.4
+      - 6.0
+    - - 4.6
+      - 6.0
+    width_m: 1.2
+    connects:
+    - room_0
+    - room_1
+    is_exterior: false
+    source_walls:
+    - wall_mid_h_1
+    - wall_mid_h_2
+  portal_2:
+    center:
+    - 14.2
+    - 6.0
+    endpoints:
+    - - 13.6
+      - 6.0
+    - - 14.8
+      - 6.0
+    width_m: 1.2
+    connects:
+    - room_0
+    - room_2
+    is_exterior: false
+    source_walls:
+    - wall_mid_h_2
+    - wall_mid_h_3
+  portal_3:
+    center:
+    - 8.0
+    - 8.2
+    endpoints:
+    - - 8.0
+      - 7.6
+    - - 8.0
+      - 8.8
+    width_m: 1.2
+    connects:
+    - room_1
+    - room_2
+    is_exterior: false
+    source_walls:
+    - wall_mid_v_bottom
+    - wall_mid_v_top
