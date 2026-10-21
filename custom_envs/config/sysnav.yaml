@@ -40,6 +40,12 @@ search:
   early_stop_min_room_coverage: 0.50
   early_stop_min_ordinary_viewpoints: 3
   early_stop_max_current_images: 4
+  # Room semantics remain revisable. A doorway-only classification is
+  # tentative; diverse ordinary views can replace it with a stable label.
+  room_semantic_max_images: 6
+  room_semantic_refresh_min_new_images: 2
+  room_semantic_stable_min_ordinary_views: 2
+  room_semantic_stable_confidence: 0.75
 
 # Perception is sampled synchronously in the MuJoCo/navigation thread.  Thus
 # frequency_hz is an upper bound: slow inference never builds a stale backlog.

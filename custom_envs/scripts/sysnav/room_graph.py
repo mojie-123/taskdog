@@ -150,6 +150,21 @@ class AnonymousRoomGraph:
                     )
                     if state
                     else "",
+                    "runtime_description_status": str(
+                        getattr(state, "semantic_status", "unknown")
+                    )
+                    if state
+                    else "unknown",
+                    "runtime_description_confidence": round(
+                        float(getattr(state, "semantic_confidence", 0.0)), 4
+                    )
+                    if state
+                    else 0.0,
+                    "runtime_description_revision": int(
+                        getattr(state, "semantic_revision", 0)
+                    )
+                    if state
+                    else 0,
                     "observed_objects": list(getattr(state, "observed_labels", ()))
                     if state
                     else [],

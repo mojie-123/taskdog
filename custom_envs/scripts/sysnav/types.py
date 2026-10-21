@@ -146,6 +146,8 @@ class TargetVerification:
     is_target: bool
     reason: str
     verdict: Literal["confirmed", "rejected", "uncertain"] | str = ""
+    visual_verdict: Literal["confirmed", "rejected", "uncertain"] | str = ""
+    room_verdict: Literal["confirmed", "uncertain", "not_required"] | str = ""
 
     def __post_init__(self) -> None:
         verdict = str(self.verdict).strip().lower()
@@ -156,6 +158,22 @@ class TargetVerification:
         if bool(self.is_target) != (verdict == "confirmed"):
             raise ValueError("is_target must be true exactly when verdict is confirmed")
         object.__setattr__(self, "verdict", verdict)
+        visual_verdict = str(self.visual_verdict).strip().lower()
+        if visual_verdict and visual_verdict not in {
+            "confirmed",
+            "rejected",
+            "uncertain",
+        }:
+            raise ValueError(f"unknown visual-verification verdict: {visual_verdict!r}")
+        room_verdict = str(self.room_verdict).strip().lower()
+        if room_verdict and room_verdict not in {
+            "confirmed",
+            "uncertain",
+            "not_required",
+        }:
+            raise ValueError(f"unknown room-verification verdict: {room_verdict!r}")
+        object.__setattr__(self, "visual_verdict", visual_verdict)
+        object.__setattr__(self, "room_verdict", room_verdict)
 
     @property
     def is_uncertain(self) -> bool:

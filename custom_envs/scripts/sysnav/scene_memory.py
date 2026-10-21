@@ -24,6 +24,11 @@ class RoomState:
     semantic_description: str = ""
     semantic_confidence: float = 0.0
     semantic_cues: tuple[str, ...] = ()
+    semantic_status: str = "unknown"
+    semantic_revision: int = 0
+    semantic_evidence_count: int = 0
+    semantic_ordinary_evidence_count: int = 0
+    semantic_evidence_tokens: tuple[str, ...] = ()
     representative_image_path: str = ""
     observed_labels: tuple[str, ...] = ()
     visited: bool = False
@@ -98,14 +103,52 @@ class SceneMemory:
         description: RoomDescription,
         *,
         representative_image_path: str = "",
-    ) -> None:
+        evidence_count: int = 1,
+        ordinary_evidence_count: int = 0,
+        evidence_tokens: tuple[str, ...] = (),
+        stable_min_ordinary_views: int = 2,
+        stable_confidence: float = 0.75,
+    ) -> bool:
+        """Replace room semantics with the latest multi-view interpretation.
+
+        The newest interpretation is deliberately allowed to revise an older
+        label.  Stability describes the amount and quality of current evidence;
+        it is not a permanent lock on the first classification.
+        """
+
         state = self.rooms[room_id]
-        if description.confidence >= state.semantic_confidence:
-            state.semantic_description = description.room_type
-            state.semantic_confidence = float(description.confidence)
-            state.semantic_cues = tuple(description.visual_cues)
-            if representative_image_path:
-                state.representative_image_path = representative_image_path
+        evidence_count = max(1, int(evidence_count))
+        ordinary_evidence_count = max(0, int(ordinary_evidence_count))
+        room_type = description.room_type or "unknown"
+        if room_type == "unknown":
+            status = "unknown"
+        elif (
+            ordinary_evidence_count >= int(stable_min_ordinary_views)
+            and description.confidence >= float(stable_confidence)
+        ):
+            status = "stable"
+        else:
+            status = "tentative"
+
+        changed = bool(
+            room_type != state.semantic_description
+            or float(description.confidence) != state.semantic_confidence
+            or tuple(description.visual_cues) != state.semantic_cues
+            or status != state.semantic_status
+            or evidence_count != state.semantic_evidence_count
+            or ordinary_evidence_count != state.semantic_ordinary_evidence_count
+        )
+        state.semantic_description = room_type
+        state.semantic_confidence = float(description.confidence)
+        state.semantic_cues = tuple(description.visual_cues)
+        state.semantic_status = status
+        state.semantic_evidence_count = evidence_count
+        state.semantic_ordinary_evidence_count = ordinary_evidence_count
+        state.semantic_evidence_tokens = tuple(str(value) for value in evidence_tokens)
+        state.semantic_revision += 1
+        if representative_image_path:
+            state.representative_image_path = representative_image_path
+        return changed
 
     def update_room_progress(
         self, room_id: str, coverage: float, *, exhausted: bool | None = None
@@ -256,7 +299,7 @@ class SceneMemory:
             payload = json_safe(state)
             rooms[room_id] = payload
         return {
-            "version": 1,
+            "version": 2,
             "rooms": rooms,
             "viewpoints": {
                 key: json_safe(value) for key, value in self.viewpoints.items()

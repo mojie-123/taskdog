@@ -91,6 +91,17 @@ class RoomImageEvidence:
         }
 
 
+@dataclass
+class _PendingTarget:
+    """Visually verified target waiting only for Room-node confirmation."""
+
+    detection: LocalizedDetection
+    viewpoint_id: str
+    source: str
+    visual_reason: str
+    last_room_revision: int = -1
+
+
 class SysNavSearchRunner:
     """Alternate VLM room decisions with classical in-room coverage."""
 
@@ -123,6 +134,8 @@ class SysNavSearchRunner:
         self._searched_rooms: list[str] = []
         self._viewpoint_count = 0
         self._ordinary_viewpoint_counts: dict[str, int] = {}
+        self._room_semantic_last_counts: dict[str, tuple[int, int]] = {}
+        self._pending_targets: list[_PendingTarget] = []
 
     def _record_event(self, event: str, **payload) -> None:
         append_jsonl(
@@ -228,6 +241,17 @@ class SysNavSearchRunner:
                 confirmed.target,
             )
             scene_object_id = scene_object.object_id
+        elif (
+            update is not None
+            and decision.visual_verdict == "confirmed"
+            and decision.room_verdict == "uncertain"
+        ):
+            self._remember_pending_target(
+                confirmed.target,
+                update.viewpoint.viewpoint_id,
+                source=f"transit:{navigation_name}",
+                visual_reason=decision.reason,
+            )
         self._record_event(
             "transit_target_verified",
             navigation_name=navigation_name,
@@ -240,6 +264,8 @@ class SysNavSearchRunner:
             room_id=confirmed.target.room_id,
             is_target=decision.is_target,
             verdict=decision.verdict,
+            visual_verdict=decision.visual_verdict,
+            room_verdict=decision.room_verdict,
             reason=decision.reason,
             scene_viewpoint_id=(
                 None if update is None else update.viewpoint.viewpoint_id
@@ -325,6 +351,57 @@ class SysNavSearchRunner:
         self.room_image_history.setdefault(viewed_room_id, []).append(evidence)
         return evidence
 
+    def _semantic_room_evidence(
+        self, room_id: str
+    ) -> tuple[RoomImageEvidence, ...]:
+        """Select a bounded ordinary-first multi-view room evidence set."""
+
+        history = list(getattr(self, "room_image_history", {}).get(room_id, ()))
+        if not history:
+            return ()
+        limit = int(self.components.config.search.room_semantic_max_images)
+        ordinary = [item for item in history if item.observation_kind == "ordinary"]
+        partial = [item for item in history if item.observation_kind != "ordinary"]
+        if not ordinary:
+            return tuple(partial[-limit:])
+
+        # Preserve up to two doorway/context views, but let observations made
+        # inside the room dominate the multi-view classification.
+        partial_limit = min(2, len(partial), max(0, limit - 1))
+        ordinary_limit = limit - partial_limit
+        selected = ordinary[-ordinary_limit:]
+        if partial_limit:
+            selected.extend(partial[-partial_limit:])
+        order = {id(item): index for index, item in enumerate(history)}
+        selected.sort(key=lambda item: order[id(item)])
+        return tuple(selected)
+
+    def _room_semantic_update_due(self, room_id: str) -> bool:
+        history = list(getattr(self, "room_image_history", {}).get(room_id, ()))
+        if not history:
+            return False
+        total_count = len(history)
+        ordinary_count = sum(
+            item.observation_kind == "ordinary" for item in history
+        )
+        last_total, last_ordinary = getattr(
+            self, "_room_semantic_last_counts", {}
+        ).get(room_id, (0, 0))
+        state = self.components.scene_memory.rooms[room_id]
+        if state.semantic_revision == 0:
+            return True
+        if last_ordinary == 0 and ordinary_count > 0:
+            return True
+        stable_min = int(
+            self.components.config.search.room_semantic_stable_min_ordinary_views
+        )
+        if last_ordinary < stable_min <= ordinary_count:
+            return True
+        return (
+            total_count - last_total
+            >= self.components.config.search.room_semantic_refresh_min_new_images
+        )
+
     def _early_stop_current_evidence(
         self, room_id: str
     ) -> tuple[RoomImageEvidence, ...]:
@@ -367,20 +444,44 @@ class SysNavSearchRunner:
         frame: RGBDFrame,
         update: ObservationUpdate,
         image_path: str,
-    ) -> None:
+    ) -> LocalizedDetection | None:
+        del frame, update, image_path
         vlm = self.components.vlm
         state = self.components.scene_memory.rooms[room_id]
-        if (
-            not self.enable_room_semantics
-            or vlm is None
-            or state.semantic_description
-        ):
-            return
+        if not self.enable_room_semantics or vlm is None:
+            return None
+        if not self._room_semantic_update_due(room_id):
+            return None
+        evidence = self._semantic_room_evidence(room_id)
+        if not evidence:
+            return None
+        history = self.room_image_history.get(room_id, ())
+        total_count = len(history)
+        ordinary_count = sum(
+            item.observation_kind == "ordinary" for item in history
+        )
+        previous = {
+            "room_type": state.semantic_description,
+            "confidence": state.semantic_confidence,
+            "status": state.semantic_status,
+            "revision": state.semantic_revision,
+        }
         try:
-            description = vlm.describe_room(
+            description = vlm.describe_room_multiview(
                 room_id,
-                frame.rgb,
-                [item.label for item in update.detections],
+                tuple(item.image_rgb for item in evidence),
+                observation_kinds=tuple(
+                    item.observation_kind for item in evidence
+                ),
+                detected_labels=tuple(
+                    sorted(
+                        {
+                            label
+                            for item in evidence
+                            for label in item.detection_labels
+                        }
+                    )
+                ),
             )
         except Exception as exc:
             self._record_event(
@@ -388,11 +489,26 @@ class SysNavSearchRunner:
                 room_id=room_id,
                 error=f"{type(exc).__name__}: {exc}",
             )
-            return
-        self.components.scene_memory.update_room_description(
+            return None
+        self._room_semantic_last_counts[room_id] = (
+            total_count,
+            ordinary_count,
+        )
+        changed = self.components.scene_memory.update_room_description(
             room_id,
             description,
-            representative_image_path=image_path,
+            representative_image_path=evidence[-1].image_path,
+            evidence_count=len(evidence),
+            ordinary_evidence_count=sum(
+                item.observation_kind == "ordinary" for item in evidence
+            ),
+            evidence_tokens=tuple(item.token for item in evidence),
+            stable_min_ordinary_views=(
+                self.components.config.search.room_semantic_stable_min_ordinary_views
+            ),
+            stable_confidence=(
+                self.components.config.search.room_semantic_stable_confidence
+            ),
         )
         self._record_event(
             "room_described",
@@ -400,10 +516,126 @@ class SysNavSearchRunner:
             room_type=description.room_type,
             confidence=description.confidence,
             visual_cues=list(description.visual_cues),
+            semantic_status=state.semantic_status,
+            semantic_revision=state.semantic_revision,
+            changed=changed,
+            previous=previous,
+            evidence=[item.event_dict() for item in evidence],
+        )
+        print(
+            f"[SYSNAV][ROOM_SEMANTIC_UPDATE] room={room_id} "
+            f"revision={state.semantic_revision} status={state.semantic_status} "
+            f"type={state.semantic_description!r} "
+            f"confidence={state.semantic_confidence:.2f} "
+            f"evidence={state.semantic_evidence_count} "
+            f"ordinary={state.semantic_ordinary_evidence_count} "
+            f"previous={previous['room_type']!r}/{previous['status']}",
+            flush=True,
+        )
+        return self._resolve_pending_target(room_id)
+
+    def _remember_pending_target(
+        self,
+        detection: LocalizedDetection,
+        viewpoint_id: str,
+        *,
+        source: str,
+        visual_reason: str,
+    ) -> None:
+        room_id = detection.room_id
+        for pending in self._pending_targets:
+            if pending.detection.room_id != room_id:
+                continue
+            separation = float(
+                np.linalg.norm(
+                    pending.detection.position_world[:2]
+                    - detection.position_world[:2]
+                )
+            )
+            if separation > self.components.config.transit_detection.candidate_dedup_radius_m:
+                continue
+            if (
+                detection.detection.confidence
+                > pending.detection.detection.confidence
+            ):
+                pending.detection = detection
+                pending.viewpoint_id = viewpoint_id
+                pending.source = source
+                pending.visual_reason = visual_reason
+            return
+        self._pending_targets.append(
+            _PendingTarget(
+                detection=detection,
+                viewpoint_id=viewpoint_id,
+                source=source,
+                visual_reason=visual_reason,
+            )
+        )
+        self._record_event(
+            "target_pending_room_semantics",
+            source=source,
+            viewpoint_id=viewpoint_id,
+            room_id=room_id,
+            position_world=detection.position_world.astype(float).tolist(),
+            confidence=detection.detection.confidence,
+            reason=visual_reason,
+        )
+        print(
+            f"[SYSNAV][TARGET_PENDING_ROOM] room={room_id} "
+            f"position={detection.position_world.astype(float).tolist()} "
+            f"confidence={detection.detection.confidence:.3f} source={source}",
+            flush=True,
         )
 
+    def _resolve_pending_target(self, room_id: str) -> LocalizedDetection | None:
+        state = self.components.scene_memory.rooms[room_id]
+        for pending in list(self._pending_targets):
+            if pending.detection.room_id != room_id:
+                continue
+            if pending.last_room_revision == state.semantic_revision:
+                continue
+            pending.last_room_revision = state.semantic_revision
+            room_decision = self.components.search_policy.verify_room_condition(room_id)
+            self._record_event(
+                "pending_target_room_reviewed",
+                source=pending.source,
+                room_id=room_id,
+                semantic_revision=state.semantic_revision,
+                room_type=state.semantic_description,
+                semantic_status=state.semantic_status,
+                room_verdict=room_decision.room_verdict,
+                reason=room_decision.reason,
+            )
+            if not room_decision.is_target:
+                continue
+            scene_object = self.components.commit_verified_detection(
+                pending.viewpoint_id, pending.detection
+            )
+            self._pending_targets.remove(pending)
+            self._record_event(
+                "pending_target_resolved",
+                source=pending.source,
+                viewpoint_id=pending.viewpoint_id,
+                object_id=scene_object.object_id,
+                room_id=room_id,
+                semantic_revision=state.semantic_revision,
+                position_world=scene_object.position_world.astype(float).tolist(),
+            )
+            print(
+                f"[SYSNAV][TARGET_RESOLVED_FROM_ROOM] room={room_id} "
+                f"revision={state.semantic_revision} object={scene_object.object_id} "
+                f"position={scene_object.position_world.astype(float).tolist()}",
+                flush=True,
+            )
+            return pending.detection
+        return None
+
     def _verify_targets(
-        self, frame: RGBDFrame, detections: tuple[LocalizedDetection, ...]
+        self,
+        frame: RGBDFrame,
+        detections: tuple[LocalizedDetection, ...],
+        *,
+        viewpoint_id: str,
     ) -> LocalizedDetection | None:
         instruction = self.components.search_policy.instruction
         assert instruction is not None
@@ -436,11 +668,23 @@ class SysNavSearchRunner:
                 room_id=candidate.room_id,
                 is_target=decision.is_target,
                 verdict=decision.verdict,
+                visual_verdict=decision.visual_verdict,
+                room_verdict=decision.room_verdict,
                 reason=decision.reason,
                 position_world=candidate.position_world.astype(float).tolist(),
             )
             if decision.is_target:
                 return candidate
+            if (
+                decision.visual_verdict == "confirmed"
+                and decision.room_verdict == "uncertain"
+            ):
+                self._remember_pending_target(
+                    candidate,
+                    viewpoint_id,
+                    source="coverage",
+                    visual_reason=decision.reason,
+                )
         return None
 
     def _observe(
@@ -476,9 +720,21 @@ class SysNavSearchRunner:
             update=update,
             planned_viewpoint_index=planned_viewpoint_index,
         )
-        self._describe_room(viewed_room, frame, update, image_path)
-        target = self._verify_targets(frame, update.localized_detections)
-        if target is not None:
+        resolved_target = self._describe_room(
+            viewed_room, frame, update, image_path
+        )
+        if resolved_target is None:
+            target = self._verify_targets(
+                frame,
+                update.localized_detections,
+                viewpoint_id=update.viewpoint.viewpoint_id,
+            )
+        else:
+            # _resolve_pending_target() already attached the previously seen
+            # detection to its original viewpoint. Do not duplicate that
+            # object observation on the current room-semantics frame.
+            target = resolved_target
+        if target is not None and resolved_target is None:
             scene_object = self.components.commit_verified_detection(
                 update.viewpoint.viewpoint_id,
                 target,

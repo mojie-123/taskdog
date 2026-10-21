@@ -50,9 +50,9 @@ MuJoCo front_realsense RGB-D
 3. 用 `instruction.detector_prompts` 设置 YOLOE 文本类别。
 4. `SysNavSearchPolicy.choose_next_room()` 返回匿名 `room_id`；用 `execution_anchor()` 映射到门内的地图坐标。
 5. 在该房间反复调用 `next_viewpoint()`，由现有 Nav2 到达 `(x, y, yaw)`。
-6. 每个视点采集 RGB-D，依次调用 detector、localizer 和 `SceneMemory.add_viewpoint()`。
-7. 若找到目标候选，调用 `verify_candidate()`；通过后把估计的 cube 世界坐标交给现有 N2M 前观察位姿流程。
-8. 当前房间覆盖率达到 0.50 且完成至少 3 个普通覆盖视点后，才允许在门口获得相邻房间图像并调用 `consider_early_stop()`；VLM 会联合比较当前房间最近至多 4 个普通覆盖视点与相邻房间的当前 PEEK 图，旧的门口 PEEK 不会替代当前房间证据。每个普通视点后至多执行一次门口观察，实际输入图片记录在 `early_stop_vlm_inputs` 事件中。VLM 只决定是否换房，实际路线仍由房间图和 Nav2 生成。
+6. 每个视点采集 RGB-D，依次调用 detector、localizer 和 `SceneMemory.add_viewpoint()`。每个 Room 节点保存普通视点与 PEEK 的多视角证据；单张门口图只能产生 `tentative` 语义，至少两张普通视点且多图置信度达到 0.75 后才成为 `stable`。后续高质量多图结论可以修订旧标签，`unknown` 也不会锁死。
+7. 若找到目标候选，`verify_candidate()` 先在当前图像中核验目标身份、参照物和空间关系；房间条件不再放进该局部图像提示词，而是由目标三维位置对应的稳定 Room 节点独立判断。局部视觉已经通过但 Room 语义尚未稳定时，候选只进入运行期 pending 缓存，不写入 Object 节点；Room 更新后可直接完成确认，无需再次路过目标。
+8. 当前房间覆盖率达到 0.50 且完成至少 3 个普通覆盖视点后，才允许在门口获得相邻房间图像并调用 `consider_early_stop()`；VLM 会联合比较当前房间最近至多 4 个普通覆盖视点与相邻房间的当前 PEEK 图，并同时读取上述共享 Room 节点语义。旧的门口 PEEK 不会替代当前房间证据。每个普通视点后至多执行一次门口观察，实际输入图片记录在 `early_stop_vlm_inputs` 事件中。VLM 只决定是否换房，实际路线仍由房间图和 Nav2 生成。
 9. 第一轮 N2M 的 3 个底盘位姿、每个位姿 3 次抓取均失败时，在同一个 MuJoCo 世界中选择与旧观察方向优先相差至少 60 度的新视点，重新检测 cube、采集点云并运行第二轮 N2M。默认最多两轮，可用 `--sysnav-max-n2m-rounds` 调整。
 
 ## 设计上的降级行为

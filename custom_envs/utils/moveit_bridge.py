@@ -143,12 +143,29 @@ class MoveItROS2Bridge:
     # Planning scene
     # ------------------------------------------------------------------
     def apply_default_scene(self, timeout: Optional[float] = None) -> dict:
-        """Add the original two-table scene approximation to PlanningScene.
+        """Apply only scene-independent geometry and clear legacy tables.
 
-        这不是通用 MJCF 导入器；使用 ``scene_house.xml`` 时，House 墙体和家具
-        不会由本方法自动加入 MoveIt 碰撞世界。
+        The support surface is supplied separately from the wrist-camera
+        RANSAC result.  No fixed table position or height is added here.
         """
         return self._request({"type": "apply_default_scene"}, timeout=timeout)
+
+    def apply_support_surface(
+        self,
+        pose: dict,
+        size_xyz,
+        frame_id: str = "map",
+        object_id: str = "detected_support_surface",
+        timeout: Optional[float] = None,
+    ) -> dict:
+        """Add or replace a support-surface box detected from depth data."""
+        return self._request({
+            "type": "apply_support_surface",
+            "pose": pose,
+            "size_xyz": [float(x) for x in size_xyz],
+            "frame_id": str(frame_id),
+            "object_id": str(object_id),
+        }, timeout=timeout)
 
     # ------------------------------------------------------------------
     # MoveIt calls

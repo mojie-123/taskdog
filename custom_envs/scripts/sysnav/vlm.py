@@ -125,6 +125,9 @@ class QwenVLMClient:
                     "content": (
                         "Extract an indoor object-search instruction. Preserve the "
                         "user's object nouns, but make every returned field concise. "
+                        "Normalize an explicit room_condition to a concise canonical "
+                        "English room type such as 'living room', 'kitchen', or "
+                        "'bedroom', regardless of the input language. "
                         "Use empty strings for absent constraints. anchor_object is "
                         "the reference object in relations such as 'on the table'."
                     ),
@@ -140,9 +143,60 @@ class QwenVLMClient:
         image_rgb: np.ndarray,
         detected_labels: Iterable[str] = (),
     ) -> RoomDescription:
-        """Infer runtime room semantics from what the robot actually observed."""
+        """Compatibility wrapper for a single-view room observation."""
 
+        return self.describe_room_multiview(
+            room_id,
+            (image_rgb,),
+            observation_kinds=("ordinary",),
+            detected_labels=detected_labels,
+        )
+
+    def describe_room_multiview(
+        self,
+        room_id: str,
+        images_rgb: Sequence[np.ndarray],
+        *,
+        observation_kinds: Sequence[str] = (),
+        detected_labels: Iterable[str] = (),
+    ) -> RoomDescription:
+        """Infer one revisable room description from diverse views of that room."""
+
+        images = tuple(images_rgb)
+        if not images:
+            raise ValueError("room evidence must contain at least one image")
+        kinds = tuple(str(value).strip().lower() for value in observation_kinds)
+        if kinds and len(kinds) != len(images):
+            raise ValueError("observation_kinds must align with images_rgb")
+        if not kinds:
+            kinds = ("ordinary",) * len(images)
         labels = sorted({str(value).strip().lower() for value in detected_labels if value})
+        content: list[dict[str, Any]] = [
+            {
+                "type": "text",
+                "text": (
+                    f"room_id={room_id}; image_count={len(images)}; "
+                    f"unverified_detector_proposals={labels}. All images show the "
+                    "same anonymous geometric room from different viewpoints."
+                ),
+            }
+        ]
+        for index, (image, kind) in enumerate(zip(images, kinds), start=1):
+            content.extend(
+                [
+                    {
+                        "type": "text",
+                        "text": (
+                            f"Room evidence view {index}/{len(images)}; "
+                            f"observation_kind={kind}:"
+                        ),
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": _image_data_url(image)},
+                    },
+                ]
+            )
         result = self._parse(
             self.config.reasoning_model,
             _RoomDescriptionResult,
@@ -150,28 +204,26 @@ class QwenVLMClient:
                 {
                     "role": "system",
                     "content": (
-                        "Classify the visually observed indoor room from the RGB image. "
+                        "Classify one indoor room jointly from every supplied RGB view. "
                         "The supplied room id is an anonymous map id, not a semantic "
-                        "label. Infer room_type from directly visible room layout, fixed "
-                        "features, and large room-defining furniture. Detector proposals "
+                        "label. The views belong to the same geometric room; doorway PEEK "
+                        "views are partial evidence and ordinary in-room views are stronger. "
+                        "Do not let one narrow or ambiguous view override consistent evidence "
+                        "from the other views. Infer room_type from directly visible room "
+                        "layout, fixed features, and large room-defining furniture. Return a "
+                        "concise canonical English room type such as 'living room', 'kitchen', "
+                        "'bedroom', 'bathroom', or 'dining room'. Detector proposals "
                         "are unverified hints only: never claim an object is present merely "
                         "because its name appears in that list. Do not identify or record "
                         "small movable task targets in visual_cues. If the image does not "
-                        "support a room type, return room_type='unknown' with low confidence."
+                        "support a room type, return room_type='unknown' with low confidence. "
+                        "The user task and any previous room label are intentionally absent; "
+                        "classify only from the supplied visual evidence."
                     ),
                 },
                 {
                     "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": (
-                                f"room_id={room_id}; "
-                                f"unverified_detector_proposals={labels}"
-                            ),
-                        },
-                        {"type": "image_url", "image_url": {"url": _image_data_url(image_rgb)}},
-                    ],
+                    "content": content,
                 },
             ],
         )
@@ -240,6 +292,9 @@ class QwenVLMClient:
         current_images_rgb: Sequence[np.ndarray],
         nearby_room_id: str,
         nearby_images_rgb: Sequence[np.ndarray],
+        *,
+        current_room_semantics: dict[str, Any] | None = None,
+        nearby_room_semantics: dict[str, Any] | None = None,
     ) -> EarlyStopDecision:
         """Compare doorway evidence with the room currently being covered."""
 
@@ -253,6 +308,20 @@ class QwenVLMClient:
             {
                 "type": "text",
                 "text": "Instruction: " + json.dumps(instruction.to_dict(), ensure_ascii=False),
+            },
+            {
+                "type": "text",
+                "text": (
+                    "Shared multi-view Room-node semantics (the status and revision "
+                    "indicate whether each description is tentative or stable):\n"
+                    + json.dumps(
+                        {
+                            current_room_id: current_room_semantics or {},
+                            nearby_room_id: nearby_room_semantics or {},
+                        },
+                        ensure_ascii=False,
+                    )
+                ),
             },
             {
                 "type": "text",
@@ -302,6 +371,9 @@ class QwenVLMClient:
                         "Decide whether to interrupt coverage of the current room and "
                         "search the nearby room. Switch only when the nearby view shows "
                         "the target or substantially stronger task-relevant evidence. "
+                        "Use the supplied multi-view Room-node semantics as the shared "
+                        "room interpretation; tentative labels are revisable and stable "
+                        "labels summarize stronger multi-view evidence. "
                         "Evaluate every supplied view of each room jointly; do not let "
                         "one weak view override stronger evidence from the other views."
                     ),
@@ -329,9 +401,15 @@ class QwenVLMClient:
         candidate_crop_rgb: np.ndarray | None = None,
         candidate_clipped_by_image_edge: bool = False,
     ) -> TargetVerification:
-        """Verify visual identity first, then the instruction constraints."""
+        """Verify identity and local visual relations, never room semantics.
+
+        ``room_description`` remains accepted for source compatibility, but is
+        intentionally ignored.  The search policy evaluates room constraints
+        against the independently maintained Room node.
+        """
 
         del candidate_label  # The detector's class prediction must not bias identity.
+        del room_description
         crop = image_rgb if candidate_crop_rgb is None else candidate_crop_rgb
         identity = self._parse(
             self.config.reasoning_model,
@@ -434,21 +512,29 @@ class QwenVLMClient:
                 reason=f"identity {identity.verdict}: {identity.reason}",
                 verdict=identity.verdict,
             )
-        if not instruction.needs_vlm_verification:
+        needs_local_relation = bool(
+            instruction.spatial_condition
+            or instruction.attribute_condition
+            or instruction.anchor_object
+            or instruction.anchor_attribute
+        )
+        if not needs_local_relation:
             return TargetVerification(
                 is_target=True,
-                reason=f"identity confirmed: {identity.reason}; no relation constraints",
+                reason=(
+                    f"identity confirmed: {identity.reason}; "
+                    "no local relation constraints"
+                ),
                 verdict="confirmed",
+                visual_verdict="confirmed",
             )
 
         relation_context = {
             "requested_target_category": instruction.target_object,
-            "room_condition": instruction.room_condition,
             "spatial_condition": instruction.spatial_condition,
             "attribute_condition": instruction.attribute_condition,
             "anchor_object": instruction.anchor_object,
             "anchor_attribute": instruction.anchor_attribute,
-            "runtime_room_description": room_description,
             "untrusted_nearby_detector_labels": sorted(set(nearby_objects)),
         }
         relation = self._parse(
@@ -459,11 +545,18 @@ class QwenVLMClient:
                     "role": "system",
                     "content": (
                         "Stage 2: verify every explicit non-identity constraint for the same "
-                        "green-outlined candidate whose identity is confirmed. Return exactly "
-                        "one verdict for all explicit room, attribute, and spatial constraints: "
+                        "green-outlined candidate whose identity is confirmed. The candidate's "
+                        "identity has already been confirmed by Stage 1 and is a fixed premise "
+                        "for this stage. Do not re-identify, question, discuss, or contradict the "
+                        "candidate's object category, even if its appearance seems ambiguous in "
+                        "this image. Judge only anchor identity, spatial relation, and "
+                        "non-category attributes. Room type is deliberately evaluated elsewhere "
+                        "from the multi-view Room node: do not infer, discuss, confirm, or reject "
+                        "the room type in this stage. Return exactly one verdict for all supplied "
+                        "local attribute and spatial constraints: "
                         "confirmed only when the supplied image directly supports every "
                         "constraint; rejected only when a visible constraint is contradicted; "
-                        "uncertain when an anchor, relation, attribute, or room cue is not "
+                        "uncertain when an anchor, relation, or attribute is not "
                         "visible enough to decide. The outlined candidate itself must "
                         "participate in the requested relation; do not substitute another "
                         "object elsewhere. Merely seeing an anchor nearby is insufficient. "
@@ -474,8 +567,8 @@ class QwenVLMClient:
                         "or sufficiently clear whole-scene evidence, otherwise return uncertain. "
                         "The green outline is an artificial annotation and is not part of the "
                         "candidate's appearance. "
-                        "Treat runtime room text and detector-provided nearby labels as "
-                        "unverified supporting hints, never as proof. Do not use object-size "
+                        "Treat detector-provided nearby labels as unverified supporting hints, "
+                        "never as proof. Do not use object-size "
                         "assumptions. Never turn missing evidence into either rejection or "
                         "confirmation."
                     ),
@@ -500,6 +593,7 @@ class QwenVLMClient:
                     f"constraints {relation.verdict}: {relation.reason}"
                 ),
                 verdict=relation.verdict,
+                visual_verdict=relation.verdict,
             )
         return TargetVerification(
             is_target=True,
@@ -508,4 +602,5 @@ class QwenVLMClient:
                 f"constraints confirmed: {relation.reason}"
             ),
             verdict="confirmed",
+            visual_verdict="confirmed",
         )

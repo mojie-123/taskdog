@@ -92,7 +92,64 @@
     <texture name="grid" type="2d" builtin="checker" rgb1="0.8 0.8 0.8" rgb2="0.6 0.6 0.6" width="512" height="512" />
     <material name="grid_mat" texture="grid" texrepeat="10 10" reflectance="0.2" />
 
+    <!-- Low-contrast household materials: improve visual semantics without
+         changing any furniture geometry, collision, or navigation footprint. -->
+    <texture name="wood_warm_tex" type="2d" file="textures/house/wood_warm.png" />
+    <texture name="fabric_blue_tex" type="2d" file="textures/house/fabric_blue.png" />
+    <texture name="fabric_beige_tex" type="2d" file="textures/house/fabric_beige.png" />
+    <texture name="stone_gray_tex" type="2d" file="textures/house/stone_gray.png" />
+    <texture name="brushed_metal_tex" type="2d" file="textures/house/brushed_metal.png" />
+    <texture name="fridge_front_tex" type="2d" file="textures/house/fridge_front.png" />
+    <texture name="tv_console_front_tex" type="2d" file="textures/house/tv_console_module.png" />
+    <texture name="living_storage_front_tex" type="2d" file="textures/house/living_storage_module.png" />
+    <texture name="wardrobe_front_tex" type="2d" file="textures/house/wardrobe_module.png" />
+    <texture name="kitchen_cabinet_front_tex" type="2d" file="textures/house/kitchen_cabinet_module.png" />
+    <material name="wood_warm_mat" texture="wood_warm_tex" texrepeat="1.5 1.5"
+              texuniform="true" specular="0.12" shininess="0.18" reflectance="0.03" />
+    <material name="fabric_blue_mat" texture="fabric_blue_tex" texrepeat="3 3"
+              texuniform="true" specular="0.03" shininess="0.05" reflectance="0" />
+    <material name="fabric_beige_mat" texture="fabric_beige_tex" texrepeat="3 3"
+              texuniform="true" specular="0.03" shininess="0.05" reflectance="0" />
+    <material name="stone_gray_mat" texture="stone_gray_tex" texrepeat="2 2"
+              texuniform="true" specular="0.22" shininess="0.30" reflectance="0.05" />
+    <material name="brushed_metal_mat" texture="brushed_metal_tex" texrepeat="2 2"
+              texuniform="true" specular="0.35" shininess="0.45" reflectance="0.08" />
+    <material name="fridge_front_mat" texture="fridge_front_tex"
+              specular="0.12" shininess="0.18" reflectance="0.02" />
+    <material name="tv_console_front_mat" texture="tv_console_front_tex" texrepeat="4 1"
+              specular="0.08" shininess="0.12" reflectance="0.01" />
+    <material name="living_storage_front_mat" texture="living_storage_front_tex" texrepeat="8 1"
+              specular="0.08" shininess="0.12" reflectance="0.01" />
+    <material name="wardrobe_front_mat" texture="wardrobe_front_tex" texrepeat="3 1"
+              specular="0.08" shininess="0.12" reflectance="0.01" />
+    <material name="kitchen_cabinet_right_front_mat" texture="kitchen_cabinet_front_tex" texrepeat="6 1"
+              specular="0.10" shininess="0.15" reflectance="0.01" />
+    <material name="kitchen_cabinet_bottom_front_mat" texture="kitchen_cabinet_front_tex" texrepeat="8 1"
+              specular="0.10" shininess="0.15" reflectance="0.01" />
+    <!-- Median base color sampled from kitchen_cabinet_module.png.  Use it on
+         cabinet carcasses/end caps so uncovered side faces match the fronts. -->
+    <material name="kitchen_cabinet_side_mat" rgba="0.545 0.561 0.518 1"
+              specular="0.10" shininess="0.15" reflectance="0.01" />
+
     <!-- object meshes (absolute paths, scale=1 -> unit=meters) -->
+    <mesh name="fridge_front_panel_mesh"
+          file="/home/mojie/taskdog/custom_envs/mujoco/meshes/house/fridge_front_panel.obj"
+          scale="1 1 1" inertia="shell" />
+    <mesh name="tv_console_front_panel_mesh"
+          file="/home/mojie/taskdog/custom_envs/mujoco/meshes/house/cabinet_front_unit.obj"
+          scale="3.0 1 0.55" inertia="shell" />
+    <mesh name="living_storage_front_panel_mesh"
+          file="/home/mojie/taskdog/custom_envs/mujoco/meshes/house/cabinet_front_unit.obj"
+          scale="5.8 1 0.9" inertia="shell" />
+    <mesh name="wardrobe_front_panel_mesh"
+          file="/home/mojie/taskdog/custom_envs/mujoco/meshes/house/cabinet_front_unit.obj"
+          scale="2.7 1 1.2" inertia="shell" />
+    <mesh name="kitchen_counter_right_front_panel_mesh"
+          file="/home/mojie/taskdog/custom_envs/mujoco/meshes/house/cabinet_front_unit.obj"
+          scale="4.05 1 0.9" inertia="shell" />
+    <mesh name="kitchen_counter_bottom_front_panel_mesh"
+          file="/home/mojie/taskdog/custom_envs/mujoco/meshes/house/cabinet_front_unit.obj"
+          scale="5.2 1 0.9" inertia="shell" />
     <mesh name="banana_collision" file="/home/mojie/taskdog/custom_envs/mujoco/meshes/banana/collision.obj" scale="1 1 1" />
     <mesh name="banana_visual"    file="/home/mojie/taskdog/custom_envs/mujoco/meshes/banana/textured.obj"  scale="1 1 1" />
     <!-- collision 用 collision_flat.obj（第四轮"平顶化" + 第七轮"底面穹顶"，脚本 scripts/generate_apple_collision.py）：
@@ -422,21 +479,21 @@
     <!-- Main sofa moved back so it sits against the top wall -->
     <body name="living_sofa_main" pos="7.5 0.80 0">
       <geom name="living_sofa_main_seat" type="box" pos="0 0 0.28"
-            size="2.50 0.675 0.18" rgba="0.24 0.39 0.62 1" />
+            size="2.50 0.675 0.18" material="fabric_blue_mat" />
       <geom name="living_sofa_main_back" type="box" pos="0 -0.56 0.63"
-            size="2.50 0.12 0.45" rgba="0.20 0.34 0.55 1" />
+            size="2.50 0.12 0.45" material="fabric_blue_mat" />
       <geom name="living_sofa_main_arm_l" type="box" pos="2.42 0 0.48"
-            size="0.08 0.675 0.30" rgba="0.20 0.34 0.55 1" />
+            size="0.08 0.675 0.30" material="fabric_blue_mat" />
       <geom name="living_sofa_main_arm_r" type="box" pos="-2.42 0 0.48"
-            size="0.08 0.675 0.30" rgba="0.20 0.34 0.55 1" />
+            size="0.08 0.675 0.30" material="fabric_blue_mat" />
     </body>
 
     <!-- Side sofa: enlarged 1.5x footprint -->
     <body name="living_sofa_side" pos="13.20 3.60 0">
       <geom name="living_sofa_side_seat" type="box" pos="0 0 0.28"
-            size="0.75 0.90 0.18" rgba="0.30 0.46 0.67 1" />
+            size="0.75 0.90 0.18" material="fabric_blue_mat" />
       <geom name="living_sofa_side_back" type="box" pos="0.67 0 0.62"
-            size="0.08 0.90 0.44" rgba="0.24 0.39 0.60 1" />
+            size="0.08 0.90 0.44" material="fabric_blue_mat" />
     </body>
 
     <!-- Storage cabinet row behind the blue side sofa.
@@ -444,21 +501,26 @@
          essentially the full living-room width. -->
     <body name="living_storage_row" pos="15.65 3.00 0">
       <geom name="living_storage_body" type="box" pos="0 0 0.45"
-            size="0.30 2.90 0.45" rgba="0.58 0.43 0.28 1" />
+            size="0.30 2.90 0.45" material="wood_warm_mat" />
       <geom name="living_storage_top" type="box" pos="0 0 0.92"
-            size="0.31 2.91 0.02" rgba="0.42 0.30 0.20 1" />
+            size="0.31 2.91 0.02" material="wood_warm_mat" />
       <geom name="living_storage_div_1" type="box" pos="0 -1.45 0.45"
-            size="0.31 0.015 0.42" rgba="0.46 0.33 0.22 1" />
+            size="0.31 0.015 0.42" material="wood_warm_mat" />
       <geom name="living_storage_div_2" type="box" pos="0 0.0 0.45"
-            size="0.31 0.015 0.42" rgba="0.46 0.33 0.22 1" />
+            size="0.31 0.015 0.42" material="wood_warm_mat" />
       <geom name="living_storage_div_3" type="box" pos="0 1.45 0.45"
-            size="0.31 0.015 0.42" rgba="0.46 0.33 0.22 1" />
+            size="0.31 0.015 0.42" material="wood_warm_mat" />
+      <!-- Front faces -X toward the living-room interior. -->
+      <geom name="living_storage_front_visual" type="mesh"
+            mesh="living_storage_front_panel_mesh" material="living_storage_front_mat"
+            pos="-0.312 0 0.45" quat="0.7071068 0 0 0.7071068"
+            contype="0" conaffinity="0" group="1" />
     </body>
 
     <!-- Coffee table: lengthened to match the main sofa -->
     <body name="living_coffee_table" pos="7.50 3.65 0">
       <geom name="coffee_top" type="box" pos="0 0 0.42"
-            size="2.50 0.45 0.03" rgba="0.52 0.31 0.16 1" />
+            size="2.50 0.45 0.03" material="wood_warm_mat" />
       <geom name="coffee_leg_1" type="box" pos="2.35 0.34 0.20"
             size="0.04 0.04 0.20" rgba="0.38 0.22 0.12 1" />
       <geom name="coffee_leg_2" type="box" pos="2.35 -0.34 0.20"
@@ -483,7 +545,12 @@
     <!-- TV console: made narrower in depth and pushed against the wall -->
     <body name="living_tv_console" pos="7.50 5.73 0">
       <geom name="tv_console" type="box" pos="0 0 0.275"
-            size="1.50 0.22 0.275" rgba="0.35 0.27 0.20 1" />
+            size="1.50 0.22 0.275" material="wood_warm_mat" />
+      <!-- Front faces -Y into the living room. -->
+      <geom name="tv_console_front_visual" type="mesh"
+            mesh="tv_console_front_panel_mesh" material="tv_console_front_mat"
+            pos="0 -0.221 0.275" quat="0 0 0 1"
+            contype="0" conaffinity="0" group="1" />
       <geom name="tv_screen" type="box" pos="0 -0.10 0.98"
             size="1.10 0.05 0.50" rgba="0.06 0.07 0.08 1" />
     </body>
@@ -491,15 +558,15 @@
     <!-- Extra living-room armchair moved to face the side table near the living-room / kitchen corner -->
     <body name="living_armchair" pos="0.80 3.75 0">
       <geom name="living_armchair_seat" type="box" pos="0 0 0.30"
-            size="0.49 0.49 0.18" rgba="0.62 0.44 0.26 1" />
+            size="0.49 0.49 0.18" material="fabric_beige_mat" />
       <geom name="living_armchair_back" type="box" pos="0 -0.42 0.62"
-            size="0.49 0.07 0.40" rgba="0.55 0.37 0.21 1" />
+            size="0.49 0.07 0.40" material="fabric_beige_mat" />
     </body>
 
     <!-- Small side table enlarged to 1.8 x 1.8 m and moved into the living-room / kitchen wall corner -->
     <body name="living_side_table" pos="0.80 5.20 0">
       <geom name="living_side_table_top" type="box" pos="0 0 0.48"
-            size="0.90 0.90 0.03" rgba="0.50 0.32 0.18 1" />
+            size="0.90 0.90 0.03" material="wood_warm_mat" />
       <geom name="living_side_table_leg" type="cylinder" pos="0 0 0.24"
             size="0.09 0.24" rgba="0.38 0.24 0.14 1" />
     </body>
@@ -508,23 +575,27 @@
     <!-- Shelf enlarged to 1.5x footprint -->
     <body name="bedroom_shelf" pos="10.30 6.55 0">
       <geom name="bedroom_shelf_body" type="box" pos="0 0 0.60"
-            size="1.35 0.3375 0.60" rgba="0.48 0.32 0.20 1" />
+            size="1.35 0.3375 0.60" material="wood_warm_mat" />
+      <!-- This box serves as the bedroom wardrobe; its accessible front is +Y. -->
+      <geom name="bedroom_wardrobe_front_visual" type="mesh"
+            mesh="wardrobe_front_panel_mesh" material="wardrobe_front_mat"
+            pos="0 0.3385 0.60" contype="0" conaffinity="0" group="1" />
     </body>
 
     <!-- Bed: footprint enlarged by another 1.2x and kept tight in the bedroom corner -->
     <body name="bedroom_bed" pos="14.60 12.15 0">
       <geom name="bed_frame" type="box" pos="0 0 0.22"
-            size="1.35 1.80 0.22" rgba="0.43 0.30 0.20 1" />
+            size="1.35 1.80 0.22" material="wood_warm_mat" />
       <geom name="bed_mattress" type="box" pos="0 0 0.50"
-            size="1.314 1.764 0.10" rgba="0.78 0.84 0.88 1" />
+            size="1.314 1.764 0.10" material="fabric_beige_mat" />
       <geom name="bed_headboard" type="box" pos="0 1.74 0.72"
-            size="1.35 0.06 0.52" rgba="0.40 0.28 0.19 1" />
+            size="1.35 0.06 0.52" material="wood_warm_mat" />
     </body>
 
     <!-- Bedroom desk: enlarged to 1.5x footprint, still near divider wall -->
     <body name="bedroom_desk" pos="8.95 10.60 0">
       <geom name="bedroom_desk_top" type="box" pos="0 0 0.72"
-            size="0.45 1.125 0.03" rgba="0.55 0.38 0.22 1" />
+            size="0.45 1.125 0.03" material="wood_warm_mat" />
       <geom name="bedroom_desk_leg_1" type="box" pos="0.36 1.00 0.35"
             size="0.035 0.035 0.35" rgba="0.38 0.26 0.16 1" />
       <geom name="bedroom_desk_leg_2" type="box" pos="0.36 -1.00 0.35"
@@ -538,9 +609,9 @@
     <!-- Bedroom chair moved close to the desk and rotated to face it -->
     <body name="bedroom_chair" pos="10.15 10.60 0" quat="0.7071068 0 0 -0.7071068">
       <geom name="bedroom_chair_seat" type="box" pos="0 0 0.45"
-            size="0.45 0.45 0.04" rgba="0.55 0.40 0.28 1" />
+            size="0.45 0.45 0.04" material="wood_warm_mat" />
       <geom name="bedroom_chair_back" type="box" pos="0 0.40 0.70"
-            size="0.45 0.04 0.25" rgba="0.50 0.34 0.23 1" />
+            size="0.45 0.04 0.25" material="wood_warm_mat" />
       <geom name="bedroom_chair_base" type="cylinder" pos="0 0 0.22"
             size="0.05 0.22" rgba="0.28 0.28 0.28 1" />
     </body>
@@ -548,23 +619,30 @@
     <!-- Nightstand moved beside the bed and flush with the bottom wall -->
     <body name="bedroom_nightstand" pos="12.75 13.6125 0">
       <geom name="bedroom_nightstand_body" type="box" pos="0 0 0.25"
-            size="0.3375 0.3375 0.25" rgba="0.52 0.35 0.22 1" />
+            size="0.3375 0.3375 0.25" material="wood_warm_mat" />
     </body>
 
     <!-- ============================== KITCHEN ========================= -->
     <!-- Refrigerator: enlarged to 1.5x footprint -->
     <body name="kitchen_fridge" pos="6.80 6.85 0">
       <geom name="kitchen_fridge_body" type="box" pos="0 0 0.90"
-            size="0.60 0.525 0.90" rgba="0.72 0.75 0.77 1" />
+            size="0.60 0.525 0.90" material="brushed_metal_mat" />
+      <!-- Dedicated UV front: visual-only so the physical refrigerator and
+           every navigation/collision map remain unchanged. -->
+      <geom name="kitchen_fridge_front_visual" type="mesh"
+            mesh="fridge_front_panel_mesh" material="fridge_front_mat"
+            pos="0 0.526 0.90" contype="0" conaffinity="0" group="1" />
+      <!-- Keep the original handle collider unchanged, but hide its flat
+           rendering because the dedicated front texture already has handles. -->
       <geom name="kitchen_fridge_handle" type="box" pos="-0.46 -0.54 1.05"
-            size="0.025 0.025 0.35" rgba="0.20 0.20 0.20 1" />
+            size="0.025 0.025 0.35" rgba="0.20 0.20 0.20 0" />
     </body>
 
     <!-- Kitchen dining / manipulation table: made larger than 1.5x for easier grasp staging -->
     <body name="kitchen_table" pos="4.50 10.40 0">
       <geom name="kitchen_table_top" type="box" pos="0 0 0.72"
             size="1.20 0.90 0.03" friction="0.8 0.01 0.01"
-            rgba="0.64 0.48 0.30 1" />
+            material="wood_warm_mat" />
       <geom name="kitchen_table_leg_1" type="box" pos="1.08 0.78 0.35"
             size="0.045 0.045 0.35" rgba="0.42 0.30 0.20 1" />
       <geom name="kitchen_table_leg_2" type="box" pos="1.08 -0.78 0.35"
@@ -578,35 +656,47 @@
     <!-- L-shaped kitchen counters: horizontal leg is intentionally longer for an asymmetric L shape -->
     <body name="kitchen_counter_right" pos="0.51 11.915 0">
       <geom name="kitchen_counter_right_body" type="box" pos="0 0 0.45"
-            size="0.45 2.025 0.45" rgba="0.70 0.70 0.66 1" />
+            size="0.45 2.025 0.45" material="kitchen_cabinet_side_mat" />
+      <!-- Accessible cabinet face is +X, toward the kitchen interior. -->
+      <geom name="kitchen_counter_right_front_visual" type="mesh"
+            mesh="kitchen_counter_right_front_panel_mesh"
+            material="kitchen_cabinet_right_front_mat"
+            pos="0.461 0 0.45" quat="0.7071068 0 0 -0.7071068"
+            contype="0" conaffinity="0" group="1" />
       <geom name="kitchen_counter_right_top" type="box" pos="0 0 0.92"
             size="0.46 2.035 0.02" friction="0.8 0.01 0.01"
-            rgba="0.34 0.35 0.34 1" />
+            material="stone_gray_mat" />
     </body>
 
     <body name="kitchen_counter_bottom" pos="2.66 13.49 0">
       <geom name="kitchen_counter_bottom_body" type="box" pos="0 0 0.45"
-            size="2.60 0.45 0.45" rgba="0.70 0.70 0.66 1" />
+            size="2.60 0.45 0.45" material="kitchen_cabinet_side_mat" />
+      <!-- Accessible cabinet face is -Y, toward the kitchen interior. -->
+      <geom name="kitchen_counter_bottom_front_visual" type="mesh"
+            mesh="kitchen_counter_bottom_front_panel_mesh"
+            material="kitchen_cabinet_bottom_front_mat"
+            pos="0 -0.461 0.45" quat="0 0 0 1"
+            contype="0" conaffinity="0" group="1" />
       <geom name="kitchen_counter_bottom_top" type="box" pos="0 0 0.92"
             size="2.61 0.46 0.02" friction="0.8 0.01 0.01"
-            rgba="0.34 0.35 0.34 1" />
+            material="stone_gray_mat" />
     </body>
 
     <!-- Simple kitchen chairs, moved closer to the kitchen table and oriented toward it -->
     <body name="kitchen_chair_1" pos="6.45 10.40 0">
       <geom name="kitchen_chair_1_seat" type="box" pos="0 0 0.45"
-            size="0.375 0.375 0.04" rgba="0.48 0.33 0.20 1" />
+            size="0.375 0.375 0.04" material="wood_warm_mat" />
       <geom name="kitchen_chair_1_back" type="box" pos="0.33 0 0.70"
-            size="0.04 0.375 0.25" rgba="0.43 0.29 0.18 1" />
+            size="0.04 0.375 0.25" material="wood_warm_mat" />
       <geom name="kitchen_chair_1_base" type="cylinder" pos="0 0 0.22"
             size="0.045 0.22" rgba="0.25 0.25 0.25 1" />
     </body>
 
     <body name="kitchen_chair_2" pos="2.55 10.40 0">
       <geom name="kitchen_chair_2_seat" type="box" pos="0 0 0.45"
-            size="0.375 0.375 0.04" rgba="0.48 0.33 0.20 1" />
+            size="0.375 0.375 0.04" material="wood_warm_mat" />
       <geom name="kitchen_chair_2_back" type="box" pos="-0.33 0 0.70"
-            size="0.04 0.375 0.25" rgba="0.43 0.29 0.18 1" />
+            size="0.04 0.375 0.25" material="wood_warm_mat" />
       <geom name="kitchen_chair_2_base" type="cylinder" pos="0 0 0.22"
             size="0.045 0.22" rgba="0.25 0.25 0.25 1" />
     </body>

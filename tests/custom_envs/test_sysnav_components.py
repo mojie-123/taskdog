@@ -26,6 +26,7 @@ from custom_envs.scripts.sysnav.types import (
     Detection2D,
     EarlyStopDecision,
     LocalizedDetection,
+    RoomDescription,
     SearchInstruction,
     TargetVerification,
 )
@@ -73,6 +74,10 @@ def test_config_and_instruction_prompts():
     assert instruction.detector_prompts == ("cube", "coffee table")
     assert instruction.needs_vlm_verification
     assert config.search.early_stop_max_current_images == 4
+    assert config.search.room_semantic_max_images == 6
+    assert config.search.room_semantic_refresh_min_new_images == 2
+    assert config.search.room_semantic_stable_min_ordinary_views == 2
+    assert config.search.room_semantic_stable_confidence == 0.75
     assert config.search.target_accept_confidence == 0.20
     assert config.transit_detection.enabled
     assert config.transit_detection.frequency_hz == 2.0
@@ -357,9 +362,16 @@ def test_vlm_target_verification_runs_relation_only_after_identity_passes():
         "_TargetRelationResult",
     ]
     relation_prompt = calls[1][1][0]["content"]
+    assert "identity has already been confirmed by Stage 1" in relation_prompt
+    assert "Do not re-identify, question, discuss, or contradict" in relation_prompt
+    assert "Room type is deliberately evaluated elsewhere" in relation_prompt
+    assert "do not infer, discuss, confirm, or reject the room type" in relation_prompt
     assert "do not substitute another" in relation_prompt
     assert "do not rename an arbitrary support surface" in relation_prompt
     assert "Never turn missing evidence" in relation_prompt
+    relation_context = calls[1][1][1]["content"][0]["text"]
+    assert "room_condition" not in relation_context
+    assert "runtime_room_description" not in relation_context
 
 
 def test_vlm_target_verification_preserves_uncertain_identity():
@@ -446,6 +458,36 @@ def test_room_description_treats_detector_labels_as_unverified_hints():
     assert "unverified_detector_proposals=['cube']" in user_text
 
 
+def test_multiview_room_description_jointly_sends_every_view():
+    config = load_sysnav_config()
+    client = QwenVLMClient(config.vlm)
+    calls = []
+
+    def fake_parse(model, response_format, messages):
+        calls.append(messages)
+        return SimpleNamespace(
+            room_type="living room",
+            visual_cues=["sofa", "low central table"],
+            confidence=0.9,
+        )
+
+    client._parse = fake_parse
+    image = np.zeros((16, 16, 3), dtype=np.uint8)
+    result = client.describe_room_multiview(
+        "room_0",
+        (image, image, image),
+        observation_kinds=("peek", "ordinary", "ordinary"),
+    )
+
+    assert result.room_type == "living room"
+    content = calls[0][1]["content"]
+    assert len([item for item in content if item["type"] == "image_url"]) == 3
+    text = "\n".join(item["text"] for item in content if item["type"] == "text")
+    assert "same anonymous geometric room" in text
+    assert "observation_kind=peek" in text
+    assert "observation_kind=ordinary" in text
+
+
 def test_component_factory_is_lazy_and_does_not_require_api_key():
     components = build_sysnav_components(enable_vlm=True)
     assert set(components.room_graph.nodes) == {"room_0", "room_1", "room_2"}
@@ -513,6 +555,39 @@ def test_scene_memory_merges_repeated_object_observations(tmp_path):
     assert '"room_0"' in output.read_text(encoding="utf-8")
 
 
+def test_room_semantics_are_revisable_and_only_multiview_evidence_is_stable():
+    config, _, graph, _ = _components()
+    memory = SceneMemory(graph)
+
+    memory.update_room_description(
+        "room_0",
+        RoomDescription("kitchen", ("cabinet-like wall",), 0.6),
+        evidence_count=1,
+        ordinary_evidence_count=0,
+        evidence_tokens=("peek_1",),
+        stable_min_ordinary_views=2,
+        stable_confidence=0.75,
+    )
+    state = memory.rooms["room_0"]
+    assert state.semantic_description == "kitchen"
+    assert state.semantic_status == "tentative"
+    assert state.semantic_revision == 1
+
+    memory.update_room_description(
+        "room_0",
+        RoomDescription("living room", ("sofa", "low table"), 0.88),
+        evidence_count=3,
+        ordinary_evidence_count=2,
+        evidence_tokens=("peek_1", "view_1", "view_2"),
+        stable_min_ordinary_views=2,
+        stable_confidence=0.75,
+    )
+    assert state.semantic_description == "living room"
+    assert state.semantic_status == "stable"
+    assert state.semantic_revision == 2
+    assert state.semantic_evidence_tokens == ("peek_1", "view_1", "view_2")
+
+
 def test_runtime_persists_object_only_after_explicit_verification():
     config, _, graph, _ = _components()
     memory = SceneMemory(graph, merge_distance_m=config.search.object_merge_distance_m)
@@ -558,9 +633,21 @@ def test_runtime_persists_object_only_after_explicit_verification():
 
 
 class _EarlyStopReasoner:
-    def should_switch_room(self, instruction, current_room_id, current_images_rgb, nearby_room_id, nearby_images_rgb):
+    def should_switch_room(
+        self,
+        instruction,
+        current_room_id,
+        current_images_rgb,
+        nearby_room_id,
+        nearby_images_rgb,
+        *,
+        current_room_semantics,
+        nearby_room_semantics,
+    ):
         assert len(current_images_rgb) == 2
         assert len(nearby_images_rgb) == 1
+        assert current_room_semantics["status"] == "unknown"
+        assert nearby_room_semantics["status"] == "unknown"
         return EarlyStopDecision(True, nearby_room_id, "nearby view contains stronger evidence")
 
 
@@ -620,6 +707,140 @@ def test_search_policy_sends_an_unannotated_candidate_crop_to_vlm():
     assert reasoner.clipped
 
 
+def test_search_policy_combines_visual_relation_with_stable_room_node():
+    config, _, graph, planner = _components()
+    memory = SceneMemory(graph)
+    memory.update_room_description(
+        "room_0",
+        RoomDescription("living room", ("sofa", "low table"), 0.9),
+        evidence_count=3,
+        ordinary_evidence_count=2,
+        stable_min_ordinary_views=2,
+        stable_confidence=0.75,
+    )
+
+    class ConfirmVisualReasoner:
+        def verify_target(self, instruction, *args, **kwargs):
+            assert instruction.room_condition == ""
+            return TargetVerification(
+                True,
+                "identity and coffee-table relation confirmed",
+                verdict="confirmed",
+                visual_verdict="confirmed",
+            )
+
+    policy = SysNavSearchPolicy(
+        graph, planner, memory, config.search, reasoner=ConfirmVisualReasoner()
+    )
+    policy.start(
+        SearchInstruction(
+            "去客厅茶几上拿 cube",
+            "cube",
+            room_condition="客厅",
+            spatial_condition="上",
+            anchor_object="茶几",
+        )
+    )
+    answer = policy.verify_candidate(
+        _localized([2.0, 2.0, 0.8], confidence=0.9),
+        np.zeros((8, 8, 3), dtype=np.uint8),
+    )
+
+    assert answer.is_target
+    assert answer.visual_verdict == "confirmed"
+    assert answer.room_verdict == "confirmed"
+    assert "stable Room node" in answer.reason
+
+
+def test_search_policy_keeps_visually_confirmed_target_pending_for_tentative_room():
+    config, _, graph, planner = _components()
+    memory = SceneMemory(graph)
+    memory.update_room_description(
+        "room_0",
+        RoomDescription("kitchen", ("cabinet-like wall",), 0.6),
+        evidence_count=1,
+        ordinary_evidence_count=0,
+    )
+
+    class ConfirmVisualReasoner:
+        def verify_target(self, instruction, *args, **kwargs):
+            return TargetVerification(True, "visual relation confirmed", verdict="confirmed")
+
+    policy = SysNavSearchPolicy(
+        graph, planner, memory, config.search, reasoner=ConfirmVisualReasoner()
+    )
+    policy.start(
+        SearchInstruction(
+            "去客厅茶几上拿 cube",
+            "cube",
+            room_condition="客厅",
+            spatial_condition="上",
+            anchor_object="茶几",
+        )
+    )
+    answer = policy.verify_candidate(
+        _localized([2.0, 2.0, 0.8], confidence=0.9),
+        np.zeros((8, 8, 3), dtype=np.uint8),
+    )
+
+    assert not answer.is_target
+    assert answer.verdict == "uncertain"
+    assert answer.visual_verdict == "confirmed"
+    assert answer.room_verdict == "uncertain"
+    assert "semantics are tentative" in answer.reason
+
+
+def test_pending_visual_target_commits_after_room_semantics_become_stable():
+    config, _, graph, planner = _components()
+    memory = SceneMemory(graph)
+    policy = SysNavSearchPolicy(graph, planner, memory, config.search)
+    policy.start(
+        SearchInstruction(
+            "去客厅茶几上拿 cube",
+            "cube",
+            room_condition="客厅",
+            spatial_condition="上",
+            anchor_object="茶几",
+        )
+    )
+    viewpoint = memory.add_viewpoint("room_0", (1.0, 1.0, 0.0), [])
+    runner = object.__new__(SysNavSearchRunner)
+    runner.components = SimpleNamespace(
+        config=config,
+        scene_memory=memory,
+        search_policy=policy,
+        commit_verified_detection=memory.attach_verified_detection,
+    )
+    runner._pending_targets = []
+    runner._record_event = lambda *unused, **unused_kwargs: None
+    target = _localized([2.0, 2.0, 0.8], confidence=0.9)
+    runner._remember_pending_target(
+        target,
+        viewpoint.viewpoint_id,
+        source="test",
+        visual_reason="identity and coffee-table relation confirmed",
+    )
+
+    assert memory.objects == {}
+    assert runner._resolve_pending_target("room_0") is None
+    memory.update_room_description(
+        "room_0",
+        RoomDescription("living room", ("sofa", "low table"), 0.9),
+        evidence_count=3,
+        ordinary_evidence_count=2,
+        stable_min_ordinary_views=2,
+        stable_confidence=0.75,
+    )
+    resolved = runner._resolve_pending_target("room_0")
+
+    assert resolved is target
+    assert len(memory.objects) == 1
+    record = next(iter(memory.objects.values()))
+    assert record.observation_count == 1
+    assert record.viewpoint_ids == [viewpoint.viewpoint_id]
+    assert runner._pending_targets == []
+
+
 def test_doorway_peek_keeps_pose_room_but_describes_viewed_room(tmp_path):
     frame = RGBDFrame(
         rgb=np.zeros((4, 4, 3), dtype=np.uint8),
@@ -640,7 +861,10 @@ def test_doorway_peek_keeps_pose_room_but_describes_viewed_room(tmp_path):
         ):
             self.metric_room = room_id
             return SimpleNamespace(
-                detections=(), localized_detections=(), coverage=None
+                viewpoint=SimpleNamespace(viewpoint_id="viewpoint_0"),
+                detections=(),
+                localized_detections=(),
+                coverage=None,
             )
 
     runner = object.__new__(SysNavSearchRunner)
@@ -654,7 +878,7 @@ def test_doorway_peek_keeps_pose_room_but_describes_viewed_room(tmp_path):
     runner._save_image = lambda unused_frame, token: str(tmp_path / f"{token}.png")
     described = []
     runner._describe_room = lambda room_id, *unused: described.append(room_id)
-    runner._verify_targets = lambda *unused: None
+    runner._verify_targets = lambda *unused, **unused_kwargs: None
     runner._record_event = lambda *unused, **unused_kwargs: None
 
     runner._observe(

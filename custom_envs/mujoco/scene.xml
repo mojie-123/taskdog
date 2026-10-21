@@ -79,8 +79,10 @@
     <material name="grid_mat" texture="grid" texrepeat="10 10" reflectance="0.2" />
 
     <!-- object meshes (absolute paths, scale=1 -> unit=meters) -->
-    <mesh name="banana_collision" file="/home/mojie/taskdog/custom_envs/mujoco/meshes/banana/collision.obj" scale="1 1 1" />
-    <mesh name="banana_visual"    file="/home/mojie/taskdog/custom_envs/mujoco/meshes/banana/textured.obj"  scale="1 1 1" />
+    <!-- The source orange is 74 mm wide, slightly larger than the 70 mm gripper.
+         Match the proven apple setup: 0.9 visual scale and an inset 0.8 collision hull. -->
+    <mesh name="orange_collision" file="/home/mojie/taskdog/custom_envs/mujoco/meshes/orange/collision_flat.obj" scale="0.8 0.8 0.8" />
+    <mesh name="orange_visual"    file="/home/mojie/taskdog/custom_envs/mujoco/meshes/orange/textured.obj"       scale="0.9 0.9 0.9" />
     <!-- collision 用 collision_flat.obj（第四轮"平顶化" + 第七轮"底面穹顶"，脚本 scripts/generate_apple_collision.py）：
          原点偏 +0.86/-3.50mm，按 bbox 中心把 x/y 截到 ±33mm（×0.8 后宽 52.8mm、
          余量 8.6mm/侧），z<=14mm 顶点拍平到 z_min 并叠加极浅穹顶 sag 0.0025
@@ -102,8 +104,12 @@
          ~5mm/侧（物理上不穿透碰撞体）。 -->
     <mesh name="apple_collision"  file="/home/mojie/taskdog/custom_envs/mujoco/meshes/apple/collision_flat.obj"  scale="0.8 0.8 0.8" />
     <mesh name="apple_visual"     file="/home/mojie/taskdog/custom_envs/mujoco/meshes/apple/textured.obj"   scale="0.9 0.9 0.9" />
-    <material name="banana_mat" rgba="1.0 0.85 0.1 1" />
+    <!-- The mug mesh is visual-only.  Its open cavity is represented below by
+         convex primitives because MuJoCo treats a mesh collision as a convex hull. -->
+    <mesh name="mug_visual" file="/home/mojie/taskdog/custom_envs/mujoco/meshes/mug/textured.obj" scale="0.62 0.62 0.72" />
+    <material name="orange_mat" rgba="1.0 0.35 0.02 1" />
     <material name="apple_mat"  rgba="0.9 0.1  0.1 1" />
+    <material name="mug_mat"    rgba="0.75 0.02 0.02 1" />
   </asset>
   <worldbody>
     <light name="main_light" pos="5 5 5" dir="0 0 -1" diffuse="0.8 0.8 0.8" />
@@ -334,137 +340,45 @@
             size="0.002" rgba="0 0 0 0" />
     </body>
 
-    <!-- table1: center(5,5), matches IsaacLab Shop_Table scale=(0.008,0.024,0.008) -->
-    <!-- USD extent x:80.85cm y:113.56cm z:82.66cm => actual x=0.6468m y=2.7255m z(top)=0.6613m -->
+    <!-- table1: center(5,5); keep the original 0.6468 x 2.7254 m footprint,
+         but match scene_house.xml/living_coffee_table in height and appearance.
+         Top surface z=0.45 m; top/leg rgba values are copied from that table. -->
     <body name="table1" pos="5.0 5.0 0.0">
-      <geom name="table1_top" type="box" size="0.3234 1.3627 0.04" pos="0 0 0.6213" friction="0.1 0.01 0.01" rgba="0.55 0.55 0.55 1" solref="0.004 1" solimp="0.99 0.999 0.001" />
-      <geom name="table1_leg_fl" type="box" size="0.04 0.04 0.2907" pos="0.2834 1.3227 0.2907" rgba="0.45 0.45 0.45 1" />
-      <geom name="table1_leg_fr" type="box" size="0.04 0.04 0.2907" pos="0.2834 -1.3227 0.2907" rgba="0.45 0.45 0.45 1" />
-      <geom name="table1_leg_hl" type="box" size="0.04 0.04 0.2907" pos="-0.2834 1.3227 0.2907" rgba="0.45 0.45 0.45 1" />
-      <geom name="table1_leg_hr" type="box" size="0.04 0.04 0.2907" pos="-0.2834 -1.3227 0.2907" rgba="0.45 0.45 0.45 1" />
+      <geom name="table1_top" type="box" size="0.3234 1.3627 0.03" pos="0 0 0.42" friction="0.1 0.01 0.01" rgba="0.52 0.31 0.16 1" solref="0.004 1" solimp="0.99 0.999 0.001" />
+      <geom name="table1_leg_fl" type="box" size="0.04 0.04 0.20" pos="0.2834 1.3227 0.20" rgba="0.38 0.22 0.12 1" />
+      <geom name="table1_leg_fr" type="box" size="0.04 0.04 0.20" pos="0.2834 -1.3227 0.20" rgba="0.38 0.22 0.12 1" />
+      <geom name="table1_leg_hl" type="box" size="0.04 0.04 0.20" pos="-0.2834 1.3227 0.20" rgba="0.38 0.22 0.12 1" />
+      <geom name="table1_leg_hr" type="box" size="0.04 0.04 0.20" pos="-0.2834 -1.3227 0.20" rgba="0.38 0.22 0.12 1" />
     </body>
-    <!-- table2: center(8,6), matches IsaacLab Shop_Table_2 scale=(0.008,0.008,0.008) -->
-    <!-- USD extent x:80.85cm y:113.56cm z:82.66cm => actual x=0.6468m y=0.9085m z(top)=0.6613m -->
+    <!-- table2: center(8,6); likewise retain only its original X/Y footprint. -->
     <body name="table2" pos="8.0 6.0 0.0">
-      <geom name="table2_top" type="box" size="0.3234 0.4542 0.04" pos="0 0 0.6213" friction="0.5 0.01 0.01" rgba="0.55 0.55 0.55 1" solref="0.004 1" solimp="0.99 0.999 0.001" />
-      <geom name="table2_leg_fl" type="box" size="0.04 0.04 0.2907" pos="0.2834 0.4142 0.2907" rgba="0.45 0.45 0.45 1" />
-      <geom name="table2_leg_fr" type="box" size="0.04 0.04 0.2907" pos="0.2834 -0.4142 0.2907" rgba="0.45 0.45 0.45 1" />
-      <geom name="table2_leg_hl" type="box" size="0.04 0.04 0.2907" pos="-0.2834 0.4142 0.2907" rgba="0.45 0.45 0.45 1" />
-      <geom name="table2_leg_hr" type="box" size="0.04 0.04 0.2907" pos="-0.2834 -0.4142 0.2907" rgba="0.45 0.45 0.45 1" />
+      <geom name="table2_top" type="box" size="0.3234 0.4542 0.03" pos="0 0 0.42" friction="0.5 0.01 0.01" rgba="0.52 0.31 0.16 1" solref="0.004 1" solimp="0.99 0.999 0.001" />
+      <geom name="table2_leg_fl" type="box" size="0.04 0.04 0.20" pos="0.2834 0.4142 0.20" rgba="0.38 0.22 0.12 1" />
+      <geom name="table2_leg_fr" type="box" size="0.04 0.04 0.20" pos="0.2834 -0.4142 0.20" rgba="0.38 0.22 0.12 1" />
+      <geom name="table2_leg_hl" type="box" size="0.04 0.04 0.20" pos="-0.2834 0.4142 0.20" rgba="0.38 0.22 0.12 1" />
+      <geom name="table2_leg_hr" type="box" size="0.04 0.04 0.20" pos="-0.2834 -0.4142 0.20" rgba="0.38 0.22 0.12 1" />
     </body>
-    <!-- banana on table1: body z = table_surface(0.6613) + mesh_z_min_abs(0.0187) = 0.6800 -->
-    <!--
-    <body name="banana" pos="4.9 5.0 0.6800">
-      <freejoint name="banana_freejoint" />
-      [ visual mesh (no collision) ]
-      <geom name="banana_visual" type="mesh" mesh="banana_visual"
-            contype="0" conaffinity="0" group="1" material="banana_mat" />
-      [collision mesh ]
-      <geom name="banana_geom" type="mesh" mesh="banana_collision"
-            mass="0.068" friction="5.0 0.5 0.5"
-            solref="0.004 1" solimp="0.99 0.999 0.001"
-            rgba="1.0 0.85 0.1 1" />
-    </body> 
-    -->
-
-    <body name="banana" pos="4.9 5.0 0.6800">
-      <freejoint name="banana_freejoint" />
+    <!-- Orange replaces the banana at the same table location. The collision
+         lowest point is -0.248 mm before the 0.8 mesh scale, so z=0.4502 puts
+         it on the table surface at z=0.45. -->
+    <body name="orange" pos="4.9766 5.0 0.4502">
+      <freejoint name="orange_freejoint" />
       
       <!-- 视觉模型 -->
-      <geom name="banana_visual" type="mesh" mesh="banana_visual"
-            contype="0" conaffinity="0" group="1" material="banana_mat" />
+      <geom name="orange_visual" type="mesh" mesh="orange_visual"
+            contype="0" conaffinity="0" group="1" mass="0" material="orange_mat" />
 
-      <!-- 碰撞模型：中心线胶囊链 + ±y 夹持"拍平板"（自动生成，勿手改；
-           重跑 scripts/generate_banana_collision.py 覆盖本块）
-           旧碰撞是 3 根手调胶囊：抓取站（body-x≈-45.7）实际生效的"左弯曲段"圆心 y=-20.6mm、
-           半径 10mm，而视觉中心线在 y≈-28.1mm、管半径 ≈18mm → 偏 7.5mm、细 43%。
-           现链每 12mm 一站，站心/半径 = 薄片顶点的 (y,z) 圆拟合（Kasa），最大差 1.0mm。
-           第五轮加"拍平板"（每站 ±y 各一块薄板）：夹持方向 ±y 是几何必然（夹爪开口 70mm
-           ≪ 香蕉长 180mm，只能从上方沿 ±y 夹）。指板是严格平行的平板，夹圆管子时接触法线
-           偏离 ±y 约 21°（香蕉弓形）→ 法向推力带切向分量 → 沿板面被推着走 = 粘滑振动。
-           拍平后所有指板接触法线恒为 ±y，配合 friction 5.0→1.2
-           （有效μ=max(手指1.0, 本值)），粘滑驱动源消失。
-           第九轮拆板：抓取站拆成"共面段"（COP 区 x -60.90..-30.50 = 指板足迹 26.4mm +
-           两侧 2mm 余量），共面段 y 面整段共面（两指同刻接触、无 y 台阶）。
-           第十二轮整体内缩 -inset=11mm（用户实测：旧板面凸出视觉 +1.0..+9.7mm，相机看不见
-           碰撞体却挡住抓取）：板面与圆管半径同步内缩 → 板面相对视觉 -1.30..-10.00mm（全在
-           视觉内，指板夹进来时穿入香蕉视觉体几毫米，用户接受）；板面与圆管间距（挡管余量）
-           逐点不变 ≥1.0mm，不会退回"圆管先接触→斜法线→振动"。板 z 半高改为沿 x 采样让
-           盒角贴住椭圆管截面（4 段 COP 为 6.6~9.8mm，仍覆盖指板 12.58mm 的 z 足迹）；
-           香蕉左尖部两段（x<-68.5）轴心沿 x 移动太快、盒子装不进视觉 → 不放板，退回圆管链。
-           静止时视觉沉桌 0.44mm（旧 6.0mm）。
-           全部碰撞 geom 带 group="3" → 渲染默认只画 group 0/1/2，相机与 GUI 都看不到，
-           仅参与物理接触。想看碰撞体：把生成器里胶囊/box 模板的 group="3" 改成 "0"
-           （可再把 rgba 末位 1 改 0.4 半透明）重跑生成器；改回 "3" 重跑即恢复隐藏。 -->
-      <!-- BANANA_COLLISION_BEGIN -->
-      <geom type="capsule" group="3" fromto="-0.09853 0.01649 -0.01193  -0.08653 -0.00512 -0.00409" size="0.00600"
-            mass="0.00227" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="1.0 0.85 0.1 1" />
-      <geom type="capsule" group="3" fromto="-0.08653 -0.00512 -0.00409  -0.07453 -0.01615 -0.00225" size="0.00600"
-            mass="0.00227" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="1.0 0.85 0.1 1" />
-      <geom type="capsule" group="3" fromto="-0.07453 -0.01615 -0.00225  -0.06253 -0.02245 -0.00095" size="0.00600"
-            mass="0.00227" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="1.0 0.85 0.1 1" />
-      <geom type="capsule" group="3" fromto="-0.06253 -0.02245 -0.00095  -0.05053 -0.02711 -0.00023" size="0.00614"
-            mass="0.00227" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="1.0 0.85 0.1 1" />
-      <geom type="capsule" group="3" fromto="-0.05053 -0.02711 -0.00023  -0.03853 -0.03032 0.00019" size="0.00658"
-            mass="0.00227" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="1.0 0.85 0.1 1" />
-      <geom type="capsule" group="3" fromto="-0.03853 -0.03032 0.00019  -0.02653 -0.03223 0.00039" size="0.00688"
-            mass="0.00227" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="1.0 0.85 0.1 1" />
-      <geom type="capsule" group="3" fromto="-0.02653 -0.03223 0.00039  -0.01453 -0.03291 0.00033" size="0.00692"
-            mass="0.00227" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="1.0 0.85 0.1 1" />
-      <geom type="capsule" group="3" fromto="-0.01453 -0.03291 0.00033  -0.00253 -0.03253 0.00028" size="0.00679"
-            mass="0.00227" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="1.0 0.85 0.1 1" />
-      <geom type="capsule" group="3" fromto="-0.00253 -0.03253 0.00028  0.00947 -0.03126 0.00007" size="0.00663"
-            mass="0.00227" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="1.0 0.85 0.1 1" />
-      <geom type="capsule" group="3" fromto="0.00947 -0.03126 0.00007  0.02147 -0.02902 -0.00023" size="0.00654"
-            mass="0.00227" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="1.0 0.85 0.1 1" />
-      <geom type="capsule" group="3" fromto="0.02147 -0.02902 -0.00023  0.03347 -0.02593 -0.00070" size="0.00636"
-            mass="0.00227" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="1.0 0.85 0.1 1" />
-      <geom type="capsule" group="3" fromto="0.03347 -0.02593 -0.00070  0.04547 -0.02179 -0.00138" size="0.00600"
-            mass="0.00227" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="1.0 0.85 0.1 1" />
-      <geom type="capsule" group="3" fromto="0.04547 -0.02179 -0.00138  0.05747 -0.01651 -0.00216" size="0.00600"
-            mass="0.00227" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="1.0 0.85 0.1 1" />
-      <geom type="capsule" group="3" fromto="0.05747 -0.01651 -0.00216  0.06947 -0.01119 -0.00285" size="0.00600"
-            mass="0.00227" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="1.0 0.85 0.1 1" />
-      <geom type="capsule" group="3" fromto="0.06947 -0.01119 -0.00285  0.08147 -0.00507 -0.00368" size="0.00600"
-            mass="0.00227" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="1.0 0.85 0.1 1" />
-      <geom type="box" group="3" size="0.00381 0.01072 0.01162" pos="-0.06471 -0.02142 -0.00095"
-            mass="0.00227" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="1.0 0.85 0.1 1" />
-      <geom type="box" group="3" size="0.00219 0.01332 0.00734" pos="-0.05871 -0.02733 -0.00095"
-            mass="0.00227" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="1.0 0.85 0.1 1" />
-      <geom type="box" group="3" size="0.00600 0.01332 0.00975" pos="-0.05053 -0.02733 -0.00023"
-            mass="0.00227" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="1.0 0.85 0.1 1" />
-      <geom type="box" group="3" size="0.00600 0.01332 0.00739" pos="-0.03853 -0.02733 0.00019"
-            mass="0.00227" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="1.0 0.85 0.1 1" />
-      <geom type="box" group="3" size="0.00101 0.01332 0.00661" pos="-0.03151 -0.02733 0.00039"
-            mass="0.00227" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="1.0 0.85 0.1 1" />
-      <geom type="box" group="3" size="0.00499 0.00930 0.01451" pos="-0.02551 -0.03231 0.00039"
-            mass="0.00227" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="1.0 0.85 0.1 1" />
-      <geom type="box" group="3" size="0.00600 0.00882 0.01482" pos="-0.01453 -0.03302 0.00033"
-            mass="0.00227" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="1.0 0.85 0.1 1" />
-      <geom type="box" group="3" size="0.00600 0.00913 0.01436" pos="-0.00253 -0.03259 0.00028"
-            mass="0.00227" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="1.0 0.85 0.1 1" />
-      <geom type="box" group="3" size="0.00600 0.00966 0.01387" pos="0.00947 -0.03114 0.00007"
-            mass="0.00227" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="1.0 0.85 0.1 1" />
-      <geom type="box" group="3" size="0.00600 0.01033 0.01322" pos="0.02147 -0.02886 -0.00023"
-            mass="0.00227" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="1.0 0.85 0.1 1" />
-      <geom type="box" group="3" size="0.00600 0.01090 0.01219" pos="0.03347 -0.02590 -0.00070"
-            mass="0.00227" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="1.0 0.85 0.1 1" />
-      <geom type="box" group="3" size="0.00600 0.01143 0.01061" pos="0.04547 -0.02190 -0.00138"
-            mass="0.00227" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="1.0 0.85 0.1 1" />
-      <geom type="box" group="3" size="0.00600 0.01126 0.00891" pos="0.05747 -0.01715 -0.00216"
-            mass="0.00227" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="1.0 0.85 0.1 1" />
-      <geom type="box" group="3" size="0.00600 0.01018 0.00626" pos="0.06947 -0.01196 -0.00285"
-            mass="0.00227" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="1.0 0.85 0.1 1" />
-      <geom type="box" group="3" size="0.00600 0.00820 0.00852" pos="0.08147 -0.00628 -0.00368"
-            mass="0.00227" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="1.0 0.85 0.1 1" />
-      <!-- BANANA_COLLISION_END -->
+      <!-- 内缩凸碰撞体：X/Y 竖直夹持面 + 浅穹顶底面。 -->
+      <geom name="orange_geom" type="mesh" mesh="orange_collision"
+            mass="0.1" friction="5.0 0.01 0.01" condim="6"
+            solref="0.004 1" solimp="0.99 0.999 0.001"
+            group="3" rgba="1.0 0.35 0.02 1" />
     </body>
 
-    <!-- apple on table1: 桌面碰撞面 z=0.6613；自由落地实测 stable body z=0.6616
+    <!-- apple on table1: 桌面碰撞面 z=0.45；沿用原 0.3mm 落地偏移，body z=0.4503
          （collision_flat + condim=6；9000 步静置：|w|≡0、倾角 0.00°、位移 0.78mm，
-         其中 0.59mm 是 2.6e-5 m/s 的匀速残滑）。原值 0.6623 是
-         "0.6613+未缩放网格 z_min(0.001)" 估出来的，会开局下落 ~0.7mm。 -->
-    <body name="apple" pos="4.9 4.5 0.6616">
+         其中 0.59mm 是 2.6e-5 m/s 的匀速残滑）。 -->
+    <body name="apple" pos="4.9766 4.5 0.4503">
       <freejoint name="apple_freejoint" />
       <!-- visual mesh (no collision) -->
       <geom name="apple_visual" type="mesh" mesh="apple_visual"
@@ -478,28 +392,77 @@
             solref="0.004 1" solimp="0.99 0.999 0.001"
             rgba="0.9 0.1 0.1 1" />
     </body>
-    <!-- cylinder on table1（原 bowl 已换为圆柱 r=2.5cm h=6cm，竖放）:
-         body z = table_surface(0.6613) + 圆柱半高 0.03 = 0.6913。
-         单 geom 身兼视觉+碰撞（group 默认 0 → 相机可见，AnyGrasp 靠它出抓取）。
-         不再需要凸块拼装：圆柱是凸几何原语，不像 mesh（碰撞=凸包）会把空腔填实。
-         圆盘面大、平底不滚 → condim 默认 3 即可（无需苹果那样的滚动摩擦）。
-         橙色高饱和（vivid 过滤要 S≥80），区别于苹果红 0.9 0.1 0.1 与香蕉/方块黄 1 1 0。 -->
-    <body name="bowl" pos="4.9 5.5 0.6913">
-      <freejoint name="bowl_freejoint" />
-      <geom name="bowl_geom" type="cylinder" size="0.025 0.03"
-            mass="0.3" friction="5.0 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001"
-            rgba="1 0.55 0 1" />
-      <!-- 原 BOWL_COLLISION_BEGIN..END 凸块拼装块（50 个 box geom）已随 bowl→圆柱替换删除：
-           圆柱是凸几何原语，不像 mesh（碰撞=凸包）会把空腔填实，无需拼装。
-           仍可用 scripts/generate_bowl_collision.py 重新生成（若要还原旧碗）。 -->
+    <!-- YCB 025_mug on table1.  The normalized OBJ is centered on the cup body
+         (not the handle) and grounded at z=0, so body z equals the 0.45m table top.
+         XY scale is 0.62 while Z remains 0.72: the cup is narrower without
+         changing its height, and the collision primitives use the same radii.
+         The complete handle remains visible but is deliberately non-colliding.
+         Collision is a hollow 24-segment body wall, a 24-segment rim, and a
+         thin bottom generated by scripts/generate_mug_collision.py. -->
+    <body name="mug" pos="4.9766 5.5 0.45">
+      <freejoint name="mug_freejoint" />
+      <inertial pos="0 0 0.029" mass="0.15" diaginertia="0.00010 0.00010 0.00012" />
+      <geom name="mug_visual" type="mesh" mesh="mug_visual"
+            contype="0" conaffinity="0" group="1" mass="0" material="mug_mat" />
+      <!-- MUG_COLLISION_BEGIN -->
+      <geom name="mug_bottom_geom" type="cylinder" group="3" pos="0 0 0.0015000" size="0.0224200 0.0015000" mass="0" friction="1.2 0.01 0.01" condim="6" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_wall_00" type="box" group="3" pos="0.0239200 0.0000000 0.0285191" quat="1.00000000 0 0 0.00000000" size="0.0015000 0.0035139 0.0255191" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_wall_01" type="box" group="3" pos="0.0231049 0.0061910 0.0285191" quat="0.99144486 0 0 0.13052619" size="0.0015000 0.0035139 0.0255191" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_wall_02" type="box" group="3" pos="0.0207153 0.0119600 0.0285191" quat="0.96592583 0 0 0.25881905" size="0.0015000 0.0035139 0.0255191" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_wall_03" type="box" group="3" pos="0.0169140 0.0169140 0.0285191" quat="0.92387953 0 0 0.38268343" size="0.0015000 0.0035139 0.0255191" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_wall_04" type="box" group="3" pos="0.0119600 0.0207153 0.0285191" quat="0.86602540 0 0 0.50000000" size="0.0015000 0.0035139 0.0255191" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_wall_05" type="box" group="3" pos="0.0061910 0.0231049 0.0285191" quat="0.79335334 0 0 0.60876143" size="0.0015000 0.0035139 0.0255191" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_wall_06" type="box" group="3" pos="0.0000000 0.0239200 0.0285191" quat="0.70710678 0 0 0.70710678" size="0.0015000 0.0035139 0.0255191" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_wall_07" type="box" group="3" pos="-0.0061910 0.0231049 0.0285191" quat="0.60876143 0 0 0.79335334" size="0.0015000 0.0035139 0.0255191" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_wall_08" type="box" group="3" pos="-0.0119600 0.0207153 0.0285191" quat="0.50000000 0 0 0.86602540" size="0.0015000 0.0035139 0.0255191" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_wall_09" type="box" group="3" pos="-0.0169140 0.0169140 0.0285191" quat="0.38268343 0 0 0.92387953" size="0.0015000 0.0035139 0.0255191" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_wall_10" type="box" group="3" pos="-0.0207153 0.0119600 0.0285191" quat="0.25881905 0 0 0.96592583" size="0.0015000 0.0035139 0.0255191" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_wall_11" type="box" group="3" pos="-0.0231049 0.0061910 0.0285191" quat="0.13052619 0 0 0.99144486" size="0.0015000 0.0035139 0.0255191" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_wall_12" type="box" group="3" pos="-0.0239200 0.0000000 0.0285191" quat="0.00000000 0 0 1.00000000" size="0.0015000 0.0035139 0.0255191" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_wall_13" type="box" group="3" pos="-0.0231049 -0.0061910 0.0285191" quat="-0.13052619 0 0 0.99144486" size="0.0015000 0.0035139 0.0255191" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_wall_14" type="box" group="3" pos="-0.0207153 -0.0119600 0.0285191" quat="-0.25881905 0 0 0.96592583" size="0.0015000 0.0035139 0.0255191" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_wall_15" type="box" group="3" pos="-0.0169140 -0.0169140 0.0285191" quat="-0.38268343 0 0 0.92387953" size="0.0015000 0.0035139 0.0255191" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_wall_16" type="box" group="3" pos="-0.0119600 -0.0207153 0.0285191" quat="-0.50000000 0 0 0.86602540" size="0.0015000 0.0035139 0.0255191" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_wall_17" type="box" group="3" pos="-0.0061910 -0.0231049 0.0285191" quat="-0.60876143 0 0 0.79335334" size="0.0015000 0.0035139 0.0255191" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_wall_18" type="box" group="3" pos="-0.0000000 -0.0239200 0.0285191" quat="-0.70710678 0 0 0.70710678" size="0.0015000 0.0035139 0.0255191" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_wall_19" type="box" group="3" pos="0.0061910 -0.0231049 0.0285191" quat="-0.79335334 0 0 0.60876143" size="0.0015000 0.0035139 0.0255191" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_wall_20" type="box" group="3" pos="0.0119600 -0.0207153 0.0285191" quat="-0.86602540 0 0 0.50000000" size="0.0015000 0.0035139 0.0255191" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_wall_21" type="box" group="3" pos="0.0169140 -0.0169140 0.0285191" quat="-0.92387953 0 0 0.38268343" size="0.0015000 0.0035139 0.0255191" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_wall_22" type="box" group="3" pos="0.0207153 -0.0119600 0.0285191" quat="-0.96592583 0 0 0.25881905" size="0.0015000 0.0035139 0.0255191" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_wall_23" type="box" group="3" pos="0.0231049 -0.0061910 0.0285191" quat="-0.99144486 0 0 0.13052619" size="0.0015000 0.0035139 0.0255191" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_rim_00" type="box" group="3" pos="0.0260820 0.0000000 0.0562882" quat="1.00000000 0 0 0.00000000" size="0.0025000 0.0039510 0.0022500" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_rim_01" type="box" group="3" pos="0.0251933 0.0067505 0.0562882" quat="0.99144486 0 0 0.13052619" size="0.0025000 0.0039510 0.0022500" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_rim_02" type="box" group="3" pos="0.0225877 0.0130410 0.0562882" quat="0.96592583 0 0 0.25881905" size="0.0025000 0.0039510 0.0022500" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_rim_03" type="box" group="3" pos="0.0184428 0.0184428 0.0562882" quat="0.92387953 0 0 0.38268343" size="0.0025000 0.0039510 0.0022500" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_rim_04" type="box" group="3" pos="0.0130410 0.0225877 0.0562882" quat="0.86602540 0 0 0.50000000" size="0.0025000 0.0039510 0.0022500" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_rim_05" type="box" group="3" pos="0.0067505 0.0251933 0.0562882" quat="0.79335334 0 0 0.60876143" size="0.0025000 0.0039510 0.0022500" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_rim_06" type="box" group="3" pos="0.0000000 0.0260820 0.0562882" quat="0.70710678 0 0 0.70710678" size="0.0025000 0.0039510 0.0022500" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_rim_07" type="box" group="3" pos="-0.0067505 0.0251933 0.0562882" quat="0.60876143 0 0 0.79335334" size="0.0025000 0.0039510 0.0022500" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_rim_08" type="box" group="3" pos="-0.0130410 0.0225877 0.0562882" quat="0.50000000 0 0 0.86602540" size="0.0025000 0.0039510 0.0022500" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_rim_09" type="box" group="3" pos="-0.0184428 0.0184428 0.0562882" quat="0.38268343 0 0 0.92387953" size="0.0025000 0.0039510 0.0022500" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_rim_10" type="box" group="3" pos="-0.0225877 0.0130410 0.0562882" quat="0.25881905 0 0 0.96592583" size="0.0025000 0.0039510 0.0022500" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_rim_11" type="box" group="3" pos="-0.0251933 0.0067505 0.0562882" quat="0.13052619 0 0 0.99144486" size="0.0025000 0.0039510 0.0022500" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_rim_12" type="box" group="3" pos="-0.0260820 0.0000000 0.0562882" quat="0.00000000 0 0 1.00000000" size="0.0025000 0.0039510 0.0022500" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_rim_13" type="box" group="3" pos="-0.0251933 -0.0067505 0.0562882" quat="-0.13052619 0 0 0.99144486" size="0.0025000 0.0039510 0.0022500" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_rim_14" type="box" group="3" pos="-0.0225877 -0.0130410 0.0562882" quat="-0.25881905 0 0 0.96592583" size="0.0025000 0.0039510 0.0022500" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_rim_15" type="box" group="3" pos="-0.0184428 -0.0184428 0.0562882" quat="-0.38268343 0 0 0.92387953" size="0.0025000 0.0039510 0.0022500" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_rim_16" type="box" group="3" pos="-0.0130410 -0.0225877 0.0562882" quat="-0.50000000 0 0 0.86602540" size="0.0025000 0.0039510 0.0022500" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_rim_17" type="box" group="3" pos="-0.0067505 -0.0251933 0.0562882" quat="-0.60876143 0 0 0.79335334" size="0.0025000 0.0039510 0.0022500" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_rim_18" type="box" group="3" pos="-0.0000000 -0.0260820 0.0562882" quat="-0.70710678 0 0 0.70710678" size="0.0025000 0.0039510 0.0022500" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_rim_19" type="box" group="3" pos="0.0067505 -0.0251933 0.0562882" quat="-0.79335334 0 0 0.60876143" size="0.0025000 0.0039510 0.0022500" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_rim_20" type="box" group="3" pos="0.0130410 -0.0225877 0.0562882" quat="-0.86602540 0 0 0.50000000" size="0.0025000 0.0039510 0.0022500" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_rim_21" type="box" group="3" pos="0.0184428 -0.0184428 0.0562882" quat="-0.92387953 0 0 0.38268343" size="0.0025000 0.0039510 0.0022500" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_rim_22" type="box" group="3" pos="0.0225877 -0.0130410 0.0562882" quat="-0.96592583 0 0 0.25881905" size="0.0025000 0.0039510 0.0022500" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <geom name="mug_rim_23" type="box" group="3" pos="0.0251933 -0.0067505 0.0562882" quat="-0.99144486 0 0 0.13052619" size="0.0025000 0.0039510 0.0022500" mass="0" friction="1.2 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001" rgba="0.55 0.02 0.02 1" />
+      <!-- MUG_COLLISION_END -->
     </body>
-    <!-- test cube on table1: body z = table_surface(0.6613) + 半边长 0.02 = 0.6813
-         4cm 立方体做 CLOSE 阶段专用测试物：两夹持面严格平行 → 两指同刻接触，
+    <!-- test cube on table1: body z = table_surface(0.45) + 半边长 0.025 = 0.475
+         5cm 立方体做 CLOSE 阶段专用测试物：两夹持面严格平行 → 两指同刻接触，
          是对"两段式冻结"最干净的几何（香蕉弓形会让两指接触步差很多）。
          单 geom 身兼视觉+碰撞（group 默认 0 → 相机可见，AnyGrasp 靠它出抓取）；
          视觉=碰撞，不存在"看不见的障碍"。mass 0.05kg 是刻意轻的：
          桌面摩擦容量 μmg≈0.6N，挤压力一旦不对称立刻把方块推走 → 最灵敏的探针。 -->
-    <body name="cube" pos="4.95 6.0 0.6813">
+    <body name="cube" pos="4.9766 6.0 0.475">
       <freejoint name="cube_freejoint" />
       <geom name="cube_geom" type="box" size="0.025 0.025 0.025"
             mass="0.01" friction="1.0 0.01 0.01" solref="0.004 1" solimp="0.99 0.999 0.001"

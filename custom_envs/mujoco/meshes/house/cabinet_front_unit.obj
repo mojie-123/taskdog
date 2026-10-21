@@ -1,0 +1,15 @@
+# Unit visual-only cabinet front panel.
+# Width and height are both 1 m before per-asset MJCF scaling.
+# The face normal points toward +Y; MJCF geom quaternions orient each panel.
+v -0.500000 0.000000 -0.500000
+v  0.500000 0.000000 -0.500000
+v  0.500000 0.000000  0.500000
+v -0.500000 0.000000  0.500000
+vt 0.000000 0.000000
+vt 1.000000 0.000000
+vt 1.000000 1.000000
+vt 0.000000 1.000000
+vn 0.000000 1.000000 0.000000
+# Reverse U so textures read normally when viewed from +Y toward -Y.
+f 1/2/1 3/4/1 2/1/1
+f 1/2/1 4/3/1 3/4/1

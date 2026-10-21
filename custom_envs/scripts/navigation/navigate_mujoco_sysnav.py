@@ -1503,7 +1503,7 @@ def main() -> int:
     write_json(
         output_dir / "sysnav_config.json",
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "instruction": instruction.to_dict(),
             "scene": str(args.scene.resolve()),
             "initial_robot_pose": [args.robot_x, args.robot_y, args.robot_yaw],
@@ -1526,6 +1526,22 @@ def main() -> int:
                 "debug_output": str(
                     (output_dir / "viewpoint_planning").resolve()
                 ),
+            },
+            "room_semantics": {
+                "max_images": int(
+                    config.config.search.room_semantic_max_images
+                ),
+                "refresh_min_new_images": int(
+                    config.config.search.room_semantic_refresh_min_new_images
+                ),
+                "stable_min_ordinary_views": int(
+                    config.config.search.room_semantic_stable_min_ordinary_views
+                ),
+                "stable_confidence": float(
+                    config.config.search.room_semantic_stable_confidence
+                ),
+                "room_condition_source": "stable_multi_view_room_node",
+                "local_target_prompt_includes_room_condition": False,
             },
             "transit_detection": {
                 "enabled": bool(transit_config.enabled),
@@ -1598,6 +1614,15 @@ def main() -> int:
                 f"save_images={transit_config.save_images}",
                 flush=True,
             )
+        print(
+            "[SYSNAV][ROOM_SEMANTICS] mode=revisable_multi_view "
+            f"max_images={config.config.search.room_semantic_max_images} "
+            "stable_gate="
+            f"{config.config.search.room_semantic_stable_min_ordinary_views}ordinary/"
+            f"{config.config.search.room_semantic_stable_confidence:.2f}confidence "
+            "target_room_source=stable_room_node",
+            flush=True,
+        )
         policy = None
         device = None
         if args.sysnav_direct_teleport_test:

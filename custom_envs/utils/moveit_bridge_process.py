@@ -12,7 +12,7 @@ All logs go to stderr. stdout is reserved for one-line JSON replies.
 
 ``move_group`` 在终端 1 中运行；本进程只是 service client 和 joint-state
 publisher。返回的 trajectory 不在 ROS 侧执行，而是交回 MuJoCo 主进程加密后由
-``env.set_arm_target`` 执行。``default_scene_objects`` 目前只近似原双桌场景。
+``env.set_arm_target`` 执行。桌面碰撞体由腕部深度的 RANSAC 结果动态提供。
 """
 
 from __future__ import annotations
@@ -258,47 +258,47 @@ def main():
         c.joint_constraints = out
         return c
 
-    def default_scene_objects():
-        """Return collision geometry for scene.xml's two tables and floor.
-
-        这里没有解析当前 ``--scene``；新增/替换 MJCF 场景时必须另行同步 MoveIt
-        PlanningScene，否则 MoveIt 的碰撞检查和 MuJoCo 物理世界并不一致。
-        """
+    def legacy_scene_removals():
+        """Build best-effort removals for objects created by older clients."""
         objects = []
+        for object_id in (
+            "mujoco_table1",
+            "mujoco_table2",
+            "detected_support_surface",
+        ):
+            stale = CollisionObject()
+            stale.header.frame_id = "map"
+            stale.id = object_id
+            stale.operation = CollisionObject.REMOVE
+            objects.append(stale)
+        return objects
 
-        table1 = CollisionObject()
-        table1.header.frame_id = "map"
-        table1.id = "mujoco_table1"
-        add_box(table1, [5.0, 5.0, 0.6213], [0.6468, 2.7254, 0.08])
-        for dx in (0.2834, -0.2834):
-            for dy in (1.3227, -1.3227):
-                add_box(table1, [5.0 + dx, 5.0 + dy, 0.2907], [0.08, 0.08, 0.5814])
-        table1.operation = CollisionObject.ADD
-        objects.append(table1)
-
-        table2 = CollisionObject()
-        table2.header.frame_id = "map"
-        table2.id = "mujoco_table2"
-        add_box(table2, [8.0, 6.0, 0.6213], [0.6468, 0.9084, 0.08])
-        for dx in (0.2834, -0.2834):
-            for dy in (0.4142, -0.4142):
-                add_box(table2, [8.0 + dx, 6.0 + dy, 0.2907], [0.08, 0.08, 0.5814])
-        table2.operation = CollisionObject.ADD
-        objects.append(table2)
-
+    def default_scene_objects():
+        """Return only scene-independent collision geometry."""
         floor = CollisionObject()
         floor.header.frame_id = "map"
         floor.id = "mujoco_floor"
         add_box(floor, [0.0, 0.0, -0.05], [40.0, 40.0, 0.10])
         floor.operation = CollisionObject.ADD
-        objects.append(floor)
-        return objects
+        return [floor]
 
     def handle(msg):
         rid = msg.get("id", "")
         kind = msg.get("type", "")
         try:
             if kind == "apply_default_scene":
+                # Removing an object that is already absent makes MoveIt return
+                # success=False.  Keep this cleanup in its own best-effort diff
+                # so that absent legacy IDs cannot make the required floor ADD
+                # look like a PlanningScene failure.  MoveIt processes every
+                # object in the diff even when one removal returns false.
+                cleanup_req = ApplyPlanningScene.Request()
+                cleanup_ps = PlanningScene()
+                cleanup_ps.is_diff = True
+                cleanup_ps.world.collision_objects = legacy_scene_removals()
+                cleanup_req.scene = cleanup_ps
+                cleanup_res = wait_future(scene_cli.call_async(cleanup_req), 5.0)
+
                 req = ApplyPlanningScene.Request()
                 ps = PlanningScene()
                 ps.is_diff = True
@@ -306,8 +306,42 @@ def main():
                 req.scene = ps
                 res = wait_future(scene_cli.call_async(req), 5.0)
                 ok = bool(res and res.success)
-                return {"id": rid, "ok": ok, "type": kind,
-                        "error": "" if ok else "apply_planning_scene failed"}
+                return {
+                    "id": rid,
+                    "ok": ok,
+                    "type": kind,
+                    "error": "" if ok else "floor apply_planning_scene failed",
+                    # False normally means at least one legacy ID was already
+                    # absent; it is diagnostic only and must not abort grasping.
+                    "legacy_cleanup_ack": bool(
+                        cleanup_res and cleanup_res.success),
+                }
+
+            if kind == "apply_support_surface":
+                req = ApplyPlanningScene.Request()
+                ps = PlanningScene()
+                ps.is_diff = True
+
+                surface = CollisionObject()
+                surface.header.frame_id = str(msg.get("frame_id", "map"))
+                surface.id = str(msg.get(
+                    "object_id", "detected_support_surface"))
+                add_box_pose(surface, msg["pose"], msg["size_xyz"])
+                surface.operation = CollisionObject.ADD
+                ps.world.collision_objects = [surface]
+
+                req.scene = ps
+                res = wait_future(scene_cli.call_async(req), 5.0)
+                ok = bool(res and res.success)
+                return {
+                    "id": rid,
+                    "ok": ok,
+                    "type": kind,
+                    "error": "" if ok else "dynamic support surface apply failed",
+                    "object_id": surface.id,
+                    "frame_id": surface.header.frame_id,
+                    "size_xyz": [float(v) for v in msg["size_xyz"]],
+                }
 
             if kind == "attach_box":
                 req = ApplyPlanningScene.Request()

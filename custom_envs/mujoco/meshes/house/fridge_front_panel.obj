@@ -1,0 +1,15 @@
+# Visual-only refrigerator front panel (1.20 m x 1.80 m).
+# The face normal points toward +Y, into the accessible kitchen interior.
+v -0.600000 0.000000 -0.900000
+v  0.600000 0.000000 -0.900000
+v  0.600000 0.000000  0.900000
+v -0.600000 0.000000  0.900000
+vt 0.000000 0.000000
+vt 1.000000 0.000000
+vt 1.000000 1.000000
+vt 0.000000 1.000000
+vn 0.000000 1.000000 0.000000
+# Reverse U while reversing the face normal so the front texture is not
+# mirrored when viewed from +Y toward -Y.
+f 1/2/1 3/4/1 2/1/1
+f 1/2/1 4/3/1 3/4/1

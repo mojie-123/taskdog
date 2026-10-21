@@ -75,6 +75,10 @@ class SearchConfig:
     early_stop_min_room_coverage: float
     early_stop_min_ordinary_viewpoints: int
     early_stop_max_current_images: int
+    room_semantic_max_images: int
+    room_semantic_refresh_min_new_images: int
+    room_semantic_stable_min_ordinary_views: int
+    room_semantic_stable_confidence: float
 
 
 @dataclass(frozen=True)
@@ -183,6 +187,18 @@ def load_sysnav_config(path: Path | str = DEFAULT_CONFIG) -> SysNavConfig:
             early_stop_max_current_images=int(
                 search.get("early_stop_max_current_images", 4)
             ),
+            room_semantic_max_images=int(
+                search.get("room_semantic_max_images", 6)
+            ),
+            room_semantic_refresh_min_new_images=int(
+                search.get("room_semantic_refresh_min_new_images", 2)
+            ),
+            room_semantic_stable_min_ordinary_views=int(
+                search.get("room_semantic_stable_min_ordinary_views", 2)
+            ),
+            room_semantic_stable_confidence=float(
+                search.get("room_semantic_stable_confidence", 0.75)
+            ),
         ),
         transit_detection=TransitDetectionConfig(
             enabled=bool(transit.get("enabled", True)),
@@ -218,6 +234,14 @@ def load_sysnav_config(path: Path | str = DEFAULT_CONFIG) -> SysNavConfig:
         raise ValueError("early_stop_min_ordinary_viewpoints must be positive")
     if result.search.early_stop_max_current_images <= 0:
         raise ValueError("early_stop_max_current_images must be positive")
+    if result.search.room_semantic_max_images <= 0:
+        raise ValueError("room_semantic_max_images must be positive")
+    if result.search.room_semantic_refresh_min_new_images <= 0:
+        raise ValueError("room_semantic_refresh_min_new_images must be positive")
+    if result.search.room_semantic_stable_min_ordinary_views <= 0:
+        raise ValueError("room_semantic_stable_min_ordinary_views must be positive")
+    if not 0.0 < result.search.room_semantic_stable_confidence <= 1.0:
+        raise ValueError("room_semantic_stable_confidence must lie in (0, 1]")
     if result.transit_detection.frequency_hz <= 0.0:
         raise ValueError("transit_detection.frequency_hz must be positive")
     if result.transit_detection.min_translation_m < 0.0:
