@@ -9,7 +9,8 @@
 
 * Nav2：完成 ``NAV``/``NAV2_DEST`` 的全局规划与 ``vx/wz`` 跟踪；
 * rsl_rl policy：把 ``vx/vy/wz`` 变成腿轮动作；
-* AnyGrasp：从腕部深度点云提出抓取候选；
+* YOLOE + SAM2：根据 ``--object`` 从腕部 RGB 生成目标掩码；
+* AnyGrasp：读取完整深度点云，并由目标掩码的 region steering 引导抓取候选；
 * MoveIt：筛选候选并规划 pre-grasp、approach、lift/retract 路径；
 * MuJoCo：执行所有底盘和关节控制并计算接触；
 * 本状态机：负责精定位、坐标变换、规划结果执行、夹持和阶段切换。
@@ -276,14 +277,146 @@ def _support_box_from_ransac_plane(
     }
 
 
+def _save_target_mask_overlay(
+    image_rgb,
+    target_mask,
+    *,
+    label,
+    confidence,
+):
+    """Save ``filter.png`` as a translucent SAM2 target-mask overlay."""
+    try:
+        import cv2
+
+        image = np.asarray(image_rgb, dtype=np.uint8)
+        mask = np.asarray(target_mask, dtype=bool)
+        if image.ndim != 3 or image.shape[2] != 3:
+            raise ValueError(f"unexpected RGB shape {image.shape}")
+        if mask.shape != image.shape[:2]:
+            raise ValueError(
+                f"mask/image shape mismatch: {mask.shape} vs {image.shape[:2]}"
+            )
+
+        output = image.copy()
+        color_rgb = np.array([0, 220, 255], dtype=np.float32)
+        opacity = 0.55
+        output[mask] = np.clip(
+            (1.0 - opacity) * output[mask].astype(np.float32)
+            + opacity * color_rgb,
+            0,
+            255,
+        ).astype(np.uint8)
+        contours, _ = cv2.findContours(
+            mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        cv2.drawContours(output, contours, -1, (0, 255, 255), 2)
+        cv2.putText(
+            output,
+            f"{label} {float(confidence):.2f}",
+            (12, 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+        output_dir = os.path.abspath(
+            os.path.join(_ROOT, "custom_envs", "tmp_pictures")
+        )
+        os.makedirs(output_dir, exist_ok=True)
+        path = os.path.join(output_dir, "filter.png")
+        cv2.imwrite(path, cv2.cvtColor(output, cv2.COLOR_RGB2BGR))
+        print(f"[SM] filter.png 已保存(SAM2 mask): {path}", flush=True)
+    except Exception as exc:
+        print(f"[SM] filter.png 保存失败: {exc}", flush=True)
+
+
+def _detect_target_mask(image_rgb, args):
+    """Run the existing SysNav YOLOE->SAM2 backend for one wrist RGB frame."""
+    from dataclasses import replace
+
+    from custom_envs.scripts.sysnav.config import load_sysnav_config
+    from custom_envs.scripts.sysnav.perception import YOLOESAM2Perceptor
+
+    perception = None
+    try:
+        config = replace(
+            load_sysnav_config(args.perception_config).perception,
+            confidence=float(args.target_detection_confidence),
+        )
+        perception = YOLOESAM2Perceptor(config, refine_with_sam2=True)
+        target_label = " ".join(str(args.object).strip().lower().split())
+        prompt_aliases = {
+            "apple": ("apple",),
+            "banana": ("banana",),
+            "bowl": ("bowl",),
+            "cube": ("cube", "box"),
+            "mug": ("mug", "cup"),
+            "orange": ("orange fruit", "orange"),
+        }
+        prompts = prompt_aliases.get(target_label, (target_label,))
+        perception.set_prompts(prompts)
+        detections = perception.detect(np.asarray(image_rgb, dtype=np.uint8))
+        matches = [item for item in detections if item.label in prompts]
+        if not matches:
+            labels = [item.label for item in detections]
+            raise RuntimeError(
+                f"YOLOE did not detect target {target_label!r} with "
+                f"prompts={list(prompts)}; labels={labels}"
+            )
+
+        # With no SysNav world-position prior in this standalone entry point,
+        # choose the highest-confidence instance of the requested class.
+        selected = max(matches, key=lambda item: float(item.confidence))
+        target_mask = np.asarray(selected.mask, dtype=bool)
+        if target_mask.shape != np.asarray(image_rgb).shape[:2]:
+            raise RuntimeError(
+                f"SAM2 mask shape {target_mask.shape} does not match RGB "
+                f"{np.asarray(image_rgb).shape[:2]}"
+            )
+        if not target_mask.any():
+            raise RuntimeError("SAM2 returned an empty target mask")
+
+        print(
+            f"[SM] YOLOE+SAM2 target={target_label} "
+            f"detected_as={selected.label} "
+            f"instances={len(matches)} confidence={selected.confidence:.3f} "
+            f"mask_pixels={int(target_mask.sum())} "
+            f"bbox={np.round(selected.bbox_xyxy, 1)}",
+            flush=True,
+        )
+        _save_target_mask_overlay(
+            image_rgb,
+            target_mask,
+            label=(
+                target_label
+                if selected.label == target_label
+                else f"{target_label}/{selected.label}"
+            ),
+            confidence=selected.confidence,
+        )
+        return target_mask
+    finally:
+        if perception is not None:
+            try:
+                perception.close()
+            except Exception as exc:
+                print(f"[SM] perception cleanup warning: {exc}", flush=True)
+        cuda = getattr(torch, "cuda", None)
+        if cuda is not None and cuda.is_available():
+            cuda.empty_cache()
+
+
 def _run_grasp_plan(
     env, args, depth_accum, scan_rgb,
     q_scan_at_scan, pos_w_at_scan, quat_w_at_scan,
     pos_w, quat_w, ransac_fit_plane, ransac_remove_plane,
     scan_transforms,
     build_support_surface=False,
+    use_target_mask=False,
 ):
-    """Run AnyGrasp and geometry/color filtering, but do *no* legacy IK.
+    """Run AnyGrasp and target filtering, but do *no* legacy IK.
 
     MoveIt owns kinematic reachability, goal collision checking and full-path
     collision checking in the next state.  This function deliberately keeps
@@ -314,6 +447,17 @@ def _run_grasp_plan(
     ], axis=-1).astype(np.float32)
     rgb_u = scan_rgb if scan_rgb is not None else np.zeros((H, W, 3), np.uint8)
     cols = (rgb_u[valid] / 255.0).astype(np.float32)
+
+    target_mask_image = None
+    if use_target_mask:
+        if scan_rgb is None:
+            print("[SM] YOLOE+SAM2 requires an RGB scan -> ARM_INIT", flush=True)
+            return PipelineState.ARM_INIT, None
+        try:
+            target_mask_image = _detect_target_mask(rgb_u, args)
+        except Exception as exc:
+            print(f"[SM] YOLOE+SAM2 target mask failed: {exc} -> ARM_INIT", flush=True)
+            return PipelineState.ARM_INIT, None
 
     # Remove the dominant plane only for target filtering.  AnyGrasp itself sees
     # the full cloud so table geometry remains visible to its collision filter.
@@ -370,8 +514,33 @@ def _run_grasp_plan(
         keep_obj = ransac_remove_plane(pts)
     pts_obj = pts[keep_obj]
     cols_obj = cols[keep_obj]
-    obj_filter_ok = len(pts_obj) >= 200
-    print(f"[SM] GRASP_PLAN: full={len(pts)} object={len(pts_obj)} pts", flush=True)
+    target_point_mask = None
+    target_points = None
+    if target_mask_image is not None:
+        # ``pts`` was built with exactly this depth-valid indexing, so this
+        # boolean vector corresponds element-for-element with the full cloud.
+        # Exclude RANSAC table inliers from steering if SAM2 leaks at the base.
+        target_point_mask = (
+            np.asarray(target_mask_image, dtype=bool)[valid] & keep_obj
+        )
+        target_points = pts[target_point_mask]
+        if len(target_points) < 20:
+            print(
+                f"[SM] SAM2 target cloud too small ({len(target_points)} pts) "
+                "-> ARM_INIT",
+                flush=True,
+            )
+            return PipelineState.ARM_INIT, None
+        print(
+            f"[SM] GRASP_PLAN: full={len(pts)} non_table={len(pts_obj)} "
+            f"target={len(target_points)} pts",
+            flush=True,
+        )
+    else:
+        print(
+            f"[SM] GRASP_PLAN: full={len(pts)} object={len(pts_obj)} pts",
+            flush=True,
+        )
 
     # Keep a world-frame table cloud for diagnostics only.  Unlike the old code,
     # this conversion uses the SCAN-time MuJoCo transform directly and never
@@ -395,8 +564,17 @@ def _run_grasp_plan(
     except Exception as exc:
         print(f"[SM] table-cloud diagnostic skipped: {exc}", flush=True)
 
-    np.savez("/tmp/pointcloud.npz", points=pts, colors=cols)
-    worker = os.path.join(_HERE, "grasp_worker.py")
+    if target_point_mask is not None:
+        np.savez(
+            "/tmp/pointcloud.npz",
+            points=pts,
+            colors=cols,
+            region_steering=target_point_mask.astype(bool),
+        )
+        worker = os.path.join(_HERE, "grasp_worker_masked.py")
+    else:
+        np.savez("/tmp/pointcloud.npz", points=pts, colors=cols)
+        worker = os.path.join(_HERE, "grasp_worker.py")
     requested_topk = max(50, int(args.moveit_candidate_limit), int(args.grasp_topk))
     res = _subproc.run([
         sys.executable, worker,
@@ -422,43 +600,57 @@ def _run_grasp_plan(
 
     candidate_mask = np.ones(len(scores), dtype=bool)
 
-    # Preserve the current project's vivid-object preference, but only use it if
-    # it leaves at least one candidate.
-    try:
-        import cv2 as _cv2
-        from scipy.spatial import cKDTree
-        cols_u8_obj = (cols_obj * 255).astype(np.uint8).reshape(1, -1, 3)
-        hsv_obj = _cv2.cvtColor(cols_u8_obj, _cv2.COLOR_RGB2HSV)[0]
-        vivid = pts_obj[hsv_obj[:, 1] >= 80]
-        _diag_save_filter_image(scan_rgb, valid, keep_obj, hsv_obj[:, 1] >= 80)
-        if len(vivid) >= 20:
-            dist, _ = cKDTree(vivid).query(translations, k=1)
-            vivid_mask = dist < 0.05
-            if int(vivid_mask.sum()) > 0:
-                candidate_mask &= vivid_mask
-    except Exception as exc:
-        print(f"[SM] vivid filter skipped: {exc}", flush=True)
+    if target_points is None:
+        # Preserve N2M's current fallback path.  The standalone MoveIt entry
+        # point uses the semantic target-mask branch above instead.
+        try:
+            import cv2 as _cv2
+            from scipy.spatial import cKDTree
+            cols_u8_obj = (cols_obj * 255).astype(np.uint8).reshape(1, -1, 3)
+            hsv_obj = _cv2.cvtColor(cols_u8_obj, _cv2.COLOR_RGB2HSV)[0]
+            vivid = pts_obj[hsv_obj[:, 1] >= 80]
+            _diag_save_filter_image(scan_rgb, valid, keep_obj, hsv_obj[:, 1] >= 80)
+            if len(vivid) >= 20:
+                dist, _ = cKDTree(vivid).query(translations, k=1)
+                vivid_mask = dist < 0.05
+                if int(vivid_mask.sum()) > 0:
+                    candidate_mask &= vivid_mask
+        except Exception as exc:
+            print(f"[SM] vivid filter skipped: {exc}", flush=True)
 
     # Preserve the old actual threshold (8 cm), but expose it as a CLI argument
     # instead of hiding the number behind a misleading '<1cm' comment.
-    if obj_filter_ok:
+    filter_points = target_points if target_points is not None else pts_obj
+    if len(filter_points) >= 20:
         try:
             from scipy.spatial import cKDTree
-            kd = cKDTree(pts_obj.astype(np.float64))
+            kd = cKDTree(filter_points.astype(np.float64))
             grasp_point_cam = translations + depths[:, None] * rotations[:, :, 0]
             dist, _ = kd.query(grasp_point_cam, k=1)
             on_obj = dist < float(args.moveit_object_point_dist)
-            combined = candidate_mask & on_obj
-            if int(combined.sum()) > 0:
-                candidate_mask = combined
-            elif int(on_obj.sum()) > 0:
-                # Do not let the optional color preference erase all geometric candidates.
-                candidate_mask = on_obj
+            if target_points is not None:
+                # Semantic targeting must never fall back to another object.
+                candidate_mask &= on_obj
+            else:
+                combined = candidate_mask & on_obj
+                if int(combined.sum()) > 0:
+                    candidate_mask = combined
+                elif int(on_obj.sum()) > 0:
+                    # Do not let the optional color preference erase all
+                    # geometric candidates in the legacy/N2M path.
+                    candidate_mask = on_obj
         except Exception as exc:
             print(f"[SM] object-point filter skipped: {exc}", flush=True)
 
     idxs = np.where(candidate_mask)[0].tolist()
     if not idxs:
+        if target_points is not None:
+            print(
+                "[SM] no AnyGrasp candidate belongs to the SAM2 target "
+                "-> ARM_INIT",
+                flush=True,
+            )
+            return PipelineState.ARM_INIT, None
         idxs = list(range(len(scores)))
     idxs.sort(key=lambda i: -float(scores[i]))
     idxs = idxs[:max(1, int(args.moveit_candidate_limit))]
@@ -477,6 +669,7 @@ def _run_grasp_plan(
                             for k, v in scan_transforms.items()},
         "table_cloud_world": table_cloud_world,
         "support_surface": support_surface,
+        "target_mask": target_mask_image,
     }
     print("[SM] AnyGrasp candidates for MoveIt: " + " ".join(
         f"[{i}]s={scores[i]:.3f}" for i in idxs[:8]), flush=True)
@@ -492,6 +685,19 @@ def main():
     parser.add_argument("--policy_path",    required=True, help="model_4999.pt 路径")
     parser.add_argument("--grasp_checkpoint", default=None)
     parser.add_argument("--grasp_topk",     type=int, default=1)
+    parser.add_argument(
+        "--perception_config",
+        default=os.path.abspath(
+            os.path.join(_ROOT, "custom_envs", "config", "sysnav.yaml")
+        ),
+        help="YOLOE/MobileCLIP/SAM2 感知配置（默认复用 sysnav.yaml）",
+    )
+    parser.add_argument(
+        "--target_detection_confidence",
+        type=float,
+        default=0.01,
+        help="腕部近景 YOLOE 最低置信度（默认 0.01；SAM2及三维点云继续复核）",
+    )
     parser.add_argument("--moveit_candidate_limit", type=int, default=12,
                         help="最多交给 MoveIt 检查的 AnyGrasp 候选数")
     parser.add_argument("--moveit_pregrasp_distance", type=float, default=0.115,
@@ -541,7 +747,6 @@ def main():
     parser.add_argument("--object",          default="orange",
                         choices=["banana", "apple", "orange", "mug", "bowl", "cube"],
                         help="抓取目标物体（default: orange）")
-    parser.add_argument("--target_speed",   type=float, default=0.8)
     parser.add_argument("--nav2_arrival_radius", type=float, default=0.55)
     parser.add_argument("--destination",    nargs=2, type=float, default=None,
                         metavar=("X","Y"))
@@ -558,6 +763,8 @@ def main():
                         help="机器人初始偏航角(rad，绕世界+Z；默认0)")
     args = parser.parse_args()
 
+    if not 0.0 <= float(args.target_detection_confidence) <= 1.0:
+        parser.error("--target_detection_confidence must be in [0, 1]")
     if args.map:
         if not os.path.isfile(args.map):
             parser.error(f"--map file does not exist: {args.map}")
@@ -2604,6 +2811,7 @@ def main():
                     ransac_remove_plane=_ransac_remove_plane,
                     scan_transforms=_scan_transforms,
                     build_support_surface=True,
+                    use_target_mask=True,
                 )
                 state_step = 0
                 _moveit_pre_cmds = None
