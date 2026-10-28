@@ -8,15 +8,15 @@ from typing import Iterable
 import numpy as np
 
 
-def wrap_angle(angle: float) -> float:
+def wrap_angle(angle: float) -> float:   # 把任意角度归一化到 [-π, π)
     return (float(angle) + math.pi) % (2.0 * math.pi) - math.pi
 
 
-def yaw_to_quat_wxyz(yaw: float) -> np.ndarray:
+def yaw_to_quat_wxyz(yaw: float) -> np.ndarray:   # 把只有 yaw 的平面旋转转换成 MuJoCo 使用的四元数wxyz
     return rpy_to_quat_wxyz(0.0, 0.0, yaw)
 
 
-def rpy_to_quat_wxyz(roll: float, pitch: float, yaw: float) -> np.ndarray:
+def rpy_to_quat_wxyz(roll: float, pitch: float, yaw: float) -> np.ndarray:   # 把 roll、pitch、yaw 转换成 MuJoCo 的 wxyz 四元数，主要用于设置机器狗根节点的三维姿态。
     """Convert intrinsic XYZ roll/pitch/yaw to MuJoCo ``(w,x,y,z)``."""
     cr, sr = math.cos(0.5 * roll), math.sin(0.5 * roll)
     cp, sp = math.cos(0.5 * pitch), math.sin(0.5 * pitch)
@@ -29,7 +29,7 @@ def rpy_to_quat_wxyz(roll: float, pitch: float, yaw: float) -> np.ndarray:
     ], dtype=np.float64)
 
 
-def se2_to_matrix(pose: Iterable[float]) -> np.ndarray:
+def se2_to_matrix(pose: Iterable[float]) -> np.ndarray:   # 把二维位姿[x, y, yaw]转换成 4×4 齐次变换矩阵
     x, y, yaw = (float(v) for v in pose)
     c, s = math.cos(yaw), math.sin(yaw)
     return np.array(
@@ -41,7 +41,7 @@ def se2_to_matrix(pose: Iterable[float]) -> np.ndarray:
     )
 
 
-def matrix_to_se2(transform: np.ndarray) -> np.ndarray:
+def matrix_to_se2(transform: np.ndarray) -> np.ndarray:   # 从 4×4 变换矩阵中提取[x, y, yaw]
     transform = np.asarray(transform, dtype=np.float64).reshape(4, 4)
     return np.array(
         [transform[0, 3], transform[1, 3],
@@ -50,21 +50,21 @@ def matrix_to_se2(transform: np.ndarray) -> np.ndarray:
     )
 
 
-def relative_se2(origin_world: Iterable[float], target_world: Iterable[float]) -> np.ndarray:
+def relative_se2(origin_world: Iterable[float], target_world: Iterable[float]) -> np.ndarray:   # 计算目标位姿在起点局部坐标系中的相对位姿
     return matrix_to_se2(
         np.linalg.inv(se2_to_matrix(origin_world)) @ se2_to_matrix(target_world)
     )
 
 
-def transform_se2(origin_world: Iterable[float], local_pose: Iterable[float]) -> np.ndarray:
+def transform_se2(origin_world: Iterable[float], local_pose: Iterable[float]) -> np.ndarray:   # 把局部坐标系中的位姿转换回世界坐标
     return matrix_to_se2(se2_to_matrix(origin_world) @ se2_to_matrix(local_pose))
 
 
-def joint1_towards_cube(base_pose: Iterable[float], cube_world: Iterable[float]) -> float:
+def joint1_towards_cube(base_pose: Iterable[float], cube_world: Iterable[float]) -> float:   # 计算机械臂 joint1 应旋转到的角度，使机械臂朝向 cube
     bx, by, byaw = (float(v) for v in base_pose)
     cube = np.asarray(cube_world, dtype=np.float64)
     return wrap_angle(math.atan2(cube[1] - by, cube[0] - bx) - byaw)
 
 
-def angular_error(actual: float, target: float) -> float:
+def angular_error(actual: float, target: float) -> float:   # 计算两个角度之间带方向的误差
     return wrap_angle(float(actual) - float(target))

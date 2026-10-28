@@ -63,6 +63,7 @@ class CoverageConfig:
     min_new_coverage_cells: int
     travel_cost_weight: float
     semantic_interest_weight: float
+    depth_ray_stride_px: int
 
 
 @dataclass(frozen=True)
@@ -71,7 +72,16 @@ class SearchConfig:
     nav2_map_yaml: Path
     camera_name: str
     object_merge_distance_m: float
-    target_accept_confidence: float
+    object_vlm_min_mask_pixels: int
+    provisional_reobserve_enabled: bool
+    provisional_reobserve_min_observations: int
+    provisional_reobserve_min_mask_pixels: int
+    provisional_reobserve_min_confidence: float
+    provisional_reobserve_max_position_residual_m: float
+    provisional_reobserve_preferred_standoff_m: float
+    provisional_reobserve_min_standoff_m: float
+    provisional_reobserve_max_standoff_m: float
+    provisional_reobserve_max_attempts: int
     early_stop_min_room_coverage: float
     early_stop_min_ordinary_viewpoints: int
     early_stop_max_current_images: int
@@ -145,8 +155,12 @@ def load_sysnav_config(path: Path | str = DEFAULT_CONFIG) -> SysNavConfig:
         vlm=VLMConfig(
             api_key_env=str(vlm["api_key_env"]),
             base_url=str(vlm["base_url"]),
-            reasoning_model=str(vlm["reasoning_model"]),
-            fast_model=str(vlm["fast_model"]),
+            reasoning_model=os.environ.get(
+                "QWEN_MODEL", str(vlm["reasoning_model"])
+            ).strip(),
+            fast_model=os.environ.get(
+                "QWEN_MODEL_LITE", str(vlm["fast_model"])
+            ).strip(),
             timeout_s=float(vlm["timeout_s"]),
         ),
         perception=PerceptionConfig(
@@ -171,13 +185,45 @@ def load_sysnav_config(path: Path | str = DEFAULT_CONFIG) -> SysNavConfig:
             min_new_coverage_cells=int(coverage["min_new_coverage_cells"]),
             travel_cost_weight=float(coverage["travel_cost_weight"]),
             semantic_interest_weight=float(coverage["semantic_interest_weight"]),
+            depth_ray_stride_px=int(coverage.get("depth_ray_stride_px", 8)),
         ),
         search=SearchConfig(
             room_map_manifest=_resolve_path(search["room_map_manifest"], root),
             nav2_map_yaml=_resolve_path(search["nav2_map_yaml"], root),
             camera_name=str(search["camera_name"]),
             object_merge_distance_m=float(search["object_merge_distance_m"]),
-            target_accept_confidence=float(search["target_accept_confidence"]),
+            object_vlm_min_mask_pixels=int(
+                search.get("object_vlm_min_mask_pixels", 500)
+            ),
+            provisional_reobserve_enabled=bool(
+                search.get("provisional_reobserve_enabled", True)
+            ),
+            provisional_reobserve_min_observations=int(
+                search.get("provisional_reobserve_min_observations", 3)
+            ),
+            provisional_reobserve_min_mask_pixels=int(
+                search.get("provisional_reobserve_min_mask_pixels", 80)
+            ),
+            provisional_reobserve_min_confidence=float(
+                search.get("provisional_reobserve_min_confidence", 0.12)
+            ),
+            provisional_reobserve_max_position_residual_m=float(
+                search.get(
+                    "provisional_reobserve_max_position_residual_m", 0.25
+                )
+            ),
+            provisional_reobserve_preferred_standoff_m=float(
+                search.get("provisional_reobserve_preferred_standoff_m", 1.25)
+            ),
+            provisional_reobserve_min_standoff_m=float(
+                search.get("provisional_reobserve_min_standoff_m", 0.85)
+            ),
+            provisional_reobserve_max_standoff_m=float(
+                search.get("provisional_reobserve_max_standoff_m", 1.65)
+            ),
+            provisional_reobserve_max_attempts=int(
+                search.get("provisional_reobserve_max_attempts", 2)
+            ),
             early_stop_min_room_coverage=float(
                 search["early_stop_min_room_coverage"]
             ),
@@ -226,10 +272,49 @@ def load_sysnav_config(path: Path | str = DEFAULT_CONFIG) -> SysNavConfig:
     )
     if not 0.0 < result.perception.confidence <= 1.0:
         raise ValueError("perception.confidence must lie in (0, 1]")
+    if not result.vlm.reasoning_model or not result.vlm.fast_model:
+        raise ValueError("VLM model names must not be empty")
     if result.coverage.yaw_bins <= 0 or result.coverage.candidate_spacing_m <= 0:
         raise ValueError("coverage spacing and yaw_bins must be positive")
+    if result.coverage.depth_ray_stride_px <= 0:
+        raise ValueError("coverage.depth_ray_stride_px must be positive")
     if not 0.0 <= result.search.early_stop_min_room_coverage <= 1.0:
         raise ValueError("early_stop_min_room_coverage must lie in [0, 1]")
+    if result.search.object_vlm_min_mask_pixels <= 0:
+        raise ValueError("object_vlm_min_mask_pixels must be positive")
+    if result.search.provisional_reobserve_min_observations <= 1:
+        raise ValueError(
+            "provisional_reobserve_min_observations must be greater than one"
+        )
+    if result.search.provisional_reobserve_min_mask_pixels <= 0:
+        raise ValueError("provisional_reobserve_min_mask_pixels must be positive")
+    if (
+        result.search.provisional_reobserve_min_mask_pixels
+        >= result.search.object_vlm_min_mask_pixels
+    ):
+        raise ValueError(
+            "provisional_reobserve_min_mask_pixels must be smaller than "
+            "object_vlm_min_mask_pixels"
+        )
+    if not 0.0 < result.search.provisional_reobserve_min_confidence <= 1.0:
+        raise ValueError(
+            "provisional_reobserve_min_confidence must lie in (0, 1]"
+        )
+    if result.search.provisional_reobserve_max_position_residual_m <= 0.0:
+        raise ValueError(
+            "provisional_reobserve_max_position_residual_m must be positive"
+        )
+    if not (
+        0.0 < result.search.provisional_reobserve_min_standoff_m
+        <= result.search.provisional_reobserve_preferred_standoff_m
+        <= result.search.provisional_reobserve_max_standoff_m
+    ):
+        raise ValueError(
+            "provisional reobserve standoffs must satisfy "
+            "0 < min <= preferred <= max"
+        )
+    if result.search.provisional_reobserve_max_attempts <= 0:
+        raise ValueError("provisional_reobserve_max_attempts must be positive")
     if result.search.early_stop_min_ordinary_viewpoints <= 0:
         raise ValueError("early_stop_min_ordinary_viewpoints must be positive")
     if result.search.early_stop_max_current_images <= 0:

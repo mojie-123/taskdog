@@ -1,42 +1,72 @@
-"""Classical room-internal viewpoint coverage over the static 2-D map."""
+"""Classical room-internal viewpoint coverage over the static 2-D map.
+负责在一个匿名房间内生成观察位姿，并在运行过程中使用贪心算法选择下一个观察点。"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 import math
+from typing import TYPE_CHECKING
 
 import numpy as np
 
+from custom_envs.scripts.N2M.data_generation.camera_geometry import (
+    camera_points_to_frame,
+    depth_to_optical_points,
+)
 from custom_envs.scripts.map.nav2_map_io import Nav2Map
 from custom_envs.scripts.map.room_map_io import RoomMap
 
 from .config import CoverageConfig
 
+if TYPE_CHECKING:
+    from .rgbd import RGBDFrame
 
-def _wrap_angle(value: np.ndarray | float):
-    return (value + math.pi) % (2.0 * math.pi) - math.pi
 
+def _grid_line_cells(
+    start: tuple[int, int], end: tuple[int, int]
+) -> tuple[np.ndarray, np.ndarray]:
+    """Rasterize a closed 2-D grid segment using evenly spaced cell samples."""
 
-def _line_is_clear(
-    blocked: np.ndarray, start: tuple[int, int], end: tuple[int, int]
-) -> bool:
     row0, col0 = start
     row1, col1 = end
     count = max(abs(row1 - row0), abs(col1 - col0)) + 1
     rows = np.rint(np.linspace(row0, row1, count)).astype(np.int32)
     cols = np.rint(np.linspace(col0, col1, count)).astype(np.int32)
-    if count <= 2:
+    return rows, cols
+
+
+def _wrap_angle(value: np.ndarray | float):   # 角度归一化到[-π, π)
+    return (value + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def _line_is_clear(
+    blocked: np.ndarray, start: tuple[int, int], end: tuple[int, int]
+) -> bool:   # 判断两个栅格之间的二维视线是否被障碍物或未知区域挡住
+    rows, cols = _grid_line_cells(start, end)
+    if len(rows) <= 2:
         return True
     return not bool(blocked[rows[1:-1], cols[1:-1]].any())
 
 
 @dataclass(frozen=True)
-class CoverageViewpoint:
-    index: int
-    room_id: str
-    pose: tuple[float, float, float]
-    grid_cell: tuple[int, int]
-    visible_target_indices: np.ndarray = field(repr=False, compare=False)
+class CoverageViewpoint:   # 一个候选观察位姿
+    index: int   # 视点编号
+    room_id: str   # 这个视点属于哪个匿名房间
+    pose: tuple[float, float, float]   # 观察位姿
+    grid_cell: tuple[int, int]   # 该位姿在栅格地图中的位置
+    visible_target_indices: np.ndarray = field(repr=False, compare=False)   # 该位姿理论上能看到哪些coverage target cells
+
+
+@dataclass(frozen=True)
+class DepthCoverageUpdate:
+    """Summary of one coverage update backed by the captured depth frame."""
+
+    valid_depth_rays: int
+    unique_grid_rays: int
+    observed_target_count: int
+    newly_observed_target_count: int
+    theoretical_target_count: int
+    coverage: float
 
 
 class RoomCoveragePlan:
@@ -49,14 +79,24 @@ class RoomCoveragePlan:
         target_cells: np.ndarray,
         target_world_xy: np.ndarray,
         config: CoverageConfig,
+        nav_map: Nav2Map,
     ):
         self.room_id = room_id
         self.viewpoints = viewpoints
         self.target_cells = np.asarray(target_cells, dtype=np.int32).reshape(-1, 2)
         self.target_world_xy = np.asarray(target_world_xy, dtype=np.float64).reshape(-1, 2)
         self.config = config
+        self.nav_map = nav_map
         self.covered = np.zeros(len(self.target_cells), dtype=bool)
         self.visited_viewpoints: set[int] = set()
+        self._blocked = nav_map.occupied_mask | nav_map.unknown_mask
+        self._target_index_by_cell = np.full(
+            self._blocked.shape, -1, dtype=np.int32
+        )
+        if len(self.target_cells):
+            self._target_index_by_cell[
+                self.target_cells[:, 0], self.target_cells[:, 1]
+            ] = np.arange(len(self.target_cells), dtype=np.int32)
 
     @property
     def coverage(self) -> float:
@@ -66,10 +106,116 @@ class RoomCoveragePlan:
     def exhausted(self) -> bool:
         return self.next_viewpoint((0.0, 0.0, 0.0)) is None
 
-    def mark_visited(self, viewpoint_index: int) -> None:
+    def mark_observed(
+        self, viewpoint_index: int, frame: "RGBDFrame"
+    ) -> DepthCoverageUpdate:
+        """Mark only target cells reached by valid measured-depth rays.
+
+        The static map remains useful for predicting future viewpoint gain, but
+        it no longer decides what a completed observation actually covered.
+        Each sampled RGB-D ray ends at its measured surface (and is additionally
+        clamped by the first occupied/unknown Nav2 cell), so coverage cannot
+        continue through a wall or a furniture footprint.
+        """
+
         viewpoint = self.viewpoints[int(viewpoint_index)]
-        self.covered[viewpoint.visible_target_indices] = True
         self.visited_viewpoints.add(int(viewpoint_index))
+
+        depth = np.asarray(frame.depth, dtype=np.float64)
+        stride = int(self.config.depth_ray_stride_px)
+        sample_mask = np.zeros(depth.shape, dtype=bool)
+        sample_mask[::stride, ::stride] = True
+        sample_mask &= np.isfinite(depth) & (depth > 0.0)
+        points_optical, _ = depth_to_optical_points(
+            depth, frame.intrinsics, sample_mask
+        )
+        if not len(points_optical):
+            return DepthCoverageUpdate(
+                valid_depth_rays=0,
+                unique_grid_rays=0,
+                observed_target_count=0,
+                newly_observed_target_count=0,
+                theoretical_target_count=len(viewpoint.visible_target_indices),
+                coverage=self.coverage,
+            )
+
+        points_world = camera_points_to_frame(
+            points_optical,
+            frame.camera_position_world,
+            frame.camera_rotation_world,
+            np.zeros(3, dtype=np.float64),
+            np.eye(3, dtype=np.float64),
+        )
+        camera_xy = np.asarray(frame.camera_position_world, dtype=np.float64)[:2]
+        ray_xy = points_world[:, :2] - camera_xy
+        ray_distance = np.linalg.norm(ray_xy, axis=1)
+        useful = np.isfinite(ray_distance) & (
+            ray_distance > self.nav_map.resolution * 0.25
+        )
+        ray_xy = ray_xy[useful]
+        ray_distance = ray_distance[useful]
+        if not len(ray_xy):
+            return DepthCoverageUpdate(
+                valid_depth_rays=len(points_optical),
+                unique_grid_rays=0,
+                observed_target_count=0,
+                newly_observed_target_count=0,
+                theoretical_target_count=len(viewpoint.visible_target_indices),
+                coverage=self.coverage,
+            )
+
+        # A far measured surface proves free space only up to the configured
+        # coverage horizon. A nearer surface naturally truncates the ray.
+        scales = np.minimum(
+            1.0,
+            float(self.config.max_view_range_m) / ray_distance,
+        )
+        endpoints_xy = camera_xy + ray_xy * scales[:, None]
+        endpoint_cells = np.asarray(
+            [
+                self.nav_map.world_to_grid(float(point[0]), float(point[1]))
+                for point in endpoints_xy
+            ],
+            dtype=np.int32,
+        )
+        endpoint_cells = np.unique(endpoint_cells, axis=0)
+        start_cell = self.nav_map.world_to_grid(
+            float(camera_xy[0]), float(camera_xy[1])
+        )
+
+        observed_indices: set[int] = set()
+        height, width = self._blocked.shape
+        for endpoint_row, endpoint_col in endpoint_cells:
+            rows, cols = _grid_line_cells(
+                start_cell, (int(endpoint_row), int(endpoint_col))
+            )
+            entered_map = False
+            for row, col in zip(rows, cols, strict=True):
+                if row < 0 or row >= height or col < 0 or col >= width:
+                    if entered_map:
+                        break
+                    continue
+                entered_map = True
+                if self._blocked[row, col]:
+                    break
+                target_index = int(self._target_index_by_cell[row, col])
+                if target_index >= 0:
+                    observed_indices.add(target_index)
+
+        observed = np.fromiter(
+            observed_indices, dtype=np.int64, count=len(observed_indices)
+        )
+        newly_observed = int((~self.covered[observed]).sum()) if len(observed) else 0
+        if len(observed):
+            self.covered[observed] = True
+        return DepthCoverageUpdate(
+            valid_depth_rays=len(points_optical),
+            unique_grid_rays=len(endpoint_cells),
+            observed_target_count=len(observed),
+            newly_observed_target_count=newly_observed,
+            theoretical_target_count=len(viewpoint.visible_target_indices),
+            coverage=self.coverage,
+        )
 
     def next_viewpoint(
         self,
@@ -113,7 +259,7 @@ class RoomCoveragePlan:
         return best
 
 
-class CoveragePlanner:
+class CoveragePlanner:   # 负责生成一个房间内所有可能的观察位姿及其可见区域。
     """Generate collision-free, occlusion-aware front-camera viewpoints."""
 
     def __init__(self, room_map: RoomMap, nav_map: Nav2Map, config: CoverageConfig):
@@ -213,4 +359,5 @@ class CoveragePlanner:
             target_cells=target_cells,
             target_world_xy=target_world,
             config=self.config,
+            nav_map=self.nav_map,
         )

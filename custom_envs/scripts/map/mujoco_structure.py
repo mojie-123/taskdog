@@ -20,13 +20,13 @@ STRUCTURE_GEOM_PREFIX = "wall_"
 
 @dataclass(frozen=True)
 class WallSegment:
-    name: str
-    center: np.ndarray
-    direction: np.ndarray
-    half_length: float
-    half_thickness: float
-    z_center: float
-    z_half_size: float
+    name: str   # 墙体名称
+    center: np.ndarray   # 墙体中心
+    direction: np.ndarray   # 墙体长边方向
+    half_length: float   # 墙的半长
+    half_thickness: float   # 墙的半厚
+    z_center: float   # 墙中心高度
+    z_half_size: float   # 墙高度的一半
 
     @property
     def normal(self) -> np.ndarray:
@@ -109,8 +109,12 @@ def _yaw_from_element(element: ET.Element, angles_are_degrees: bool) -> float:
 def extract_wall_segments(scene_xml: Path | str) -> list[WallSegment]:
     """Read only top-level structural wall boxes from a MuJoCo scene."""
 
+    """从 MuJoCo XML 中找到所有直属于 <worldbody>、
+    名字以 wall_ 开头、类型为 box 的 geom，
+    并把它们转换成统一的二维 WallSegment 对象。"""
+
     xml_path = Path(scene_xml).expanduser().resolve()
-    root = ET.parse(xml_path).getroot()
+    root = ET.parse(xml_path).getroot()   # 取得xml文件的根节点
     compiler = root.find("compiler")
     angle_unit = compiler.get("angle", "degree") if compiler is not None else "degree"
     angles_are_degrees = angle_unit == "degree"

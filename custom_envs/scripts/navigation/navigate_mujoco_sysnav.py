@@ -41,7 +41,12 @@ from custom_envs.scripts.N2M.data_generation.live_observation import (
     LiveObservationError,
 )
 from custom_envs.scripts.N2M.manifests import write_json
-from custom_envs.scripts.N2M.manipulation_episode import ARM_HOME, GRIPPER_OPEN
+from custom_envs.scripts.N2M.geometry import joint1_towards_cube
+from custom_envs.scripts.N2M.manipulation_episode import (
+    ARM_DEPLOY_TEMPLATE,
+    ARM_HOME,
+    GRIPPER_OPEN,
+)
 from custom_envs.scripts.N2M.target_provider import TargetEstimate
 from custom_envs.scripts.navigation import navigate_mujoco_n2m as n2m
 from custom_envs.scripts.sysnav.config import DEFAULT_CONFIG
@@ -55,6 +60,8 @@ from custom_envs.scripts.sysnav.search_runner import SysNavSearchRunner
 from custom_envs.scripts.sysnav.transit_detection import (
     ContinuousTransitDetector,
     TransitCandidate,
+    TransitReobserveRequested,
+    TransitTargetFound,
 )
 from custom_envs.scripts.sysnav.types import SearchInstruction
 
@@ -85,6 +92,95 @@ class _VisionTargetProvider:
         self.position_world = np.asarray(
             position_world, dtype=np.float64
         ).reshape(3)
+
+
+class _SysNavVisionGraspRunner(n2m.AttachedPersistentGraspRunner):
+    """Aim ARM_INIT from SysNav vision and keep one target per M."""
+
+    def __init__(self, *args, target_provider: _VisionTargetProvider, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._sysnav_target_provider = target_provider
+        self._sysnav_arm_init_targets: dict[str, dict] = {}
+
+    @staticmethod
+    def _m_cache_key(candidate: dict) -> str:
+        candidate_id = candidate.get("candidate_id")
+        if candidate_id is not None:
+            return str(candidate_id)
+        base = np.asarray(candidate["base_pose"], dtype=np.float64).reshape(3)
+        return "base:" + ",".join(f"{value:.12f}" for value in base)
+
+    def run_arm_init(self, candidate: dict) -> dict:
+        """Use one visually derived ARM_INIT joint target for each M.
+
+        The inherited persistent-attempt path refreshes ``cube_pose`` from
+        MuJoCo before every retry.  This SysNav-only override deliberately
+        ignores that value for ARM_INIT.  The first attempt at an M computes
+        J1 from the latest YOLOE+SAM2+depth estimate; later attempts at the
+        same M reuse the cached complete deployed-arm target.
+        """
+
+        cache_key = self._m_cache_key(candidate)
+        cached = self._sysnav_arm_init_targets.get(cache_key)
+        reused = cached is not None
+        if cached is None:
+            estimate = self._sysnav_target_provider.estimate(
+                self.env, self.cfg.object_name
+            )
+            target_position = np.asarray(
+                estimate.position_world, dtype=np.float64
+            ).reshape(3)
+            joint1_target = float(
+                joint1_towards_cube(candidate["base_pose"], target_position)
+            )
+            deploy_target = ARM_DEPLOY_TEMPLATE.copy()
+            deploy_target[0] = joint1_target
+            cached = {
+                "source": str(estimate.source),
+                "target_position_world": target_position.copy(),
+                "joint1_target": joint1_target,
+                "deploy_arm_target": deploy_target,
+            }
+            self._sysnav_arm_init_targets[cache_key] = cached
+
+        # Feed the inherited implementation a point on the cached J1 ray.
+        # Rebuilding the point from the current base pose also prevents tiny
+        # base drift from changing J1 during retries at the same M.
+        base = np.asarray(candidate["base_pose"], dtype=np.float64).reshape(3)
+        heading = float(base[2] + cached["joint1_target"])
+        arm_candidate = dict(candidate)
+        arm_candidate["cube_pose"] = [
+            float(base[0] + math.cos(heading)),
+            float(base[1] + math.sin(heading)),
+            float(cached["target_position_world"][2]),
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+        ]
+        info = super().run_arm_init(arm_candidate)
+        info.update(
+            {
+                "arm_init_target_source": cached["source"],
+                "arm_init_target_position_world": cached[
+                    "target_position_world"
+                ].astype(float).tolist(),
+                "arm_init_target_cache_key": cache_key,
+                "arm_init_target_reused": reused,
+                "deploy_arm_target": cached["deploy_arm_target"]
+                .astype(float)
+                .tolist(),
+            }
+        )
+        print(
+            f"[SYSNAV][ARM_INIT_TARGET] M={cache_key} "
+            f"mode={'reused' if reused else 'computed'} "
+            f"source={cached['source']} position="
+            f"{np.round(cached['target_position_world'], 4).tolist()} "
+            f"joints={np.round(cached['deploy_arm_target'], 4).tolist()}",
+            flush=True,
+        )
+        return info
 
 
 class _TransitNavigationInterrupt(RuntimeError):
@@ -298,6 +394,12 @@ class _LegacySearchNavigator:
                     "elapsed_s": time.monotonic() - started,
                     "final_base_pose": pose.astype(float).tolist(),
                 }
+            except TransitTargetFound:
+                self.bridge.cancel_goal()
+                raise
+            except TransitReobserveRequested:
+                self.bridge.cancel_goal()
+                raise
         return self._move_physically(target, name=name)
 
     def _move_physically(self, target: np.ndarray, *, name: str) -> dict:
@@ -337,9 +439,13 @@ class _LegacySearchNavigator:
             if contacts:
                 raise RuntimeError(f"{name}: environment contact: {contacts}")
             if self.transit_detector is not None:
-                candidate = self.transit_detector.sample(
-                    self.current_pose(), navigation_name=name
-                )
+                try:
+                    candidate = self.transit_detector.sample(
+                        self.current_pose(), navigation_name=name
+                    )
+                except (TransitTargetFound, TransitReobserveRequested):
+                    self.bridge.cancel_goal()
+                    raise
                 if candidate is not None:
                     self._pending_transit_candidate = candidate
                     self.bridge.cancel_goal()
@@ -373,9 +479,13 @@ class _LegacySearchNavigator:
                 (0.0, 0.0, command),
             )
             if self.transit_detector is not None:
-                candidate = self.transit_detector.sample(
-                    self.current_pose(), navigation_name=f"{name}_ALIGN"
-                )
+                try:
+                    candidate = self.transit_detector.sample(
+                        self.current_pose(), navigation_name=f"{name}_ALIGN"
+                    )
+                except (TransitTargetFound, TransitReobserveRequested):
+                    self.bridge.cancel_goal()
+                    raise
                 if candidate is not None:
                     self._pending_transit_candidate = candidate
                     self.bridge.cancel_goal()
@@ -1202,6 +1312,7 @@ def _handoff_to_n2m(
     original_provider = n2m.MuJoCoTruthTargetProvider
     original_capture = n2m.capture_live_observation
     original_controller = n2m.InteractiveController
+    original_grasp_runner = n2m.AttachedPersistentGraspRunner
     original_standoff_goal = n2m.standoff_goal
     original_env_class = env_module.MuJoCoEnv
     original_env_close = env.close
@@ -1266,6 +1377,13 @@ def _handoff_to_n2m(
                 components.search_policy.instruction.target_object,
             )
             n2m.InteractiveController = lambda: controller
+            n2m.AttachedPersistentGraspRunner = (
+                lambda *runner_args, **runner_kwargs: _SysNavVisionGraspRunner(
+                    *runner_args,
+                    target_provider=provider,
+                    **runner_kwargs,
+                )
+            )
             env_module.MuJoCoEnv = reuse_env
             if active_observation_view is None:
                 n2m.standoff_goal = original_standoff_goal
@@ -1412,6 +1530,7 @@ def _handoff_to_n2m(
         n2m.MuJoCoTruthTargetProvider = original_provider
         n2m.capture_live_observation = original_capture
         n2m.InteractiveController = original_controller
+        n2m.AttachedPersistentGraspRunner = original_grasp_runner
         n2m.standoff_goal = original_standoff_goal
         env_module.MuJoCoEnv = original_env_class
         args.output_dir = original_output_dir
@@ -1459,6 +1578,11 @@ def _handoff_to_n2m(
 
 def main() -> int:
     args = _build_parser().parse_args()
+    # Unless explicitly overridden, the search and the later wrist-camera
+    # grasp use the same YOLOE/SAM2 model configuration.  N2M consumes this
+    # field after SysNav hands off.
+    if args.perception_config == n2m.DEFAULT_PERCEPTION_CONFIG:
+        args.perception_config = args.sysnav_config
     _validate_args(args)
     output_dir = _prepare_output_dir(args)
     os.environ.setdefault("MUJOCO_GL", "glx" if args.render else "egl")
@@ -1614,6 +1738,21 @@ def main() -> int:
                 f"save_images={transit_config.save_images}",
                 flush=True,
             )
+        reobserve = config.config.search
+        reobserve_enabled = bool(
+            reobserve.provisional_reobserve_enabled
+            and transit_detector is not None
+        )
+        print(
+            f"[SYSNAV][TARGET_REOBSERVE_CONFIG] "
+            f"enabled={reobserve_enabled} "
+            f"min_observations={reobserve.provisional_reobserve_min_observations} "
+            f"mask_range=[{reobserve.provisional_reobserve_min_mask_pixels},"
+            f"{reobserve.object_vlm_min_mask_pixels}) "
+            f"standoff={reobserve.provisional_reobserve_preferred_standoff_m:.2f}m "
+            f"max_attempts={reobserve.provisional_reobserve_max_attempts}",
+            flush=True,
+        )
         print(
             "[SYSNAV][ROOM_SEMANTICS] mode=revisable_multi_view "
             f"max_images={config.config.search.room_semantic_max_images} "

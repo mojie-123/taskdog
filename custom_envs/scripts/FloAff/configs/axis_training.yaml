@@ -1,0 +1,35 @@
+seed: 42
+device: cuda:0
+
+dataset_root: custom_envs/scripts/FloAff/data/dataset_v1
+run_root: custom_envs/scripts/FloAff/runs/anchor_axis
+
+data:
+  train_role: axis_train
+  evaluation_role: axis_eval_floaff_train
+  validation_fraction: 0.20
+  augmentation:
+    yaw_deg: 180.0
+    jitter_std_m: 0.003
+    dropout_probability: 0.05
+
+model:
+  point_channels: [64, 128, 256]
+  head_channels: [256, 128]
+  dropout: 0.10
+
+training:
+  epochs: 200
+  batch_size: 32
+  num_workers: 4
+  pin_memory: true
+  learning_rate: 0.001
+  minimum_learning_rate: 0.000001
+  weight_decay: 0.0001
+  gradient_clip_norm: 5.0
+
+inference:
+  batch_size: 64
+  roles: [axis_eval_floaff_train, transfer_test]
+  # Keep dataset construction consistent with deployment: one prediction per O.
+  tta_angles_deg: [0.0]

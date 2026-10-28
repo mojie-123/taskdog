@@ -71,6 +71,7 @@ from custom_envs.scripts.N2M.retry_n2m_grasp_until_success import pose_motion
 
 DEFAULT_SCENE = _ROOT / "custom_envs" / "mujoco" / "scene_house_N2M.xml"
 DEFAULT_NAV2_PARAMS = _ROOT / "custom_envs" / "config" / "nav2_params.yaml"
+DEFAULT_PERCEPTION_CONFIG = _ROOT / "custom_envs" / "config" / "sysnav.yaml"
 DEFAULT_CHECKPOINT = (
     _ROOT
     / "custom_envs"
@@ -584,6 +585,7 @@ class AttachedPersistentGraspRunner(AdaptiveRecoveryRunner):
         self.current_candidate = None
         self.joint1_target = None
         self.moveit = None
+        self._moveit_scene_applied = False
         self.attached = False
         self.attached_id = "n2m_carried_cube"
         self._imports_ready = False
@@ -661,28 +663,9 @@ class AttachedPersistentGraspRunner(AdaptiveRecoveryRunner):
         }
         object_tcp = self._object_pose_in_tcp()
         initial_object_tcp = object_tcp.position.copy()
-        default_sizes = {
-            "cube": (0.050, 0.050, 0.050),
-            "apple": (0.085, 0.085, 0.085),
-            "bowl": (0.120, 0.120, 0.070),
-            "banana": (0.180, 0.060, 0.055),
-        }
-        size = self.cfg.moveit_attached_object_size or default_sizes.get(
-            self.cfg.object_name, (0.060, 0.060, 0.060)
+        self._attach_current_object(
+            "LIFT_RETRACT", object_pose_in_tcp=object_tcp
         )
-        attach = self.moveit.attach_box(
-            self.attached_id,
-            self.pose_to_ros_dict(object_tcp),
-            size,
-            link_name="grasp_tcp",
-            touch_links=["gripper_base", "grasp_tcp", "link6", "link7", "link8"],
-            timeout=6.0,
-        )
-        if not attach.get("ok", False):
-            raise EpisodeFailure(
-                "LIFT_RETRACT", "moveit_attach_failed", reply=attach
-            )
-        self.attached = True
 
         try:
             names, positions = self._moveit_state()
@@ -4713,6 +4696,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--object", default="cube")
     parser.add_argument(
+        "--perception-config",
+        "--perception_config",
+        dest="perception_config",
+        type=Path,
+        default=DEFAULT_PERCEPTION_CONFIG,
+        help="YOLOE/SAM2 perception config used by the wrist grasp scan",
+    )
+    parser.add_argument(
+        "--target-detection-confidence",
+        "--target_detection_confidence",
+        dest="target_detection_confidence",
+        type=float,
+        default=0.01,
+        help="minimum wrist-camera YOLOE confidence before SAM2 refinement",
+    )
+    parser.add_argument(
+        "--moveit-insertion",
+        "--moveit_insertion",
+        dest="moveit_insertion",
+        type=float,
+        default=0.01,
+        help="extra grasp TCP insertion in metres (default: 0.01)",
+    )
+    parser.add_argument(
         "--destination",
         nargs=2,
         type=float,
@@ -4976,6 +4983,14 @@ def main() -> int:
         raise SystemExit(f"N2M checkpoint does not exist: {args.n2m_checkpoint}")
     if not args.nav2_params.is_file():
         raise SystemExit(f"Nav2 params do not exist: {args.nav2_params}")
+    if not args.perception_config.is_file():
+        raise SystemExit(
+            f"perception config does not exist: {args.perception_config}"
+        )
+    if not 0.0 <= float(args.target_detection_confidence) <= 1.0:
+        raise SystemExit("--target-detection-confidence must be in [0, 1]")
+    if args.moveit_insertion < 0.0:
+        raise SystemExit("--moveit-insertion must be non-negative")
     if args.nav_snapshot_every > 0 and not args.nav_snapshot_map.is_file():
         raise SystemExit(
             f"navigation snapshot map does not exist: {args.nav_snapshot_map}"
@@ -5130,6 +5145,13 @@ def main() -> int:
         "policy_path": str(Path(args.policy_path).expanduser().resolve()),
         "checkpoint": str(args.n2m_checkpoint.expanduser().resolve()),
         "grasp_checkpoint": str(Path(args.grasp_checkpoint).expanduser().resolve()),
+        "grasp_perception": {
+            "pipeline": "YOLOE_box_plus_SAM2_mask_plus_depth",
+            "config": str(args.perception_config.expanduser().resolve()),
+            "target_detection_confidence": args.target_detection_confidence,
+            "dynamic_support_surface": "wrist_depth_RANSAC",
+            "moveit_insertion_m": args.moveit_insertion,
+        },
         "object": args.object,
         "destination": [float(args.destination[0]), float(args.destination[1])],
         "destination_max_steps": args.destination_max_steps,
@@ -5361,7 +5383,17 @@ def main() -> int:
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-        episode_config = EpisodeConfig(object_name=args.object)
+        episode_config = EpisodeConfig(
+            object_name=args.object,
+            semantic_target_mask=True,
+            dynamic_support_surface=True,
+            use_mujoco_visibility_gate=False,
+            perception_config=str(args.perception_config.expanduser().resolve()),
+            target_detection_confidence=float(
+                args.target_detection_confidence
+            ),
+            moveit_insertion=float(args.moveit_insertion),
+        )
         runner = AttachedPersistentGraspRunner(
             env,
             episode_config,

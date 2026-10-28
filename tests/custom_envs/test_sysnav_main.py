@@ -10,9 +10,12 @@ import pytest
 import yaml
 
 from custom_envs.scripts.navigation import navigate_mujoco_n2m as n2m
+from custom_envs.scripts.N2M.geometry import joint1_towards_cube
+from custom_envs.scripts.N2M.manipulation_episode import ARM_DEPLOY_TEMPLATE
 from custom_envs.scripts.navigation.navigate_mujoco_sysnav import (
     _LegacySearchNavigator,
     _PreparsedParser,
+    _SysNavVisionGraspRunner,
     _VisionTargetProvider,
     _build_parser,
     _handoff_to_n2m,
@@ -56,6 +59,70 @@ def test_parser_adds_sysnav_options_without_changing_legacy_defaults():
     assert not args.sysnav_disable_obstacle_edge_view
     assert not args.sysnav_disable_transit_detection
     assert args.sysnav_transit_detection_hz is None
+
+
+def test_sysnav_arm_init_uses_vision_and_caches_complete_target_per_m(
+    monkeypatch,
+):
+    calls = []
+
+    def fake_run_arm_init(unused_self, candidate):
+        target = joint1_towards_cube(
+            candidate["base_pose"], candidate["cube_pose"]
+        )
+        deploy = ARM_DEPLOY_TEMPLATE.copy()
+        deploy[0] = target
+        calls.append((str(candidate["candidate_id"]), target, deploy))
+        return {
+            "joint1_target": target,
+            "deploy_arm_target": deploy.tolist(),
+        }
+
+    monkeypatch.setattr(
+        n2m.AttachedPersistentGraspRunner,
+        "run_arm_init",
+        fake_run_arm_init,
+    )
+    provider = _VisionTargetProvider(np.array([5.0, 4.0, 0.45]))
+    runner = object.__new__(_SysNavVisionGraspRunner)
+    runner._sysnav_target_provider = provider
+    runner._sysnav_arm_init_targets = {}
+    runner.env = object()
+    runner.cfg = SimpleNamespace(object_name="cube")
+
+    first_m = {
+        "candidate_id": "m_0001",
+        "base_pose": [4.0, 3.5, 0.2],
+        # Deliberately disagree with vision: ARM_INIT must ignore this truth.
+        "cube_pose": [20.0, 20.0, 0.45, 1.0, 0.0, 0.0, 0.0],
+    }
+    first = runner.run_arm_init(first_m)
+    provider.update(np.array([4.1, 5.2, 0.46]))
+    second = runner.run_arm_init(first_m)
+
+    second_m = {
+        "candidate_id": "m_0002",
+        "base_pose": [4.4, 3.2, -0.1],
+        "cube_pose": [-10.0, -10.0, 0.45, 1.0, 0.0, 0.0, 0.0],
+    }
+    third = runner.run_arm_init(second_m)
+
+    expected_first = joint1_towards_cube(first_m["base_pose"], [5.0, 4.0])
+    expected_third = joint1_towards_cube(
+        second_m["base_pose"], [4.1, 5.2]
+    )
+    assert calls[0][1] == pytest.approx(expected_first)
+    assert calls[1][1] == pytest.approx(expected_first)
+    assert calls[2][1] == pytest.approx(expected_third)
+    np.testing.assert_allclose(
+        first["deploy_arm_target"], second["deploy_arm_target"]
+    )
+    assert first["arm_init_target_position_world"] == [5.0, 4.0, 0.45]
+    assert second["arm_init_target_position_world"] == [5.0, 4.0, 0.45]
+    assert third["arm_init_target_position_world"] == [4.1, 5.2, 0.46]
+    assert first["arm_init_target_reused"] is False
+    assert second["arm_init_target_reused"] is True
+    assert third["arm_init_target_reused"] is False
 
 
 def test_navfn_uses_dijkstra_for_stable_long_path_extraction():
@@ -449,6 +516,7 @@ def test_n2m_exhaustion_runs_a_second_round_in_the_same_env(
     planned_waypoints = []
     retry_waypoints = []
     recoveries = []
+    original_grasp_runner = n2m.AttachedPersistentGraspRunner
 
     def fake_retry_recovery(unused_env, target, **kwargs):
         recoveries.append((np.asarray(target).copy(), kwargs))
@@ -458,6 +526,7 @@ def test_n2m_exhaustion_runs_a_second_round_in_the_same_env(
         }
 
     def fake_n2m_main():
+        assert n2m.AttachedPersistentGraspRunner is not original_grasp_runner
         parsed = n2m.build_parser().parse_args()
         live_env = env_module.MuJoCoEnv()
         round_index = len(calls) + 1
@@ -512,6 +581,7 @@ def test_n2m_exhaustion_runs_a_second_round_in_the_same_env(
     )
 
     assert return_code == 0
+    assert n2m.AttachedPersistentGraspRunner is original_grasp_runner
     assert calls == [1, 2]
     assert env.close_count == 1
     assert len(planned_waypoints) == 2

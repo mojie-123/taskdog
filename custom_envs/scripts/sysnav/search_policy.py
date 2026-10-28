@@ -12,6 +12,7 @@ import numpy as np
 
 from .config import SearchConfig
 from .coverage import CoveragePlanner, CoverageViewpoint, RoomCoveragePlan
+from .rgbd import RGBDFrame
 from .perception import annotate_detection
 from .room_graph import AnonymousRoomGraph
 from .scene_memory import SceneMemory
@@ -55,6 +56,34 @@ class SemanticReasoner(Protocol):
         nearby_objects=(),
         candidate_crop_rgb: np.ndarray | None = None,
         candidate_clipped_by_image_edge: bool = False,
+    ) -> TargetVerification: ...
+
+    def verify_object_type(
+        self,
+        requested_label: str,
+        outlined_image_rgb: np.ndarray,
+        clean_crop_rgb: np.ndarray,
+        *,
+        candidate_clipped_by_image_edge: bool = False,
+    ) -> TargetVerification: ...
+
+    def verify_spatial_target(
+        self,
+        instruction: SearchInstruction,
+        object_label: str,
+        closeup_image_rgb: np.ndarray,
+        viewpoint_images_rgb: Sequence[np.ndarray],
+        *,
+        room_label: str = "",
+    ) -> TargetVerification: ...
+
+    def verify_anchor_object(
+        self,
+        instruction: SearchInstruction,
+        object_label: str,
+        closeup_image_rgb: np.ndarray,
+        *,
+        room_label: str = "",
     ) -> TargetVerification: ...
 
 
@@ -162,6 +191,12 @@ class SysNavSearchPolicy:
         for room in self.memory.rooms.values():
             room.exhausted = False
             room.coverage = 0.0
+        for record in self.memory.objects.values():
+            record.is_considered = False
+            record.is_considered_strong = False
+            record.spatial_query_key = None
+            record.spatial_verdict = ""
+            record.spatial_reason = ""
 
     def parse_and_start(self, instruction_text: str) -> SearchInstruction:
         if self.reasoner is None:
@@ -188,6 +223,7 @@ class SysNavSearchPolicy:
                 for record in self.memory.objects_by_label(
                     self.instruction.anchor_object, room_id=room_id
                 )
+                if record.spatial_verdict == "confirmed"
             ]
         viewpoint = plan.next_viewpoint(
             current_pose, interest_points_world=interest_points
@@ -196,11 +232,22 @@ class SysNavSearchPolicy:
             self.memory.update_room_progress(room_id, plan.coverage, exhausted=True)
         return viewpoint
 
-    def mark_viewpoint_complete(self, room_id: str, viewpoint_index: int) -> float:
+    def mark_viewpoint_complete(
+        self, room_id: str, viewpoint_index: int, frame: RGBDFrame
+    ) -> float:
         plan = self.plan_for_room(room_id)
-        plan.mark_visited(viewpoint_index)
-        self.memory.update_room_progress(room_id, plan.coverage)
-        return plan.coverage
+        update = plan.mark_observed(viewpoint_index, frame)
+        self.memory.update_room_progress(room_id, update.coverage)
+        print(
+            "[SYSNAV][COVERAGE_DEPTH] "
+            f"room={room_id} viewpoint={int(viewpoint_index)} "
+            f"rays={update.valid_depth_rays}/{update.unique_grid_rays} "
+            f"observed={update.observed_target_count} "
+            f"new={update.newly_observed_target_count} "
+            f"theoretical={update.theoretical_target_count} "
+            f"coverage={update.coverage:.3f}"
+        )
+        return update.coverage
 
     def choose_next_room(
         self,
@@ -343,8 +390,6 @@ class SysNavSearchPolicy:
         detection = candidate.detection
         if detection.label != self.instruction.target_object:
             return TargetVerification(False, "detector label does not match target object")
-        if detection.confidence < self.config.target_accept_confidence:
-            return TargetVerification(False, "detector confidence is below acceptance threshold")
         if self.reasoner is None:
             if not self.instruction.needs_vlm_verification:
                 return TargetVerification(

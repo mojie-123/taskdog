@@ -1,0 +1,196 @@
+<?xml version='1.0' encoding='utf-8'?>
+<mujoco model="SF_TRON1A_Piper">
+  <compiler angle="radian" meshdir="." />
+  <option timestep="0.001" gravity="0 0 -9.81" integrator="implicitfast" />
+  <default>
+    <joint armature="0.01" damping="0.01" />
+    <geom contype="1" conaffinity="1" condim="3" friction="0.6 0.005 0.0001" margin="0.001" />
+  </default>
+  <asset>
+    <mesh name="tron_abad_L_Link" file="meshes/tron/abad_L_Link.STL" />
+    <mesh name="tron_abad_R_Link" file="meshes/tron/abad_R_Link.STL" />
+    <mesh name="tron_ankle_L_Link" file="meshes/tron/ankle_L_Link.STL" />
+    <mesh name="tron_ankle_R_Link" file="meshes/tron/ankle_R_Link.STL" />
+    <mesh name="tron_base_Link" file="meshes/tron/base_Link.STL" />
+    <mesh name="tron_hip_L_Link" file="meshes/tron/hip_L_Link.STL" />
+    <mesh name="tron_hip_R_Link" file="meshes/tron/hip_R_Link.STL" />
+    <mesh name="tron_knee_L_Link" file="meshes/tron/knee_L_Link.STL" />
+    <mesh name="tron_knee_R_Link" file="meshes/tron/knee_R_Link.STL" />
+    <mesh name="piper_arm_base_link" file="meshes/piper/arm_base_link.STL" />
+    <mesh name="piper_gripper_base" file="meshes/piper/gripper_base.STL" />
+    <mesh name="piper_link1" file="meshes/piper/link1.STL" />
+    <mesh name="piper_link2" file="meshes/piper/link2.STL" />
+    <mesh name="piper_link3" file="meshes/piper/link3.STL" />
+    <mesh name="piper_link4" file="meshes/piper/link4.STL" />
+    <mesh name="piper_link5" file="meshes/piper/link5.STL" />
+    <mesh name="piper_link6" file="meshes/piper/link6.STL" />
+    <mesh name="piper_link7" file="meshes/piper/link7.STL" />
+    <mesh name="piper_link8" file="meshes/piper/link8.STL" />
+    <material name="piper_arm_base_link_mat" rgba="0.7922 0.8196 0.9294 1" specular="0" />
+    <material name="piper_link1_mat" rgba="0.7922 0.8196 0.9294 1" specular="0" />
+    <material name="piper_link2_mat" rgba="0.7922 0.8196 0.9294 1" specular="0" />
+    <material name="piper_link3_mat" rgba="0.7922 0.8196 0.9294 1" specular="0" />
+    <material name="piper_link4_mat" rgba="0.7922 0.8196 0.9294 1" specular="0" />
+    <material name="piper_link5_mat" rgba="0.7922 0.8196 0.9294 1" specular="0" />
+    <material name="piper_link6_mat" rgba="0.898 0.9137 0.9255 1" specular="0" />
+    <material name="piper_gripper_base_mat" rgba="0.7922 0.8196 0.9294 1" specular="0" />
+    <material name="piper_link7_mat" rgba="0.7922 0.8196 0.9294 1" specular="0" />
+    <material name="piper_link8_mat" rgba="0.7922 0.8196 0.9294 1" specular="0" />
+  </asset>
+  <worldbody>
+    <body name="base_link" pos="0 0 0.85">
+      <inertial pos="0.0457123 0.000139854 -0.163809" quat="0.972578 -0.00615364 -0.232461 0.00398682" mass="9.595" diaginertia="0.154712 0.11093 0.0846371" />
+      <joint type="free" limited="false" damping="0.0000" stiffness="0.0000" armature="0" name="robot_freejoint" />
+      <site name="imu" pos="0 0 0" />
+      <geom rgba="0.79216 0.81961 0.93333 1" mesh="tron_base_Link" type="mesh" contype="0" conaffinity="0" group="1" />
+      <geom name="base_collision" size="0.135 0.13 0.095" pos="0.03 0 -0.072" type="box" rgba="0 0 1 0" />
+      <body name="abad_L_Link" pos="0.05556 0.105 -0.2602">
+        <inertial pos="-0.06977 0.04479 0.00057" quat="0.595024 0.579772 0.394141 0.393019" mass="1.469" diaginertia="0.00252289 0.00208104 0.00139163" />
+        <joint name="abad_L_Joint" pos="0 0 0" axis="1 0 0" limited="true" range="-0.38397 1.39626" />
+        <geom rgba="0.79216 0.81961 0.93333 1" mesh="tron_abad_L_Link" type="mesh" contype="0" conaffinity="0" group="1" />
+        <geom name="abad_L_collision" size="0.05 0.025" pos="0.03 0 0" quat="0.500398 0.5 0.499602 0.5" type="cylinder" rgba="0 0 1 0" />
+        <body name="hip_L_Link" pos="-0.077 0.0205 0">
+          <inertial pos="-0.02869 -0.0477 -0.03992" quat="0.853885 0.192797 0.226903 0.426877" mass="2.3" diaginertia="0.0233264 0.0230229 0.00277548" />
+          <joint name="hip_L_Joint" pos="0 0 0" axis="0 1 0" limited="true" range="-1.01229 1.39626" />
+          <geom rgba="1 1 1 1" mesh="tron_hip_L_Link" type="mesh" contype="0" conaffinity="0" group="1" />
+          <geom name="hip_L_collision" size="0.035 0.075" pos="-0.1 -0.03 -0.14" quat="0.965093 0 0.261909 0" type="cylinder" rgba="0 0 1 0" />
+          <body name="knee_L_Link" pos="-0.15 -0.0205 -0.25981">
+            <inertial pos="0.11452 0.0013 -0.19367" quat="0.965543 0.00476557 -0.259713 -0.0159388" mass="1.22" diaginertia="0.0144103 0.0143581 0.00061582" />
+            <joint name="knee_L_Joint" pos="0 0 0" axis="0 -1 0" limited="true" range="-0.872665 1.36136" />
+            <geom rgba="0.79216 0.81961 0.93333 1" mesh="tron_knee_L_Link" type="mesh" contype="0" conaffinity="0" group="1" />
+            <geom name="knee_L_collision" size="0.02 0.13" pos="0.078 0 -0.12" quat="0.962425 0 -0.271547 0" type="cylinder" rgba="0 0 1 0" />
+            <body name="ankle_L_Link" pos="0.15 0 -0.25981">
+              <inertial pos="0.01074 -0.00061 -0.03314" quat="0.013732 0.694322 0.0150212 0.719377" mass="0.62" diaginertia="0.0019759 0.00181179 0.000523633" />
+              <joint name="ankle_L_Joint" pos="0 0 0" axis="0 -1 0" limited="true" range="-1.15192 1.5708" frictionloss="0.01" />
+              <geom rgba="0.26667 0.26667 0.26667 1" mesh="tron_ankle_L_Link" type="mesh" contype="0" conaffinity="0" group="1" />
+              <geom name="ankle_L_collision" type="mesh" rgba="0 0 1 0" mesh="tron_ankle_L_Link" />
+            </body>
+          </body>
+        </body>
+      </body>
+      <body name="abad_R_Link" pos="0.05556 -0.105 -0.2602">
+        <inertial pos="-0.06977 -0.04479 0.00057" quat="0.393019 0.394141 0.579772 0.595024" mass="1.469" diaginertia="0.00252289 0.00208104 0.00139163" />
+        <joint name="abad_R_Joint" pos="0 0 0" axis="1 0 0" limited="true" range="-1.39626 0.38397" />
+        <geom rgba="0.79216 0.81961 0.93333 1" mesh="tron_abad_R_Link" type="mesh" contype="0" conaffinity="0" group="1" />
+        <geom name="abad_R_collision" size="0.05 0.025" pos="0.03 0 0" quat="0.500398 0.5 0.499602 0.5" type="cylinder" rgba="0 0 1 0" />
+        <body name="hip_R_Link" pos="-0.077 -0.0205 0">
+          <inertial pos="-0.02869 0.0477 -0.03992" quat="0.426877 0.226903 0.192797 0.853885" mass="2.3" diaginertia="0.0233264 0.0230229 0.00277548" />
+          <joint name="hip_R_Joint" pos="0 0 0" axis="0 -1 0" limited="true" range="-1.39626 1.01229" />
+          <geom rgba="1 1 1 1" mesh="tron_hip_R_Link" type="mesh" contype="0" conaffinity="0" group="1" />
+          <geom name="hip_R_collision" size="0.035 0.075" pos="-0.1 0.03 -0.14" quat="0.965093 0 0.261909 0" type="cylinder" rgba="0 0 1 0" />
+          <body name="knee_R_Link" pos="-0.15 0.0205 -0.25981">
+            <inertial pos="0.11452 -0.0013 -0.19367" quat="0.965543 -0.00476557 -0.259713 0.0159388" mass="1.22" diaginertia="0.0144103 0.0143581 0.00061582" />
+            <joint name="knee_R_Joint" pos="0 0 0" axis="0 1 0" limited="true" range="-1.36136 0.872665" />
+            <geom rgba="0.79216 0.81961 0.93333 1" mesh="tron_knee_R_Link" type="mesh" contype="0" conaffinity="0" group="1" />
+            <geom name="knee_R_collision" size="0.02 0.13" pos="0.078 0 -0.12" quat="0.962425 0 -0.271547 0" type="cylinder" rgba="0 0 1 0" />
+            <body name="ankle_R_Link" pos="0.15 0 -0.25981">
+              <inertial pos="0.01074 0.00061 -0.03314" quat="-0.013732 0.694322 -0.0150212 0.719377" mass="0.62" diaginertia="0.0019759 0.00181179 0.000523633" />
+              <joint name="ankle_R_Joint" pos="0 0 0" axis="0 -1 0" limited="true" range="-1.15192 1.5708" frictionloss="0.01" />
+              <geom rgba="0.26667 0.26667 0.26667 1" mesh="tron_ankle_R_Link" type="mesh" contype="0" conaffinity="0" group="1" />
+              <geom name="ankle_R_collision" type="mesh" rgba="0 0 1 0" mesh="tron_ankle_R_Link" />
+            </body>
+          </body>
+        </body>
+      </body>
+      <site name="base_lock_site" pos="0 0 0" quat="1 0 0 0" size="0.002" rgba="0 0 0 0" />
+      <body name="arm_base_link" pos="0 0 0.0165" gravcomp="1">
+        <inertial pos="-0.0047364 0.0000257 0.0414515" mass="1.02" fullinertia="0.00267433 0.00282612 0.00089624 -0.00000073 -0.00017389 0.0000004" />
+        <geom pos="0 0 0" group="1" contype="0" conaffinity="0" material="piper_arm_base_link_mat" type="mesh" mesh="piper_arm_base_link" />
+        <geom pos="0 0 0" rgba="0.9373 0.2667 0.2667 1" group="3" contype="1" conaffinity="1" type="mesh" mesh="piper_arm_base_link" />
+        <body name="link1" pos="0 0 0.123" gravcomp="1">
+          <joint name="joint1" type="hinge" axis="0 0 1" limited="true" range="-2.618 2.618" damping="10.0" armature="0.1" frictionloss="0" />
+          <inertial pos="0.0001215 0.0001046 -0.004386" mass="0.71" fullinertia="0.00048916 0.00040472 0.00043982 -0.00000036 -0.00000224 -0.00000242" />
+          <geom pos="0 0 0" group="1" contype="0" conaffinity="0" material="piper_link1_mat" type="mesh" mesh="piper_link1" />
+          <geom pos="0 0 0" rgba="0.9373 0.2667 0.2667 1" group="3" contype="1" conaffinity="1" type="mesh" mesh="piper_link1" />
+          <body name="link2" pos="0 0 0" quat="0.0480084 -0.0480134 -0.7054761 -0.7054739" gravcomp="1">
+            <joint name="joint2" type="hinge" axis="0 0 1" limited="true" range="0 3.14" damping="10.0" armature="0.1" frictionloss="0" />
+            <inertial pos="0.1986661 -0.0109269 0.0014212" mass="1.17" fullinertia="0.00116918 0.06785384 0.06774489 -0.00180037 0.00025146 -0.00000455" />
+            <geom pos="0 0 0" group="1" contype="0" conaffinity="0" material="piper_link2_mat" type="mesh" mesh="piper_link2" />
+            <geom pos="0 0 0" rgba="0.9373 0.2667 0.2667 1" group="3" contype="1" conaffinity="1" type="mesh" mesh="piper_link2" />
+            <body name="link3" pos="0.28503 0 0" quat="0.6239962 0 0 -0.7814274" gravcomp="1">
+              <joint name="joint3" type="hinge" axis="0 0 1" limited="true" range="-2.967 0" damping="10.0" armature="0.1" frictionloss="0" />
+              <inertial pos="-0.0202738 -0.133915 -0.0004587" mass="0.5" fullinertia="0.01361711 0.00045024 0.01380322 0.00165794 -0.00000048 -0.00000045" />
+              <geom pos="0 0 0" group="1" contype="0" conaffinity="0" material="piper_link3_mat" type="mesh" mesh="piper_link3" />
+              <geom pos="0 0 0" rgba="0.9373 0.2667 0.2667 1" group="3" contype="1" conaffinity="1" type="mesh" mesh="piper_link3" />
+              <body name="link4" pos="-0.021984 -0.25075 0" quat="0.7071055 0.7071081 0 0" gravcomp="1">
+                <joint name="joint4" type="hinge" axis="0 0 1" limited="true" range="-1.745 1.745" damping="5.0" armature="0.1" frictionloss="0" />
+                <inertial pos="-0.0000967 0.0008761 -0.0049688" mass="0.38" fullinertia="0.00018501 0.00018965 0.00015484 0.00000054 0.0000012 -0.00000841" />
+                <geom pos="0 0 0" group="1" contype="0" conaffinity="0" material="piper_link4_mat" type="mesh" mesh="piper_link4" />
+                <geom pos="0 0 0" rgba="0.9373 0.2667 0.2667 1" group="3" contype="1" conaffinity="1" type="mesh" mesh="piper_link4" />
+                <body name="link5" pos="0 0 0" quat="0.7071055 -0.7071081 0 0" gravcomp="1">
+                  <joint name="joint5" type="hinge" axis="0 0 1" limited="true" range="-1.22 1.22" damping="5.0" armature="0.1" frictionloss="0" />
+                  <inertial pos="-0.0000411 -0.0566487 -0.0037206" mass="0.383" fullinertia="0.00166169 0.0001851 0.00164321 0.00000006 -0.00000007 0.00001026" />
+                  <geom pos="0 0 0" group="1" contype="0" conaffinity="0" material="piper_link5_mat" type="mesh" mesh="piper_link5" />
+                  <geom pos="0 0 0" rgba="0.9373 0.2667 0.2667 1" group="3" contype="1" conaffinity="1" type="mesh" mesh="piper_link5" />
+                  <body name="link6" pos="0.0000883 -0.091 0" quat="0.7071055 0.7071081 0 0" gravcomp="1">
+                    <joint name="joint6" type="hinge" axis="0 0 1" limited="true" range="-2.0944 2.0944" damping="5.0" armature="0.1" frictionloss="0" />
+                    <inertial pos="-0.0000883 0.0000091 -0.002" mass="0.007" diaginertia="0.000000573 0.000000573 0.0000010674" />
+                    <geom pos="0 0 0" group="1" contype="0" conaffinity="0" material="piper_link6_mat" type="mesh" mesh="piper_link6" />
+                    <geom pos="0 0 0" rgba="0.9373 0.2667 0.2667 1" group="3" contype="1" conaffinity="1" type="mesh" mesh="piper_link6" />
+                    <body name="gripper_base" pos="0 0 0" gravcomp="1">
+                      <inertial pos="-0.0001838 0.0000805 0.0321437" mass="0.45" fullinertia="0.00092934 0.00071447 0.00039442 0.00000034 -0.00000738 0.00000005" />
+                      <geom pos="0 0 0" group="1" contype="0" conaffinity="0" material="piper_gripper_base_mat" type="mesh" mesh="piper_gripper_base" />
+                      <geom pos="0 0 0" rgba="0.9373 0.2667 0.2667 1" group="3" contype="1" conaffinity="1" type="mesh" mesh="piper_gripper_base" />
+                      <camera name="wrist_cam" pos="-0.05 0 0.06" quat="0 0.7071068 -0.7071068 0" fovy="42.57" />
+                      <body name="link7" pos="0 0 0.1358" quat="0.7071055 0.7071081 0 0" gravcomp="1">
+                        <joint name="joint7" type="slide" axis="0 0 1" limited="true" range="0 0.035" damping="0.5" frictionloss="0" />
+                        <inertial pos="0.0006512 -0.049193 0.0097226" mass="0.025" fullinertia="0.00007371 0.00000781 0.0000747 -0.00000113 0.00000021 -0.00001372" />
+                        <geom pos="0 0 0" group="1" contype="0" conaffinity="0" material="piper_link7_mat" type="mesh" mesh="piper_link7" />
+                        <geom pos="0 0 0" group="3" rgba="0 0 0 0" contype="2" conaffinity="0" type="mesh" mesh="piper_link7" />
+                        <geom name="link7_pad" type="box" pos="0 -0.040 0.003" size="0.012 0.04 0.002" contype="1" conaffinity="1" group="1" friction="1.0 0.01 0.001" solimp="0.99 0.999 0.001" margin="0.00015" solref="0.015 1" rgba="0.1 1.0 0.1 1" />
+                      </body>
+                      <body name="link8" pos="0 0 0.1358" quat="-0.0000026 -0.0000026 -0.7071081 -0.7071055" gravcomp="1">
+                        <joint name="joint8" type="slide" axis="0 0 -1" limited="true" range="-0.035 0" damping="0.5" frictionloss="0" />
+                        <inertial pos="0.0006512 -0.049193 0.0097226" mass="0.025" fullinertia="0.00007371 0.00000781 0.0000747 -0.00000113 0.00000021 -0.00001372" />
+                        <geom pos="0 0 0" group="1" contype="0" conaffinity="0" material="piper_link8_mat" type="mesh" mesh="piper_link8" />
+                        <geom pos="0 0 0" group="3" rgba="0 0 0 0" contype="2" conaffinity="0" type="mesh" mesh="piper_link8" />
+                        <geom name="link8_pad" type="box" pos="0 -0.040 0.003" size="0.012 0.04 0.002" contype="1" conaffinity="1" group="1" friction="1.0 0.01 0.001" solimp="0.99 0.999 0.001" margin="0.00015" solref="0.015 1" rgba="0.1 1.0 0.1 1" />
+                      </body>
+                      <site name="grasp_tcp" pos="0 0 0.1358" quat="1 0 0 0" size="0.003" rgba="0 1 0 0.8" />
+                    </body>
+                  </body>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+  <actuator>
+    <motor name="abad_L_Joint" gear="1" joint="abad_L_Joint" ctrllimited="true" ctrlrange="-80 80" />
+    <motor name="hip_L_Joint" gear="1" joint="hip_L_Joint" ctrllimited="true" ctrlrange="-80 80" />
+    <motor name="knee_L_Joint" gear="1" joint="knee_L_Joint" ctrllimited="true" ctrlrange="-80 80" />
+    <motor name="ankle_L_Joint" gear="1" joint="ankle_L_Joint" ctrllimited="true" ctrlrange="-20 20" />
+    <motor name="abad_R_Joint" gear="1" joint="abad_R_Joint" ctrllimited="true" ctrlrange="-80 80" />
+    <motor name="hip_R_Joint" gear="1" joint="hip_R_Joint" ctrllimited="true" ctrlrange="-80 80" />
+    <motor name="knee_R_Joint" gear="1" joint="knee_R_Joint" ctrllimited="true" ctrlrange="-80 80" />
+    <motor name="ankle_R_Joint" gear="1" joint="ankle_R_Joint" ctrllimited="true" ctrlrange="-20 20" />
+    <motor name="joint1_motor" joint="joint1" gear="1" ctrllimited="true" ctrlrange="-100 100" />
+    <motor name="joint2_motor" joint="joint2" gear="1" ctrllimited="true" ctrlrange="-100 100" />
+    <motor name="joint3_motor" joint="joint3" gear="1" ctrllimited="true" ctrlrange="-100 100" />
+    <motor name="joint4_motor" joint="joint4" gear="1" ctrllimited="true" ctrlrange="-100 100" />
+    <motor name="joint5_motor" joint="joint5" gear="1" ctrllimited="true" ctrlrange="-100 100" />
+    <motor name="joint6_motor" joint="joint6" gear="1" ctrllimited="true" ctrlrange="-100 100" />
+    <motor name="joint7_motor" joint="joint7" gear="1" ctrllimited="true" ctrlrange="-10 10" />
+    <motor name="joint8_motor" joint="joint8" gear="1" ctrllimited="true" ctrlrange="-10 10" />
+  </actuator>
+  <sensor>
+    <framequat name="quat" objtype="site" objname="imu" />
+    <gyro name="gyro" site="imu" />
+    <accelerometer name="acc" site="imu" />
+    <jointpos name="abad_L_Joint" joint="abad_L_Joint" />
+    <jointpos name="hip_L_Joint" joint="hip_L_Joint" />
+    <jointpos name="knee_L_Joint" joint="knee_L_Joint" />
+    <jointpos name="ankle_L_Joint" joint="ankle_L_Joint" />
+    <jointpos name="abad_R_Joint" joint="abad_R_Joint" />
+    <jointpos name="hip_R_Joint" joint="hip_R_Joint" />
+    <jointpos name="knee_R_Joint" joint="knee_R_Joint" />
+    <jointpos name="ankle_R_Joint" joint="ankle_R_Joint" />
+  </sensor>
+  <contact>
+    <exclude body1="link7" body2="link8" />
+    <exclude body1="link7" body2="gripper_base" />
+    <exclude body1="link8" body2="gripper_base" />
+  </contact>
+</mujoco>

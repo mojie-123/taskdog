@@ -11,6 +11,7 @@ import base64
 import json
 from io import BytesIO
 from collections.abc import Sequence
+import threading
 from typing import Any, Iterable, Literal
 
 import numpy as np
@@ -63,6 +64,11 @@ class _TargetRelationResult(BaseModel):
     reason: str
 
 
+class _TargetSpatialResult(BaseModel):
+    is_target: bool
+    reason: str
+
+
 def _image_data_url(image_rgb: np.ndarray, *, quality: int = 88) -> str:
     image = np.asarray(image_rgb)
     if image.ndim != 3 or image.shape[2] != 3:
@@ -85,17 +91,20 @@ class QwenVLMClient:
     def __init__(self, config: VLMConfig):
         self.config = config
         self._client = None
+        self._client_lock = threading.Lock()
 
     def _get_client(self):
         if self._client is None:
-            from openai import OpenAI
+            with self._client_lock:
+                if self._client is None:
+                    from openai import OpenAI
 
-            self._client = OpenAI(
-                api_key=self.config.api_key(),
-                base_url=self.config.base_url,
-                timeout=self.config.timeout_s,
-                max_retries=2,
-            )
+                    self._client = OpenAI(
+                        api_key=self.config.api_key(),
+                        base_url=self.config.base_url,
+                        timeout=self.config.timeout_s,
+                        max_retries=2,
+                    )
         return self._client
 
     def _parse(self, model: str, response_format: type[BaseModel], messages: list[dict]):
@@ -387,6 +396,232 @@ class QwenVLMClient:
         return EarlyStopDecision(
             switch_room=result.switch_room,
             target_room_id=nearby_room_id if result.switch_room else None,
+            reason=result.reason,
+        )
+
+    def verify_object_type(
+        self,
+        requested_label: str,
+        outlined_image_rgb: np.ndarray,
+        clean_crop_rgb: np.ndarray,
+        *,
+        candidate_clipped_by_image_edge: bool = False,
+    ) -> TargetVerification:
+        """Perform the upstream SysNav object-label review for one Object node."""
+
+        result = self._parse(
+            self.config.fast_model,
+            _TargetIdentityResult,
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are provided with an RGB scene containing one object "
+                        "inside a green bounding box and a clean close-up of the same "
+                        "object. Verify whether that physical object is the requested "
+                        "category. The detector proposal is untrusted and the green "
+                        "line is an annotation. Return confirmed, rejected, or uncertain. "
+                        "When the box touches an image boundary, incomplete shape alone "
+                        "cannot justify rejection; return uncertain unless visible evidence "
+                        "identifies another category or background."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(
+                                {
+                                    "requested_category": str(requested_label),
+                                    "candidate_clipped_by_image_edge": bool(
+                                        candidate_clipped_by_image_edge
+                                    ),
+                                },
+                                ensure_ascii=False,
+                            ),
+                        },
+                        {
+                            "type": "text",
+                            "text": "Full scene with the candidate marked in green:",
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": _image_data_url(outlined_image_rgb)},
+                        },
+                        {"type": "text", "text": "Clean close-up:"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": _image_data_url(clean_crop_rgb)},
+                        },
+                    ],
+                },
+            ],
+        )
+        verdict = result.verdict
+        if candidate_clipped_by_image_edge and verdict == "rejected":
+            verdict = "uncertain"
+        return TargetVerification(
+            is_target=verdict == "confirmed",
+            verdict=verdict,
+            visual_verdict=verdict,
+            reason=f"object type {verdict}: {result.reason}",
+        )
+
+    def verify_spatial_target(
+        self,
+        instruction: SearchInstruction,
+        object_label: str,
+        closeup_image_rgb: np.ndarray,
+        viewpoint_images_rgb: Sequence[np.ndarray],
+        *,
+        room_label: str = "",
+    ) -> TargetVerification:
+        """Jointly review attributes, spatial relation and room as upstream SysNav."""
+
+        content: list[dict[str, Any]] = [
+            {
+                "type": "text",
+                "text": (
+                    "Instruction and decomposed conditions:\n"
+                    + json.dumps(instruction.to_dict(), ensure_ascii=False)
+                    + "\nCandidate description:\n"
+                    + json.dumps(
+                        {
+                            "object_type": object_label,
+                            "room_type": room_label or "Unknown",
+                        },
+                        ensure_ascii=False,
+                    )
+                ),
+            },
+            {"type": "text", "text": "Close-up image of the candidate object:"},
+            {
+                "type": "image_url",
+                "image_url": {"url": _image_data_url(closeup_image_rgb)},
+            },
+        ]
+        views = tuple(viewpoint_images_rgb)
+        if views:
+            content.append(
+                {
+                    "type": "text",
+                    "text": (
+                        "The following saved viewpoints show the candidate and its "
+                        "surroundings; the green box marks the same 3-D object."
+                    ),
+                }
+            )
+            for index, image in enumerate(views, start=1):
+                content.extend(
+                    [
+                        {
+                            "type": "text",
+                            "text": f"Surrounding viewpoint {index}/{len(views)}:",
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": _image_data_url(image)},
+                        },
+                    ]
+                )
+        result = self._parse(
+            self.config.fast_model,
+            _TargetSpatialResult,
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are given an instruction specifying object type, room "
+                        "condition, spatial condition, target attributes, an anchor "
+                        "object and anchor attributes. You are also given a close-up "
+                        "of one candidate and several images of that object and its "
+                        "surroundings from different viewpoints. Decide whether the "
+                        "candidate matches the complete instruction. Consider target "
+                        "attributes, anchor identity, spatial relation and room condition "
+                        "jointly. If room_type is Unknown, infer it from the images. If "
+                        "any requested condition is unsatisfied or cannot be clearly "
+                        "determined, return is_target=false. Return true only when all "
+                        "requested conditions are satisfied."
+                    ),
+                },
+                {"role": "user", "content": content},
+            ],
+        )
+        verdict = "confirmed" if result.is_target else "rejected"
+        room_verdict = (
+            "not_required"
+            if not instruction.room_condition
+            else ("confirmed" if result.is_target else "uncertain")
+        )
+        return TargetVerification(
+            is_target=bool(result.is_target),
+            verdict=verdict,
+            visual_verdict=verdict,
+            room_verdict=room_verdict,
+            reason=result.reason,
+        )
+
+    def verify_anchor_object(
+        self,
+        instruction: SearchInstruction,
+        object_label: str,
+        closeup_image_rgb: np.ndarray,
+        *,
+        room_label: str = "",
+    ) -> TargetVerification:
+        """Confirm the anchor's attributes and room before it guides search."""
+
+        result = self._parse(
+            self.config.fast_model,
+            _TargetSpatialResult,
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are given a requested anchor object, its attribute "
+                        "condition and room condition, plus a close-up image of one "
+                        "candidate. Decide whether this is the requested anchor. If "
+                        "the supplied room type is Unknown, infer it from visible "
+                        "context. If any requested condition is not satisfied or "
+                        "cannot be clearly determined, return is_target=false."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(
+                                {
+                                    "anchor_object": instruction.anchor_object,
+                                    "anchor_attribute": instruction.anchor_attribute,
+                                    "room_condition": instruction.room_condition,
+                                    "candidate_label": object_label,
+                                    "room_type": room_label or "Unknown",
+                                },
+                                ensure_ascii=False,
+                            ),
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": _image_data_url(closeup_image_rgb)},
+                        },
+                    ],
+                },
+            ],
+        )
+        verdict = "confirmed" if result.is_target else "rejected"
+        room_verdict = (
+            "not_required"
+            if not instruction.room_condition
+            else ("confirmed" if result.is_target else "uncertain")
+        )
+        return TargetVerification(
+            is_target=bool(result.is_target),
+            verdict=verdict,
+            visual_verdict=verdict,
+            room_verdict=room_verdict,
             reason=result.reason,
         )
 

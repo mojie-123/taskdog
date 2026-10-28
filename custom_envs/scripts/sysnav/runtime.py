@@ -26,6 +26,7 @@ class ObservationUpdate:
     viewpoint: ViewpointRecord
     detections: tuple[Detection2D, ...]
     localized_detections: tuple[LocalizedDetection, ...]
+    object_records: tuple[ObjectRecord, ...]
     coverage: float | None
 
 
@@ -61,36 +62,43 @@ class SysNavComponents:
         *,
         planned_viewpoint_index: int | None = None,
         image_path: str = "",
+        observation_kind: str = "ordinary",
+        evidence_group: str = "",
     ) -> ObservationUpdate:
-        """Attach a viewpoint and coverage, but keep proposals out of memory.
-
-        ``localized`` is returned for logging and VLM verification.  It is
-        intentionally not attached to the persistent Object layer here.
-        """
+        """Attach a viewpoint and fuse raw proposals into provisional objects."""
 
         viewpoint = self.scene_memory.add_viewpoint(
             room_id,
             robot_pose_world,
-            [],
+            list(localized),
             timestamp_s=frame.timestamp_s,
             image_path=image_path,
+            observation_kind=observation_kind,
+            evidence_group=evidence_group,
+            camera_position_world=frame.camera_position_world,
+            camera_rotation_world=frame.camera_rotation_world,
+            camera_intrinsics=frame.intrinsics.to_dict(),
         )
         coverage = None
         if planned_viewpoint_index is not None:
             coverage = self.search_policy.mark_viewpoint_complete(
-                room_id, planned_viewpoint_index
+                room_id, planned_viewpoint_index, frame
             )
         return ObservationUpdate(
             viewpoint=viewpoint,
             detections=detections,
             localized_detections=localized,
+            object_records=tuple(
+                self.scene_memory.objects[object_id]
+                for object_id in viewpoint.object_ids
+            ),
             coverage=coverage,
         )
 
     def commit_verified_detection(
         self, viewpoint_id: str, detection: LocalizedDetection
     ) -> ObjectRecord:
-        """Persist one object only after the semantic verifier accepts it."""
+        """Compatibility path for callers that explicitly approve a detection."""
 
         return self.scene_memory.attach_verified_detection(viewpoint_id, detection)
 
@@ -102,8 +110,10 @@ class SysNavComponents:
         *,
         planned_viewpoint_index: int | None = None,
         image_path: str = "",
+        observation_kind: str = "ordinary",
+        evidence_group: str = "",
     ) -> ObservationUpdate:
-        """Run perception/localization and persist only room/viewpoint state."""
+        """Run perception/localization and update Room/Viewpoint/Object state."""
 
         detections, localized = self.infer_observation(frame)
         return self.commit_observation(
@@ -114,6 +124,8 @@ class SysNavComponents:
             localized,
             planned_viewpoint_index=planned_viewpoint_index,
             image_path=image_path,
+            observation_kind=observation_kind,
+            evidence_group=evidence_group,
         )
 
     def close(self) -> None:

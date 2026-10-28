@@ -1,9 +1,9 @@
 version: 1
-frame_id: map
+frame_id: map   # ROS的map坐标系
 source:
-  scene_xml: ../mujoco/scene_house_N2M.xml
-  nav2_map: map_house_mujoco_nav2.yaml
-  structure_geoms:
+  scene_xml: ../mujoco/scene_house_N2M.xml   # 场景
+  nav2_map: map_house_mujoco_nav2.yaml   # 栅格地图->三值地图
+  structure_geoms:   # 参与房间划分的墙体名称
   - wall_top
   - wall_bottom
   - wall_left
@@ -14,26 +14,33 @@ source:
   - wall_mid_h_3
   - wall_mid_v_top
   - wall_mid_v_bottom
-raster_file: map_house_mujoco_rooms.npz
+raster_file: map_house_mujoco_rooms.npz   # 真正逐像素记录房间编号的数据
 resolution: 0.05
 origin:
 - -1.0
 - -1.0
 width: 400
 height: 400
-labels:
-  outside_or_unknown: -2
-  structural_wall: -1
-  portal_or_unassigned: 0
-generation:
+labels:   # 栅格数值约定
+  outside_or_unknown: -2   # 房屋外部/未知区域
+  structural_wall: -1   # 墙
+  portal_or_unassigned: 0   # 门洞或尚未分配到房间的区域
+generation:   # 生成房间图时的参数
+  # 门
   door_min_width_m: 0.7
   door_max_width_m: 1.8
+  # 判断是否属于同一面墙
   line_angle_tolerance_deg: 5.0
   line_offset_tolerance_m: 0.15
+  # 划分房间时，暂时用虚拟障碍把门洞封起来，并向墙体两端额外重叠 0.06 m，避免栅格误差导致两个房间仍然连在一起
   portal_overlap_m: 0.06
+  # 对墙体屏障做一次 1 栅格的形态学闭运算。当前一格是 5 cm，用来填补很小的栅格裂缝
   barrier_close_cells: 1
+  # 面积小于 2 m² 的封闭区域不认为是有效房间，避免墙角噪声产生假房间。
   min_room_area_m2: 2.0
+  # 只有距离 Nav2 障碍物至少 0.52 m 的位置，才进入房间的“可搜索区域”。
   search_clearance_m: 0.52
+  # 从门洞中心向门两侧各移动 0.85 m，判断门连接哪些房间，并寻找对应的安全入室位置。
   entry_offset_m: 0.85
 rooms:
   room_0:
@@ -47,7 +54,7 @@ rooms:
     - 0.1
     - 15.9
     - 5.95
-    polygon:
+    polygon:   # 这是房间轮廓多边形的顶点。判断某个位置是否位于该房间时，可以使用这个轮廓或 NPZ 栅格
     - - 0.075
       - 5.925
     - - 0.075
@@ -59,7 +66,7 @@ rooms:
     neighbors:
     - room_1
     - room_2
-    portals:
+    portals:   # 与该房间关联的门洞
     - portal_0
     - portal_1
     - portal_2
@@ -153,7 +160,7 @@ rooms:
       - 8.825
       - 8.225
       - 0.030294
-portals:
+portals:   # 门洞信息
   portal_0:
     center:
     - -0.0
@@ -174,12 +181,12 @@ portals:
     center:
     - 4.0
     - 6.0
-    endpoints:
+    endpoints:   # 范围（3.4, 6) ~ (4.6, 6)
     - - 3.4
       - 6.0
     - - 4.6
       - 6.0
-    width_m: 1.2
+    width_m: 1.2   # 宽度
     connects:
     - room_0
     - room_1

@@ -1,7 +1,7 @@
-image: map_house_mujoco_nav2.pgm
-resolution: 0.050000
-origin: [-1.0000, -1.0000, 0.0]
-negate: 0
-occupied_thresh: 0.65
-free_thresh: 0.196
-mode: trinary
+image: map_house_mujoco_nav2.pgm   # 实际的占用栅格图片
+resolution: 0.050000   # 每个像素对应的实际尺度   400*400 -> 20*20
+origin: [-1.0000, -1.0000, 0.0]   # 地图覆盖的实际世界坐标x ∈ [-1, 19]，y ∈ [-1, 19]
+negate: 0   # 是否反转黑白。为0时黑色是障碍物、白色是自由空间
+occupied_thresh: 0.65   # 障碍物判定阈值   占用概率 = (255 - 像素灰度) / 255
+free_thresh: 0.196   # 自由空间判定阈值
+mode: trinary   # 三值地图（free/occupied/unknown）

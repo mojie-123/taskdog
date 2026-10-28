@@ -4,8 +4,10 @@ version: 1
 vlm:
   api_key_env: DASHSCOPE_API_KEY
   base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
-  reasoning_model: qwen3-vl-plus
-  fast_model: qwen3-vl-plus
+  # Room-level reasoning. QWEN_MODEL overrides this value when set.
+  reasoning_model: qwen3.6-plus
+  # Object-level review. QWEN_MODEL_LITE overrides this value when set.
+  fast_model: qwen3.6-flash
   timeout_s: 45.0
 
 perception:
@@ -30,13 +32,29 @@ coverage:
   min_new_coverage_cells: 5
   travel_cost_weight: 0.35
   semantic_interest_weight: 12.0
+  # Sample one measured depth ray every N image pixels when committing the
+  # coverage of a completed ordinary viewpoint.
+  depth_ray_stride_px: 8
 
 search:
   room_map_manifest: custom_envs/maps/map_house_mujoco_rooms.yaml
   nav2_map_yaml: custom_envs/maps/map_house_mujoco_nav2.yaml
   camera_name: front_realsense
   object_merge_distance_m: 0.45
-  target_accept_confidence: 0.20
+  # Upstream SysNav asks the object-type VLM only after the best mask has
+  # enough pixels to provide a useful close-up.
+  object_vlm_min_mask_pixels: 500
+  # A small but repeatedly localized target is approached for a close-up
+  # instead of waiting for ordinary coverage to pass near it by chance.
+  provisional_reobserve_enabled: true
+  provisional_reobserve_min_observations: 3
+  provisional_reobserve_min_mask_pixels: 80
+  provisional_reobserve_min_confidence: 0.12
+  provisional_reobserve_max_position_residual_m: 0.25
+  provisional_reobserve_preferred_standoff_m: 1.25
+  provisional_reobserve_min_standoff_m: 0.85
+  provisional_reobserve_max_standoff_m: 1.65
+  provisional_reobserve_max_attempts: 2
   early_stop_min_room_coverage: 0.50
   early_stop_min_ordinary_viewpoints: 3
   early_stop_max_current_images: 4

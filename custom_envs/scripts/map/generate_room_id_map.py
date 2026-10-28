@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
 """Generate an anonymous room map from structural MuJoCo wall geometry."""
+"""
+python custom_envs/scripts/map/generate_room_id_map.py \
+  --scene custom_envs/mujoco/scene_house_N2M.xml \
+  --map-yaml custom_envs/maps/map_house_mujoco_nav2.yaml \
+  --out-prefix custom_envs/maps/map_house_mujoco_rooms
+"""
 
 from __future__ import annotations
 
@@ -112,19 +118,19 @@ def main() -> None:
     scene_xml = args.scene.expanduser().resolve()
     map_yaml = args.map_yaml.expanduser().resolve()
     out_prefix = args.out_prefix.expanduser().resolve()
-    manifest_path = out_prefix.with_suffix(".yaml")
-    raster_path = out_prefix.with_suffix(".npz")
-    preview_path = out_prefix.parent / f"{out_prefix.name}_debug.png"
+    manifest_path = out_prefix.with_suffix(".yaml")   # 拓扑图
+    raster_path = out_prefix.with_suffix(".npz")   # 栅格信息
+    preview_path = out_prefix.parent / f"{out_prefix.name}_debug.png"   # 可视化图片
 
-    nav_map = load_nav2_map(map_yaml)
-    walls = extract_wall_segments(scene_xml)
+    nav_map = load_nav2_map(map_yaml)   # 主要由map_yaml和PGM生成了三值图
+    walls = extract_wall_segments(scene_xml)   # 墙的信息
     portals = detect_portals(
         walls,
         min_width=args.door_min_width,
         max_width=args.door_max_width,
         angle_tolerance_degrees=args.line_angle_tolerance_deg,
         line_offset_tolerance=args.line_offset_tolerance,
-    )
+    )   # 从墙段之间的空隙中，找出宽度像门的间隙，并转换成 Portal 对象
     result = build_room_partition(
         nav_map,
         walls,
@@ -134,7 +140,7 @@ def main() -> None:
         barrier_close_cells=args.barrier_close_cells,
         search_clearance_m=args.search_clearance,
         entry_offset_m=args.entry_offset,
-    )
+    )   # 把墙体和门洞栅格化，划分出独立房间，并生成房间拓扑与安全搜索区域
     generation_parameters = {
         "door_min_width_m": float(args.door_min_width),
         "door_max_width_m": float(args.door_max_width),

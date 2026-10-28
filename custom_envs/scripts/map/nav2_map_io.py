@@ -69,7 +69,7 @@ def load_nav2_map(path: Path | str) -> Nav2Map:
     """Load a Nav2 map without changing its row orientation."""
 
     yaml_path = Path(path).expanduser().resolve()
-    document = yaml.safe_load(yaml_path.read_text(encoding="utf-8")) or {}
+    document = yaml.safe_load(yaml_path.read_text(encoding="utf-8")) or {}   # 把yaml配置转换成字典
     required = {
         "image",
         "resolution",
@@ -77,37 +77,37 @@ def load_nav2_map(path: Path | str) -> Nav2Map:
         "negate",
         "occupied_thresh",
         "free_thresh",
-    }
+    }   # 必须字段
     missing = sorted(required.difference(document))
     if missing:
         raise ValueError(f"Nav2 map YAML is missing fields: {', '.join(missing)}")
 
-    image_path = Path(str(document["image"])).expanduser()
-    if not image_path.is_absolute():
+    image_path = Path(str(document["image"])).expanduser()   # 读PGM图路径
+    if not image_path.is_absolute():  # 处理相对路径
         image_path = yaml_path.parent / image_path
     image_path = image_path.resolve()
-    image = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
+    image = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)   # 读像素灰度值
     if image is None:
         raise FileNotFoundError(f"Unable to read Nav2 map image: {image_path}")
 
-    resolution = float(document["resolution"])
+    resolution = float(document["resolution"])   # 读地图分辨率
     if resolution <= 0.0:
         raise ValueError(f"Map resolution must be positive, got {resolution}")
-    raw_origin = document["origin"]
+    raw_origin = document["origin"]   # 读栅格地图左下角在世界坐标系中的位置
     if not isinstance(raw_origin, (list, tuple)) or len(raw_origin) < 2:
         raise ValueError("Nav2 map origin must contain at least x and y")
     origin = (float(raw_origin[0]), float(raw_origin[1]))
 
-    pixels = image.astype(np.float64) / 255.0
+    pixels = image.astype(np.float64) / 255.0   # 灰度值归一化
     occupancy_probability = pixels if int(document["negate"]) else 1.0 - pixels
-    occupied_mask = occupancy_probability > float(document["occupied_thresh"])
-    free_mask = occupancy_probability < float(document["free_thresh"])
-    unknown_mask = ~(occupied_mask | free_mask)
+    occupied_mask = occupancy_probability > float(document["occupied_thresh"])   # 障碍物掩码
+    free_mask = occupancy_probability < float(document["free_thresh"])   # 自由空间掩码
+    unknown_mask = ~(occupied_mask | free_mask)   # 未知空间掩码
 
     return Nav2Map(
-        yaml_path=yaml_path,
-        image_path=image_path,
-        image=image,
+        yaml_path=yaml_path,   # yaml路径
+        image_path=image_path,   # PGM路径
+        image=image,   # 原始二维灰度图
         resolution=resolution,
         origin=origin,
         free_mask=free_mask,

@@ -1,0 +1,119 @@
+seed: 42
+output_dir: custom_envs/scripts/FloAff/data/dataset_v1
+
+table:
+  body_name: living_coffee_table
+  x_min: 5.0
+  x_max: 10.0
+  y_min: 3.2
+  y_max: 4.1
+  top_z: 0.45
+
+scene:
+  scene_xml: custom_envs/mujoco/scene_house_N2M.xml
+  target_body: cube
+  target_freejoint: cube_freejoint
+  target_half_height_m: 0.025
+  anchor_body: living_coffee_table
+  robot_root_body: base_link
+  camera_name: front_realsense
+  camera_width: 640
+  camera_height: 480
+  robot_root_z: 0.563874
+
+placements:
+  short_count: 20
+  corner_count: 30
+  # AnchorAxisNet development data: 20 placements on the upper long edge only.
+  long_count: 20
+  edge_distance_min_m: 0.10
+  edge_distance_max_m: 0.30
+  region_separation_m: 0.30
+  train_short_edge: left
+  train_corner_edges: [left, top]
+  long_edges: [top]
+  # Held-out final-generalization regions appended after the initial
+  # 20-short/30-corner training collection.
+  transfer_short_count: 4
+  transfer_short_edge: right
+  transfer_corner_count_per_region: 3
+  transfer_corner_edges: [[left, bottom], [right, bottom], [right, top]]
+  transfer_long_count_per_edge: 4
+  transfer_long_edges: [bottom, top]
+
+manipulation:
+  candidates_per_instance: 100
+  transfer_candidates_per_instance: 40
+  outward_min_m: 0.25
+  outward_max_m: 0.85
+  tangent_min_m: -0.50
+  tangent_max_m: 0.50
+  initial_attempts: 3
+  ambiguous_extra_attempts: 2
+
+observations:
+  valid_per_instance: 40
+  transfer_valid_per_instance: 20
+  camera_range_min_m: 0.8
+  camera_range_max_m: 2.0
+  yaw_offset_min_deg: -20.0
+  yaw_offset_max_deg: 20.0
+  proposal_multiplier: 12
+  corner:
+    core_min_deg: -25.0
+    core_max_deg: 25.0
+    negative_tail_min_deg: -35.0
+    negative_tail_max_deg: -25.0
+    positive_tail_min_deg: 25.0
+    positive_tail_max_deg: 35.0
+    core_fraction: 0.80
+  short_edge:
+    core_min_deg: -35.0
+    core_max_deg: 35.0
+    negative_tail_min_deg: -45.0
+    negative_tail_max_deg: -35.0
+    positive_tail_min_deg: 35.0
+    positive_tail_max_deg: 45.0
+    core_fraction: 0.80
+  # Development long-edge O: 80% in [-35, 35] degrees and 10% in each tail.
+  long_edge_train:
+    core_min_deg: -35.0
+    core_max_deg: 35.0
+    negative_tail_min_deg: -45.0
+    negative_tail_max_deg: -35.0
+    positive_tail_min_deg: 35.0
+    positive_tail_max_deg: 45.0
+    core_fraction: 0.80
+  # Held-out transfer long edges retain the original, wider test distribution.
+  long_edge:
+    core_min_deg: -50.0
+    core_max_deg: 50.0
+    negative_tail_min_deg: -65.0
+    negative_tail_max_deg: -50.0
+    positive_tail_min_deg: 50.0
+    positive_tail_max_deg: 65.0
+    core_fraction: 0.80
+
+point_cloud:
+  voxel_size_m: 0.01
+  max_depth_m: 3.0
+  min_target_pixels: 80
+  min_target_points: 15
+  min_anchor_points: 100
+  anchor_max_behind_target_m: 0.50
+  target_sample_points: 1024
+  anchor_sample_points: 3072
+  axis_anchor_points: 4096
+
+affordance:
+  outward_min_m: 0.25
+  outward_max_m: 0.85
+  tangent_min_m: -0.50
+  tangent_max_m: 0.50
+  resolution_m: 0.05
+  kernel_sigma_m: 0.08
+  support_radius_m: 0.16
+
+splits:
+  axis_train_fraction: 0.40
+  seed: 42

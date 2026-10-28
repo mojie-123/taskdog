@@ -1,5 +1,30 @@
 #!/usr/bin/env python
-"""Preview, ARM_INIT-check, or collect feasible manipulation base poses."""
+"""Preview, ARM_INIT-check, or collect feasible manipulation base poses.
+
+生成候选 M
+→ 把机器狗和 cube 放到候选状态
+→ 执行 ARM_INIT / 抓取 / LIFT
+→ 多次重复验证
+→ 保存稳定成功的 M
+
+它支持三种运行模式：
+- preview
+  只把机器人放到候选 M，检查初始位置及碰撞，方便在 MuJoCo 中查看，不执行抓取。
+- arm-init
+  执行到 ARM_INIT 为止，检查：
+  - 底盘位置是否安全；
+  - 机械臂是否能转向目标；
+  - 腕部相机和机械臂初始状态是否满足要求。
+- collect
+    执行完整的：
+    ARM_INIT
+    → YOLOE + SAM2
+    → AnyGrasp
+    → MoveIt
+    → LOCAL_REACH
+    → CLOSE
+    → LIFT
+"""
 
 from __future__ import annotations
 
@@ -30,15 +55,15 @@ from custom_envs.scripts.N2M.manifests import (
     write_json,
     write_jsonl,
 )
-from custom_envs.scripts.N2M.manipulation_episode import ManipulationEpisodeRunner
+from custom_envs.scripts.N2M.manipulation_episode import ManipulationEpisodeRunner   # 抓取执行器
 from custom_envs.scripts.N2M.visualize_success_map import build_plot
 
 
-def _utc_now() -> str:
+def _utc_now() -> str:   # 返回带时区的 UTC 时间字符串如2026-10-23T08:35:12.123456+00:00
     return datetime.now(timezone.utc).isoformat()
 
 
-def _parse_scene_ids(value: str):
+def _parse_scene_ids(value: str):   # 解析要用于生成数据的场景
     if value == "all":
         return list(CUBE_SCENES)
     values = [item.strip() for item in value.split(",") if item.strip()]
@@ -48,7 +73,7 @@ def _parse_scene_ids(value: str):
     return values
 
 
-def _grid_from_args(args) -> CandidateGrid:
+def _grid_from_args(args) -> CandidateGrid:   # 从标准位置开始生成扰动
     if args.nominal_only:
         return CandidateGrid([0.0], [0.0], [0.0])
     return CandidateGrid(
@@ -58,14 +83,14 @@ def _grid_from_args(args) -> CandidateGrid:
     )
 
 
-def _latest_summaries(path: Path):
+def _latest_summaries(path: Path):   # 读取candidate_summaries.jsonl，建立latest[candidate_id] = row（若有同一个candidate_id出现多次，则后面的记录会覆盖前面的记录）
     latest = {}
     for row in read_jsonl(path):
         latest[row["candidate_id"]] = row
     return latest
 
 
-def _rebuild_success_file(data_dir: Path):
+def _rebuild_success_file(data_dir: Path):   # 根据最新summary生成success_poses.jsonl（稳定成功 M 集合）
     latest = _latest_summaries(data_dir / "candidate_summaries.jsonl")
     successes = []
     for row in latest.values():
@@ -76,7 +101,7 @@ def _rebuild_success_file(data_dir: Path):
             "scene_id": row["scene_id"],
             "approach_edge": row.get("approach_edge"),
             "cube_pose": row["cube_pose"],
-            "base_pose": row["base_pose"],
+            "base_pose": row["base_pose"],   # 最重要的是这个
             "joint1_target": row.get("joint1_target"),
             "success_count": row["success_count"],
             "attempt_count": row["attempt_count"],
@@ -94,11 +119,11 @@ def build_parser():
     parser = argparse.ArgumentParser(
         description="Search feasible base poses for the six fixed coffee-table cube scenes."
     )
-    parser.add_argument("--mode", choices=["preview", "arm-init", "collect"], default="preview")
+    parser.add_argument("--mode", choices=["preview", "arm-init", "collect"], default="preview")   # 3种运行模式，收集数据时用collect模式
     parser.add_argument("--cube-scene", default="short_left",
                         help="one id, comma-separated ids, or 'all'")
     parser.add_argument("--scene", type=Path, default=DEFAULT_SCENE)
-    parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
+    parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)   # 各种数据和json/jsonl的保存目录
     parser.add_argument("--reference-base", nargs=3, type=float,
                         default=list(DEFAULT_REFERENCE_BASE), metavar=("X", "Y", "YAW"),
                         help="actual base pose at the known-good short_left ARM_INIT")
@@ -161,9 +186,9 @@ def main():
     if any(float(offset) > 0.0 for offset in grid.normal_offsets):
         raise SystemExit(
             "--normal-offsets must all be <= 0; positive values move into the table"
-        )
+        )   # 禁止向桌内采样
     candidates = generate_candidates(args.reference_base, scene_ids, grid)
-    candidates = select_candidates(candidates, args.candidate_id, args.max_candidates)
+    candidates = select_candidates(candidates, args.candidate_id, args.max_candidates)   # 生成并筛选候选
     if not candidates:
         raise SystemExit("No candidates selected")
     if args.mode == "collect" and not args.grasp_checkpoint:
@@ -181,10 +206,10 @@ def main():
         wrist_min_object_pixels=args.wrist_min_object_pixels,
         max_episode_steps=args.max_episode_steps,
         reject_initial_table_contact=args.reject_initial_table_contact,
-    )
+    )   # 配置
 
     args.data_dir.mkdir(parents=True, exist_ok=True)
-    write_jsonl(args.data_dir / "candidates.jsonl", candidates)
+    write_jsonl(args.data_dir / "candidates.jsonl", candidates)   # 保存候选和本次运行配置
     write_json(
         args.data_dir / "run_config.json",
         {
@@ -193,9 +218,9 @@ def main():
             "scene_path": str(args.scene.resolve()),
             "scene_ids": scene_ids,
             "reference_base": list(args.reference_base),
-            "candidate_grid": asdict(grid),
+            "candidate_grid": asdict(grid),   # 扰动网格
             "candidate_count": len(candidates),
-            "confirm_repeats": args.confirm_repeats,
+            "confirm_repeats": args.confirm_repeats,   # 重复验证标准
             "confirm_min_success": args.confirm_min_success,
             "target_successes_per_edge": args.target_successes_per_edge,
             "episode_config": config.to_dict(),
@@ -210,7 +235,7 @@ def main():
     if (args.pause_on_stage or args.mode == "preview") and not args.render:
         print("[N2M] NOTE: --pause-on-stage/preview is most useful with --render", flush=True)
 
-    controls = InteractiveController()
+    controls = InteractiveController()   # 创建控制器
     runner = ManipulationEpisodeRunner(
         args.scene,
         config,
@@ -219,7 +244,7 @@ def main():
         pause_on_stage=args.pause_on_stage,
         interactive=controls,
         debug_dir=args.data_dir / "debug",
-    )
+    )   # 创建执行器
 
     try:
         if args.mode == "preview":
@@ -249,20 +274,20 @@ def main():
 
         summary_path = args.data_dir / "candidate_summaries.jsonl"
         already = _latest_summaries(summary_path) if args.resume else {}
-        stable_by_edge = defaultdict(int)
+        stable_by_edge = defaultdict(int)   # 统计每条桌边已有多少成功 M
         for row in already.values():
             if row.get("stable_success", False):
                 stable_by_edge[(row["scene_id"], row.get("approach_edge"))] += 1
-        for candidate in candidates:
+        for candidate in candidates:   # 逐个处理候选 M
             if controls.quit:
                 break
             cid = candidate["candidate_id"]
             edge_key = (candidate["scene_id"], candidate["approach_edge"])
-            if cid in already:
+            if cid in already:   # 已经总结过的候选
                 print(f"[N2M] resume: skip summarized {cid}", flush=True)
                 continue
             target_count = int(args.target_successes_per_edge)
-            if target_count > 0 and stable_by_edge[edge_key] >= target_count:
+            if target_count > 0 and stable_by_edge[edge_key] >= target_count:   # 桌边已有足够多稳定成功 M
                 print(
                     f"[N2M] target reached for {edge_key[0]}/{edge_key[1]}: "
                     f"{stable_by_edge[edge_key]} stable poses; skip {cid}",
@@ -271,11 +296,11 @@ def main():
                 continue
 
             results = []
-            screen = runner.run_episode(candidate, attempt=0, stop_after="lift")
-            results.append(screen)
+            screen = runner.run_episode(candidate, attempt=0, stop_after="lift")   # 每个候选首先执行一次完整抓取
+            results.append(screen)   # 测试结果加入results
             row = screen.to_dict()
             row.update({"phase": "screen", "created_at": _utc_now()})
-            append_jsonl(args.data_dir / "manipulation_rollouts.jsonl", row)
+            append_jsonl(args.data_dir / "manipulation_rollouts.jsonl", row)   # 保存这一次尝试
 
             # Placement/ARM_INIT failures are deterministic geometry/configuration
             # rejections.  Once a candidate reaches the perception/manipulation
@@ -283,12 +308,12 @@ def main():
             # a fail-success-success candidate could never reach the success threshold.
             deterministic_failure = screen.failure_stage in {
                 "BASE_PLACED", "ARM_INIT", "OPERATOR", "INTERNAL",
-            }
-            max_attempts = max(1, int(args.confirm_repeats))
-            required = max(1, int(args.confirm_min_success))
+            }   # 确定性失败：机器人初始位置与桌子碰撞；机械臂姿态、关节范围等不满足要求；操作人员主动终止；程序内部异常
+            max_attempts = max(1, int(args.confirm_repeats))   # 最多尝试次数
+            required = max(1, int(args.confirm_min_success))   # 至少成功次数
             if not deterministic_failure:
-                for attempt in range(1, max_attempts):
-                    if sum(int(item.success is True) for item in results) >= required:
+                for attempt in range(1, max_attempts):   # 尝试剩下的次数
+                    if sum(int(item.success is True) for item in results) >= required:   # 达到成功次数
                         break
                     result = runner.run_episode(candidate, attempt=attempt, stop_after="lift")
                     results.append(result)
@@ -296,7 +321,7 @@ def main():
                     row.update({"phase": "confirm", "created_at": _utc_now()})
                     append_jsonl(args.data_dir / "manipulation_rollouts.jsonl", row)
 
-            success_count = sum(int(result.success is True) for result in results)
+            success_count = sum(int(result.success is True) for result in results)   # 记录成功次数
             stable = bool(success_count >= required)
             if deterministic_failure:
                 decision = "deterministic_rejection"
@@ -320,14 +345,14 @@ def main():
                 "success_rate": success_count / max(len(results), 1),
                 "stable_success": stable,
                 "decision": decision,
-                "screen_failure_stage": screen.failure_stage,
+                "screen_failure_stage": screen.failure_stage,   # 这里只记录第一次尝试失败的情况
                 "screen_failure_reason": screen.failure_reason,
                 "created_at": _utc_now(),
             }
-            append_jsonl(summary_path, summary)
+            append_jsonl(summary_path, summary)   # 写入summary
             # Keep the consumable success set crash-safe even if the operator
             # stops a long search before the final plotting pass.
-            _rebuild_success_file(args.data_dir)
+            _rebuild_success_file(args.data_dir)   # 每完成一个候选就重建成功 M 文件success_poses.jsonl
             if stable:
                 stable_by_edge[edge_key] += 1
             print(
@@ -336,9 +361,10 @@ def main():
                 flush=True,
             )
 
-        successes = _rebuild_success_file(args.data_dir)
+        # 全部候选结束后
+        successes = _rebuild_success_file(args.data_dir)   # 再次重建成功文件
         by_scene = defaultdict(int)
-        for row in successes:
+        for row in successes:   # 按场景统计成功数
             by_scene[row["scene_id"]] += 1
         for scene_id in scene_ids:
             try:

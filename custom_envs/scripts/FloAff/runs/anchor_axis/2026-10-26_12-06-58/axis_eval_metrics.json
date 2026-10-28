@@ -1,0 +1,10 @@
+{
+  "angular_mean_deg": 1.83610212271545,
+  "angular_median_deg": 1.2560033673647104,
+  "within_5_deg": 0.9380208333333333,
+  "within_10_deg": 0.9921875,
+  "within_15_deg": 0.9973958333333334,
+  "flip_rate_over_90_deg": 0.0,
+  "sample_count": 1920,
+  "loss": 0.0012615603394806386
+}

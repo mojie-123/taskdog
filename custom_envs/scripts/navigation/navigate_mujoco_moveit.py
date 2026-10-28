@@ -459,12 +459,14 @@ def _run_grasp_plan(
             print(f"[SM] YOLOE+SAM2 target mask failed: {exc} -> ARM_INIT", flush=True)
             return PipelineState.ARM_INIT, None
 
-    # Remove the dominant plane only for target filtering.  AnyGrasp itself sees
-    # the full cloud so table geometry remains visible to its collision filter.
-    # The standalone moveit entry point additionally turns the same RANSAC
-    # inliers into a dynamic PlanningScene support surface.  N2M keeps the old
-    # behaviour because it calls this shared helper with the default False.
+    # RANSAC has two independent uses here:
+    #   1. build a dynamic PlanningScene support surface when requested;
+    #   2. remove the dominant plane in the legacy, non-semantic target path.
+    # A YOLOE+SAM2 target mask is already the target definition, so do not erode
+    # it with the coarser RANSAC plane mask.  AnyGrasp still sees the full cloud,
+    # including the table, for its own collision filtering.
     support_surface = None
+    plane_mask = None
     if build_support_surface:
         plane_nv, plane_dv, plane_mask = ransac_fit_plane(pts)
         plane_count = int(plane_mask.sum())
@@ -477,11 +479,10 @@ def _run_grasp_plan(
             )
             return PipelineState.ARM_INIT, None
 
-        keep_obj = ~plane_mask
         pct = plane_count * 100 // len(pts)
         print(
             f"[SM] RANSAC plane={plane_count} pts ({pct}%), "
-            f"object pts={int(keep_obj.sum())}, "
+            f"non_plane pts={int((~plane_mask).sum())}, "
             f"normal={np.round(plane_nv, 3)} d={float(plane_dv):.3f}",
             flush=True,
         )
@@ -510,19 +511,18 @@ def _run_grasp_plan(
         except Exception as exc:
             print(f"[SM] RANSAC table model rejected: {exc} -> ARM_INIT", flush=True)
             return PipelineState.ARM_INIT, None
-    else:
-        keep_obj = ransac_remove_plane(pts)
-    pts_obj = pts[keep_obj]
-    cols_obj = cols[keep_obj]
+
     target_point_mask = None
     target_points = None
+    pts_obj = None
+    cols_obj = None
+    legacy_non_table_mask = None
     if target_mask_image is not None:
         # ``pts`` was built with exactly this depth-valid indexing, so this
         # boolean vector corresponds element-for-element with the full cloud.
-        # Exclude RANSAC table inliers from steering if SAM2 leaks at the base.
-        target_point_mask = (
-            np.asarray(target_mask_image, dtype=bool)[valid] & keep_obj
-        )
+        # Deliberately do not intersect it with the RANSAC plane mask: semantic
+        # targeting and support-surface estimation are independent operations.
+        target_point_mask = np.asarray(target_mask_image, dtype=bool)[valid]
         target_points = pts[target_point_mask]
         if len(target_points) < 20:
             print(
@@ -532,11 +532,21 @@ def _run_grasp_plan(
             )
             return PipelineState.ARM_INIT, None
         print(
-            f"[SM] GRASP_PLAN: full={len(pts)} non_table={len(pts_obj)} "
-            f"target={len(target_points)} pts",
+            f"[SM] GRASP_PLAN: full={len(pts)} target={len(target_points)} pts "
+            "(SAM2 + depth, no RANSAC plane exclusion)",
             flush=True,
         )
     else:
+        # Preserve the original workflow: without a semantic target mask, the
+        # dominant support plane must still be removed before color/geometric
+        # target filtering.  Reuse an already-fitted dynamic-table mask when
+        # possible instead of running RANSAC twice.
+        if plane_mask is not None:
+            legacy_non_table_mask = ~plane_mask
+        else:
+            legacy_non_table_mask = ransac_remove_plane(pts)
+        pts_obj = pts[legacy_non_table_mask]
+        cols_obj = cols[legacy_non_table_mask]
         print(
             f"[SM] GRASP_PLAN: full={len(pts)} object={len(pts_obj)} pts",
             flush=True,
@@ -601,15 +611,19 @@ def _run_grasp_plan(
     candidate_mask = np.ones(len(scores), dtype=bool)
 
     if target_points is None:
-        # Preserve N2M's current fallback path.  The standalone MoveIt entry
-        # point uses the semantic target-mask branch above instead.
+        # Preserve the legacy fallback path for runs without semantic masking.
         try:
             import cv2 as _cv2
             from scipy.spatial import cKDTree
             cols_u8_obj = (cols_obj * 255).astype(np.uint8).reshape(1, -1, 3)
             hsv_obj = _cv2.cvtColor(cols_u8_obj, _cv2.COLOR_RGB2HSV)[0]
             vivid = pts_obj[hsv_obj[:, 1] >= 80]
-            _diag_save_filter_image(scan_rgb, valid, keep_obj, hsv_obj[:, 1] >= 80)
+            _diag_save_filter_image(
+                scan_rgb,
+                valid,
+                legacy_non_table_mask,
+                hsv_obj[:, 1] >= 80,
+            )
             if len(vivid) >= 20:
                 dist, _ = cKDTree(vivid).query(translations, k=1)
                 vivid_mask = dist < 0.05
@@ -2167,7 +2181,7 @@ def main():
                                         f"speed_scale={_speed_scale:.2f}",
                                         flush=True)
 
-                                if _sd.pos_error_m < 0.004 and _sd.rot_error_rad < 0.10:
+                                if _sd.pos_error_m < 0.002 and _sd.rot_error_rad < 0.10:
                                     print(
                                         "[LOCAL_REACH] contact pose reached geometrically -> CLOSE",
                                         flush=True)

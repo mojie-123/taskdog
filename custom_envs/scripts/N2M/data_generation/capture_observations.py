@@ -5,6 +5,12 @@ The collector keeps testing a stratified proposal pool until every selected
 ``scene/approach_edge`` has the requested number of *valid* observations.  It
 also writes a durable rejection manifest and optional visual quality-control
 panels so a small pilot can be audited before full collection.
+
+将机器人放到候选观察位姿
+→ 用前置相机拍摄RGB、深度和MuJoCo真值分割
+→ 判断该观察是否有效
+→ 生成base坐标系下的XYZRGB点云
+→ 保存观察O
 """
 
 from __future__ import annotations

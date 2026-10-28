@@ -10,7 +10,7 @@ from typing import Iterable
 import numpy as np
 
 
-class InteractiveController:
+class  InteractiveController:
     """Thread-safe key state for ``mujoco.viewer.launch_passive``.
 
     Keys are intentionally ASCII-only so this does not depend on a particular

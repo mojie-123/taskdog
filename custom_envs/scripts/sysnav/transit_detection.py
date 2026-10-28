@@ -74,6 +74,36 @@ class ConfirmedTransitCandidate:
     separation_m: float
 
 
+class TransitTargetFound(RuntimeError):
+    """Raised on the navigation thread after an async object query succeeds."""
+
+    def __init__(self, target: LocalizedDetection):
+        super().__init__("target verified by the asynchronous object reviewer")
+        self.target = target
+
+
+class TransitReobserveRequested(RuntimeError):
+    """Interrupt navigation to obtain a close-up of a stable small target."""
+
+    def __init__(
+        self,
+        *,
+        object_id: str,
+        room_id: str,
+        position_world: np.ndarray,
+        best_image_score: int,
+        observation_count: int,
+    ):
+        super().__init__("stable provisional target needs a closer observation")
+        self.object_id = str(object_id)
+        self.room_id = str(room_id)
+        self.position_world = np.asarray(
+            position_world, dtype=np.float64
+        ).reshape(3).copy()
+        self.best_image_score = int(best_image_score)
+        self.observation_count = int(observation_count)
+
+
 @dataclass(frozen=True)
 class DeferredTransitObservation:
     """One non-confirming view, used only to avoid reviewing that view again."""
@@ -113,10 +143,33 @@ class ContinuousTransitDetector:
         self._deferred_count = 0
         self._suppressed_count = 0
         self._failure_count = 0
+        self._observation_callback: Callable[[TransitObservation], None] | None = None
+        self._verified_target_provider: Callable[[], LocalizedDetection | None] | None = None
+        self._interrupt_on_candidate = True
 
     @property
     def enabled(self) -> bool:
         return bool(self.config.enabled)
+
+    def set_observation_callback(
+        self,
+        callback: Callable[[TransitObservation], None] | None,
+        *,
+        verified_target_provider: Callable[[], LocalizedDetection | None] | None = None,
+        interrupt_on_candidate: bool = False,
+    ) -> None:
+        """Stream observations to the Object layer without stopping navigation."""
+
+        self._observation_callback = callback
+        self._verified_target_provider = verified_target_provider
+        self._interrupt_on_candidate = bool(interrupt_on_candidate)
+
+    def _raise_if_verified(self) -> None:
+        if self._verified_target_provider is None:
+            return
+        target = self._verified_target_provider()
+        if target is not None:
+            raise TransitTargetFound(target)
 
     def _due(self, pose: np.ndarray, now: float, *, force: bool) -> bool:
         if force:
@@ -205,14 +258,21 @@ class ContinuousTransitDetector:
         kind: str,
         detections: tuple[Detection2D, ...],
     ) -> tuple[str, str]:
-        if not self.config.save_images:
+        # Object-instance review needs the clean RGB frame even when the
+        # optional transit debug-image switch is disabled.  Only force that
+        # one evidence image when a streamed frame actually contains an
+        # object proposal; annotated debug output still obeys save_images.
+        force_object_evidence = bool(
+            self._observation_callback is not None and detections
+        )
+        if not self.config.save_images and not force_object_evidence:
             return "", ""
         stem = f"{kind}_{sequence:06d}"
         raw_path = self.output_dir / "images" / f"{stem}.png"
         raw_path.parent.mkdir(parents=True, exist_ok=True)
         Image.fromarray(frame.rgb, mode="RGB").save(raw_path)
         annotated_path = ""
-        if detections:
+        if detections and self.config.save_images:
             annotated = np.asarray(frame.rgb).copy()
             for detection in detections:
                 annotated = annotate_detection(annotated, detection)
@@ -234,6 +294,7 @@ class ContinuousTransitDetector:
         """Take one due sample and return the strongest reviewable target."""
 
         pose = np.asarray(robot_pose_world, dtype=np.float64).reshape(3)
+        self._raise_if_verified()
         now = time.monotonic()
         if not self._due(pose, now, force=force):
             return None
@@ -289,8 +350,6 @@ class ContinuousTransitDetector:
             item
             for item in localized
             if item.detection.label == self.target_label
-            and item.detection.confidence
-            >= self.components.config.search.target_accept_confidence
         ]
         suppressed: list[LocalizedDetection] = []
         eligible: list[LocalizedDetection] = []
@@ -348,9 +407,32 @@ class ContinuousTransitDetector:
             f"image={image_path}",
             flush=True,
         )
+        if self._observation_callback is not None:
+            try:
+                self._observation_callback(observation)
+            except (TransitTargetFound, TransitReobserveRequested):
+                raise
+            except Exception as exc:
+                self._failure_count += 1
+                append_jsonl(
+                    self.output_dir / "transit_observations.jsonl",
+                    {
+                        "event": "observation_callback_failed",
+                        "sequence": sequence,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    },
+                )
+                print(
+                    f"[SYSNAV][TRANSIT_SCENE_UPDATE_FAILED] sequence={sequence} "
+                    f"error={type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+        self._raise_if_verified()
         if not eligible:
             return None
         self._candidate_count += 1
+        if not self._interrupt_on_candidate:
+            return None
         return TransitCandidate(observation=observation, target=eligible[0])
 
     def confirm(
@@ -460,6 +542,7 @@ class ContinuousTransitDetector:
                 "deferred_count": self._deferred_count,
                 "same_view_suppressed_count": self._suppressed_count,
                 "failure_count": self._failure_count,
+                "streaming_object_updates": self._observation_callback is not None,
                 "deferred_observations": [
                     {
                         "position_world": item.position_world.tolist(),
